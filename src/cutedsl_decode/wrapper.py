@@ -608,17 +608,10 @@ class PagedDecodeWrapper:
         self._planned = True
 
     def _plan_quantized_sm100(self, kv_splits, reduction, kernel_kwargs) -> None:
-        from ._sm100.fold_runtime import (
-            blk_tile_n_of, quant_cfg_of, refuse_retired_kernel_kwargs)
+        from ._sm100.fold_runtime import blk_tile_n_of, quant_cfg_of
         from .quant_layout import quant_block_offsets, validate_quant_flex
         from ._sm100.scheduler import plan_splits_sm100
 
-        # A retired knob must raise rather than be accepted and ignored, and this
-        # is the public door: refuse it before the split is planned or anything is
-        # compiled, naming plan() rather than the helper that would otherwise catch
-        # it further in.
-        refuse_retired_kernel_kwargs(kernel_kwargs,
-                                     where="PagedDecodeWrapper.plan")
         bits = self._bits
         tile_n = blk_tile_n_of(self._num_qo_heads, self._num_kv_heads)
         if tile_n > 8:
@@ -1007,11 +1000,6 @@ class PagedDecodeWrapper:
         # sets this attribute, so a real wrapper always carries it; the host
         # tests reach the pre-launch guards through `__new__`.
         kkw = dict(getattr(self, "_quant_kernel_kwargs", None) or {})
-        # This reads the planned dict BY NAME, so it consults the retired-kwargs
-        # table as every such door does: a retired key here would otherwise be
-        # discarded and the order answered as though it were absent.
-        from ._sm100.fold_runtime import refuse_retired_kernel_kwargs
-        refuse_retired_kernel_kwargs(kkw, where="PagedDecodeWrapper.run")
         # The SAME predicate the pool writer asks (`_fold_harness.k_pool_perm`),
         # so the pool writer and the launch agree.
         from ._sm100.int_fold_decode import IntDecodeSm100

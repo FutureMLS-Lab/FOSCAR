@@ -43,9 +43,7 @@ import torch
 #: worst rel_l2 is 1.768e-03.
 #:
 #: The kernel has one dequant warpgroup at both widths, and
-#: `dequant_warpgroups` is not a constructor knob; the constructor refuses it
-#: with TypeError and every kernel_kwargs reader refuses it through
-#: `_RETIRED_KERNEL_KWARGS` below.
+#: `dequant_warpgroups` is not a constructor knob.
 #:
 #: `k_op_stages` is the depth of the split K/V operand rings and is accepted at
 #: both widths. 3 is the measured int4 best; None resolves to
@@ -69,111 +67,8 @@ def blk_tile_n_of(h_q, h_kv):
     return max(min(32, npo2(h_q // h_kv)), 2)
 
 
-#: Names retired from `IntDecodeSm100` and from `compile_fold`, mapped to the
-#: message that says so. Retired OUTRIGHT means nothing replaced the knob, so every
-#: value is refused, including False and None. The two RENAMED depth knobs are here
-#: as well, because a dict reader would otherwise believe the old spelling; their
-#: messages name the new spelling.
-_RETIRED_KERNEL_KWARGS = {
-    "identity_dequant": (
-        "'identity_dequant' was retired together with the raw-byte relay mode "
-        "it selected; there is no value of it to pass and nothing replaced it. "
-        "The packed pools mKq/mVq/mScale are the kernel's only input contract."),
-    "operands_in_tmem": (
-        "'operands_in_tmem' was retired together with the K-in-tmem staging arm it "
-        "selected (the dequant warpgroup's STTM deposit, the tmem operand ring and "
-        "the TMEM-source BMM1 atom); it measured neutral against the shared-memory "
-        "operand ring, and its only host, the whole-warpgroup interleave, is deleted "
-        "with the 2026-09-14 consolidation. There is no value of it to pass and "
-        "nothing replaced it."),
-    "dump_stage": (
-        "'dump_stage' was retired together with the operand-stage dump it selected "
-        "(the mDump tensor, the dequant warpgroup's named-barrier-14 copy and "
-        "scripts/_g3_dump_check.py); its only host, the whole-warpgroup interleave, "
-        "is deleted with the 2026-09-14 consolidation, and the bitwise output anchors "
-        "and the end-to-end operand-matched bar carry what it checked. There is no "
-        "value of it to pass and nothing replaced it."),
-    "dump": (
-        "'dump' was retired together with 'dump_stage' on 2026-09-14: it was "
-        "compile_fold's spelling of that knob (it set the constructor's dump_stage and "
-        "allocated the mDump tensor). There is no value of it to pass and nothing "
-        "replaced it."),
-    "softmax_warpgroups": (
-        "'softmax_warpgroups' was retired on 2026-09-14 together with the dual-softmax "
-        "topology it selected (the second softmax warpgroup, the tile-parity "
-        "skip-walks of the S, P and scale rings, and the sM mutex barrier); it "
-        "measured flat to slower than one softmax warpgroup, and the in-loop scale "
-        "acquire that was its last host is deleted with the scale-quad prefetch made "
-        "unconditional. One softmax warpgroup is the only topology, so there is no "
-        "value of it to pass and nothing replaced it."),
-    "f32x2_fold": (
-        "'f32x2_fold' was retired on 2026-09-14 together with the two packed-f32x2 "
-        "sites it selected (the softmax P hi/lo quant multiplies and the correction "
-        "warpgroup's V-fold epilogue FMAs) and the four packed-f32x2 asm helpers; it "
-        "was bit-exact with the scalar fma.rn path by construction and benched flat, "
-        "so the scalar path is the only path. There is no value of it to pass and "
-        "nothing replaced it."),
-    "elide_unit_correction": (
-        "'elide_unit_correction' was retired on 2026-09-14 together with the "
-        "correction warpgroup's unit-correction elision arm (skip the tmem O "
-        "read-modify-write when the correction vector is exactly all-1.0); it was "
-        "bit-exact by construction and measured no wall effect, so the unconditional "
-        "read-modify-write is the only path. There is no value of it to pass and "
-        "nothing replaced it."),
-    "int4_k_op_stages": (
-        "'int4_k_op_stages' was renamed to 'k_op_stages' on 2026-09-14, when the "
-        "split K/V operand rings became unconditional at both widths; pass "
-        "`k_op_stages`, the K operand ring's depth (None resolves to "
-        "min(2, kv_stages // 2) at trace time, and BITS_TUNING sets 3 at bits == 4)."),
-    "int4_code_stages_k": (
-        "'int4_code_stages_k' was renamed to 'code_stages_k' on 2026-09-14, when the "
-        "split K/V code rings became unconditional at both widths; pass "
-        "`code_stages_k`, the K code ring's depth (None splits code_stages in half)."),
-    "dequant_warpgroups": (
-        "'dequant_warpgroups' was retired from IntDecodeSm100 on 2026-09-14: the "
-        "kernel has had one dequant warpgroup, hardcoded, since that date and takes "
-        "no such argument (the knob selected two or four cooperating warpgroups, "
-        "which measured slower at both widths). There is no value of it to pass "
-        "and nothing replaced it."),
-    "kernel_cls": (
-        "'kernel_cls' was retired on 2026-10-07 together with the SM100 ping-pong "
-        "fork it selected (FoldDecodeSm100PP, kernel_cls=\"pingpong\"), an "
-        "unshipped experiment that failed the end-to-end check on long "
-        "single-split cells; IntDecodeSm100 is the only SM100 kernel class. Every "
-        "value is refused, None included, because there is nothing left to "
-        "select, so drop the argument. The Hopper ping-pong kernel "
-        "(IntPingPongDecodeSm90) is a different kernel and is unaffected."),
-}
 
 
-def refuse_retired_kernel_kwargs(kernel_kwargs, where="compile_fold"):
-    """Raise if a `kernel_kwargs` dict carries a name retired outright.
-
-    This is the one place that refuses a retired name, and it is a function
-    rather than a line inside `compile_fold` because a dict read by name
-    discards instead of raising. A keyword argument that does not exist
-    raises on its own; a dict key that does not mean anything is simply
-    ignored, and the caller gets a default it did not ask for and no warning.
-    So every helper that consumes a `kernel_kwargs` dict has to consult this,
-    not only the compile entry point.
-
-    The callers are `compile_fold`, whose `**kernel_kwargs` and `bits_tuning`
-    merge into one dict (it checks after that merge, so a retired name raises
-    this message rather than the constructor's generic TypeError, and so a
-    compile_fold-level parameter such as `dump` or `kernel_cls` that the splat
-    would otherwise hand to the constructor is named as retired);
-    `quant_cfg_of`, and `scale_pool_dtype_of` through it, which resolve the
-    quant-flex configuration out of the same dict; `k_pool_perm` /
-    `v_pool_perm`, which resolve the pool order out of it, where a silently
-    defaulted answer is wrong at every K channel and raises nothing; and
-    `PagedDecodeWrapper`, whose plan refuses the dict it is handed and whose
-    run refuses the planned dict it reads the K pool order out of.
-    """
-    if not kernel_kwargs:
-        return
-    for name, why in _RETIRED_KERNEL_KWARGS.items():
-        if name in kernel_kwargs:
-            raise TypeError(f"{where}: {why}")
 
 
 def quant_cfg_of(page_size, head_dim, kernel_kwargs=None):
@@ -187,7 +82,6 @@ def quant_cfg_of(page_size, head_dim, kernel_kwargs=None):
     from ..quant_layout import quant_block_offsets
 
     kkw = kernel_kwargs or {}
-    refuse_retired_kernel_kwargs(kkw, where="quant_cfg_of")
     kq = tuple(kkw.get("k_quant") or ("token", head_dim))
     vq = tuple(kkw.get("v_quant") or ("token", head_dim))
     kq, vq = (kq[0], int(kq[1])), (vq[0], int(vq[1]))
@@ -407,15 +301,6 @@ def compile_fold(
             "accepted and ignored rather than honoured. The runtime prediction "
             "axis is unaffected; what the knob bought was packing several query "
             "tokens into one MMA N tile.")
-    # RETIRED OUTRIGHT, with nothing replacing it. Refused here, after the
-    # bits_tuning merge and before construction, for the same reason as the
-    # guards above: the constructor splat would otherwise raise a generic
-    # TypeError. The messages, and the other callers that consult the same
-    # table, live in `refuse_retired_kernel_kwargs`. `kernel_cls` is in that
-    # table too, so a caller still passing it lands in `**kernel_kwargs` and is
-    # told it is retired rather than handed to the constructor.
-    refuse_retired_kernel_kwargs(kernel_kwargs, where="compile_fold")
-
     # Quant-config tiling. Resolved HERE as well as inside the ctor because the
     # compile CACHE KEY upstream is built from what we pass. Same classmethod
     # both places, so the two cannot disagree; the assert after the ctor proves
