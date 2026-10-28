@@ -271,7 +271,7 @@ MASK4 = 0x000F000F    # isolate low 4 bits of each bf16 lane (int4 codes)
 # bits 5-6 of each bf16 lane (MASK2L selects exactly those; plane-word garbage dies in the mask).
 # Unpack = one shift and one LOP3 per operand word (ptxas merges `>> 2p` and `<< 5` into one net
 # shift), with no floating-point op; a raw-q feed would need a bf16x2 sub = HADD2.
-# Fold (fold_numerics): y = q + 4  =>  s' = s, z' = z − 4s.  The base-4 encoding (rather than a
+# The fold: y = q + 4  =>  s' = s, z' = z − 4s.  The base-4 encoding (rather than a
 # base-2 y = q/2 + 2) makes alpha=1, so the two per-column ALPHA_INV multiplies in
 # QK-prepare vanish behind the const_expr guard — int2 joins int4's multiply-free affine path
 # with the SAME z' = z − 4s cancellation (s' = s amplifies strictly less than s' = 2s).
@@ -814,7 +814,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         self.head_dim = head_dim; self.page_size = page_size; self.q_head_tile = q_head_tile; self.num_stages = num_stages; self.bits = bits
         # affine feed constants (trace-time): the wgmma A operand holds y = alpha·q + beta
         # — int4 (1,128) magic, int2 (1,4) base-4 linear-magic, or int2 (1,128) under
-        # `int2_fast_mantissa_injection=False`.  Fold at use (fold_numerics):
+        # `int2_fast_mantissa_injection=False`.  Fold at use:
         #   s' = ALPHA_INV·s,  z' = z − BETA_FOLD·s   (ALPHA_INV = 1/alpha, BETA_FOLD = beta/alpha)
         # alpha=1 for every feed: the ALPHA_INV multiplies in QK-prepare are const_expr-elided.
         self.ALPHA_INV = 1.0
@@ -2633,7 +2633,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         sMergeC = smem.allocate_tensor(Float32, cute.make_ordered_layout((PG, 2), order=(1, 0)), byte_alignment=8)
         sMergeOut = smem.allocate_tensor(Float32, cute.make_ordered_layout((D // 64, 64, PG), order=(2, 1, 0)), byte_alignment=16)
         # l/c strip feeding each WG's own lc wgmma chain (last dim = wg plane):
-        # 4 rows x 64 tokens bf16 per slot, DOUBLE-BF16 rows (probe fold_numerics lc_via_gemm:
+        # 4 rows x 64 tokens bf16 per slot, DOUBLE-BF16 rows (measured:
         # the 2-row single-bf16 form FAILED — bf16(zr) re-breaks the feed's ±beta cancellation,
         # int4 1.25e-1; hi/lo split rows pass at the floor 1.700e-3/1.641e-3):
         #   row 0 = hi(rcp.approx(sV'_t))  row 2 = lo(...)   -> A m-rows 0 / 8  (l)

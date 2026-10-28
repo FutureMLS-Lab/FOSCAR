@@ -1182,12 +1182,6 @@ def _gate_flex_pools(seed=3):
 
 
 def main():
-    # G1d dependencies: the files whose conventions this oracle claims to replicate.
-    # probe_sm100_dequant pulls in cutlass/tvm_ffi (import-only, no GPU touched).
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import probe_sm100_dequant as _probe
-    import fold_numerics_sm100 as _fn
-
     torch.manual_seed(0)
     ok = True
     for bits in (4, 2):
@@ -1209,22 +1203,6 @@ def main():
         print(f"[G1a-lut bits={bits}] pack_rows_lut round-trip (K-shape/V-shape): "
               f"{'OK' if rt_ok_lut else 'FAIL'}")
 
-        # G1d-pack: cross-file drift check — this file's LUT pack/unpack must stay
-        # bit-identical to the SASS/gate-validated probe originals, on both row shapes
-        # (probe fns take flat [R,E]; ours must match on those exact inputs).
-        g1d_pack = True
-        for E in (64, 128):
-            cds = torch.randint(0, 2**bits, (128, E), dtype=torch.uint8)
-            # k-order: logical -- this compares two IMPLEMENTATIONS of the same
-            # pack/unpack pair over freshly generated codes, so no stored order
-            # exists on either side of the equality.
-            pk = _probe.pack_lut(cds, bits)
-            g1d_pack &= bool(torch.equal(pack_rows_lut(cds, bits), pk))
-            g1d_pack &= bool(torch.equal(unpack_rows_lut(pk, bits, E),
-                                         _probe.unpack_lut(pk, bits)))
-        ok &= g1d_pack
-        print(f"[G1d-pack bits={bits}] pack/unpack_rows_lut == probe pack/unpack_lut: "
-              f"{'OK' if g1d_pack else 'FAIL'}")
 
         # G1b: paged ref through a SCRAMBLED block table == independent logical-stream ref.
         # Logical KV is quantized BEFORE any paging; token-wise quant commutes with the
@@ -1362,24 +1340,6 @@ def main():
     ok &= _gate_i4_v_perm()
     ok &= _gate_i4_v_perm_roundtrip()
 
-    # G1d-fp8q: cross-file drift check (bits-independent) — quantize_q_fp8 must stay
-    # bit-identical to the certified sim's q_eff_fp8_tensor: same raw e4m3 codes AND same
-    # dequantized Q_eff, over hundreds of random tensors (mixed dtype/shape/scale).
-    g1d_q = True
-    for i in range(300):
-        torch.manual_seed(10_000 + i)
-        shape = [(8, D), (2, 8, D), (32, D)][i % 3]
-        qt = torch.randn(*shape) * (10.0 ** ((i % 13) - 6))
-        if i % 2:
-            qt = qt.bfloat16()
-        qs_ref = _fn.E4M3_MAX / qt.float().abs().amax().clamp_min(1e-30)   # sim's own ops
-        codes_ref = _fn.e4m3(qt.float() * qs_ref).to(torch.float8_e4m3fn).view(torch.uint8)
-        q8, qsc = quantize_q_fp8(qt)
-        g1d_q &= bool(torch.equal(q8.view(torch.uint8), codes_ref))
-        g1d_q &= bool(torch.equal(q8.float() / qsc, _fn.q_eff_fp8_tensor(qt.float())))
-    ok &= g1d_q
-    print(f"[G1d-fp8q] quantize_q_fp8 == fold_numerics q_eff_fp8_tensor "
-          f"(codes+Q_eff, 300 tensors): {'OK' if g1d_q else 'FAIL'}")
 
     print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
