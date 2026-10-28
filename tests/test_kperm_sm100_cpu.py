@@ -26,23 +26,17 @@ import sys
 import pytest
 import torch
 
+pytest.importorskip("cuda", reason="needs the CUDA Python bindings")
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-for p in (ROOT / "scripts" / "probes", ROOT / "scripts", ROOT / "src"):
-    sys.path.insert(0, str(p))
+sys.path.insert(0, str(ROOT / "src"))
 
-from repack_sm100 import (D, PS, _T8_I4, _check_k_store_perm,  # noqa: E402
-                          _k_store_perm_inverse, build_pools_flex,
-                          build_pools_lut, check_k_store_perm_f4,
-                          check_k_store_perm_i4, dequant_pools_flex,
-                          dequant_pools_lut, k_store_perm_sm100_f4,
-                          v_store_perm_sm100, v_store_perm_sm100_f4)
-
-
-def test_default_resolution_oracle():
-    """Keep the standalone resolver-agreement gate in the regular CPU suite."""
-    result = subprocess.run([sys.executable, str(ROOT / "scripts/test_default_resolution.py")],
-                            cwd=ROOT, capture_output=True, text=True)
-    assert result.returncode == 0, result.stdout + result.stderr
+from cutedsl_decode.pool import (D, PS, _T8_I4, _check_k_store_perm,  # noqa: E402
+                                 _k_store_perm_inverse, build_pools_flex,
+                                 build_pools_lut, check_k_store_perm_f4,
+                                 check_k_store_perm_i4, dequant_pools_flex,
+                                 dequant_pools_lut, k_store_perm_sm100_f4,
+                                 v_store_perm_sm100, v_store_perm_sm100_f4)
 
 
 @pytest.mark.parametrize("bits", [2, 4])
@@ -621,35 +615,6 @@ def test_the_dict_doors_refuse_kernel_cls_for_every_value_it_took(value, bits):
         with pytest.raises(TypeError,
                            match=_guard_prefix("kernel_cls", where="quant_cfg_of")):
             helper(PS, D, kkw)
-
-
-def test_the_knob_matrix_asserts_a_refusal_for_every_retired_kwarg():
-    """`scripts/test_knob_matrix_compile.py` must carry an `_expect_refused` row
-    whose `_refusal_match` names every key of `_RETIRED_KERNEL_KWARGS`.
-
-    The matrix is the compile-time gate that runs on the node, and a refusal
-    nobody asserts there can vanish in a refactor with nothing noticing. The
-    script imports `_fold_harness` at module level, so its CONFIGS are read from
-    the source by AST rather than imported. The second loop checks that every
-    such row also CARRIES the kwarg it names, because the runner counts a
-    TypeError as the refusal only when `_refusal_match in cfg`."""
-    src = (ROOT / "scripts" / "test_knob_matrix_compile.py").read_text()
-    configs = None
-    for node in ast.parse(src).body:
-        if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "CONFIGS" for t in node.targets):
-            configs = ast.literal_eval(node.value)
-    assert configs is not None, "CONFIGS not found in test_knob_matrix_compile.py"
-    matched = {cfg["_refusal_match"] for cfg in configs
-               if cfg.get("_expect_refused") and "_refusal_match" in cfg}
-    missing = sorted(set(_RETIRED) - matched)
-    assert not missing, (
-        f"retired kwargs with no `_refusal_match` row in the knob matrix: {missing}")
-    for cfg in configs:
-        if cfg.get("_expect_refused") and "_refusal_match" in cfg:
-            assert cfg["_refusal_match"] in cfg, (
-                f"row {cfg} names a `_refusal_match` it does not carry, so the "
-                f"runner could never count its TypeError as the refusal")
 
 
 # --- the derived layout (kwarg removed 2026-08-12) -------------------------

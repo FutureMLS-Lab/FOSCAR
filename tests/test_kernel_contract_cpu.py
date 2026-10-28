@@ -230,13 +230,17 @@ def test_every_name_a_constructor_reads_is_bound_before_it(rel, cls):
 
 def test_the_sdtype_validity_rule_is_not_claimed_as_shared():
     """The contract unifies the SPELLING of sdtype, not which one a configuration may
-    use. SM100 allows bf16 only for K token-(D/2); SM90 also permits it for V token-64,
-    which SM100 does not implement at all. Recording that here so a later reader does
-    not "fix" the asymmetry into a wrong rule. (codex)
+    use.
+
+    SM100 allows bf16 only for K token-(D/2); SM90 also permits it for V token-64,
+    which SM100 does not implement at all. Each kernel therefore keeps its own
+    validity rule, and normalisation must stay spelling-only so that it cannot
+    become a shared gate by accident.
     """
-    src = (_SRC / "cutedsl_decode" / "kernel_contract.py").read_text()
-    assert "DELIBERATELY NOT UNIFIED" in src, (
-        "the contract must say that sdtype VALIDITY is per-kernel, not shared")
+    from cutedsl_decode.kernel_contract import normalize_sdtype
+
+    assert normalize_sdtype("bf16") == "bf16"
+    assert normalize_sdtype("f32") == "f32"
     for rel, needle in (("_sm100/int_fold_decode.py", 'assert sdtype == "f32"'),
                         ("_sm90/int_decode_pingpong.py", 'assert sdtype_name == "bf16"')):
         got = (_SRC / "cutedsl_decode" / rel).read_text()

@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 """SM100 quantized-KV decode with the affine dequant folded through the MMA
 (`IntDecodeSm100`).
 
@@ -30,7 +30,7 @@ HOST CONTRACT
 -------------
 
 The kernel consumes packed pools, not dequantized tensors. Build them with
-``scripts/probes/repack_sm100.py``; ``_sm100/fold_runtime.py`` is the single
+``cutedsl_decode.pool``; ``_sm100/fold_runtime.py`` is the single
 compile and launch path.
 
 * ``mKq``    uint8 [NP, HKV, 64, D*bits//8], token-major rows.

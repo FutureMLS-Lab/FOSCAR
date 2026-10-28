@@ -1,9 +1,10 @@
+# Copyright 2026 Donglin Zhuang
+# SPDX-License-Identifier: Apache-2.0
 """ServingCache — the batch-free GLOBAL paged quantized-KV pool that the SM90 decode kernel reads.
 
 This is the host fixture (used by the SM90 numerics gates, benches and harnesses) that builds the
 serving-readiness contract from per-request inputs: a single pooled set of fragment-order code
-pages + ONE interleaved paged scale pool, addressed through a global block table.  Design spec:
-docs/superpowers/specs/2026-06-16-int-decode-serving-readiness-design.md.
+pages + ONE interleaved paged scale pool, addressed through a global block table.
 
 CONTRACT (the four tensors the kernel reads):
   codes_k / codes_v   uint8     [NP, HKV, <block>]     # NP = total physical pages; page = one
@@ -25,22 +26,22 @@ CONTRACT (the four tensors the kernel reads):
   seq_lens            int32     [B]                     # per-request kv length (ragged).
 
 The page id `block_table[b, gt]` is a free coordinate on the GLOBAL page (NP) dim for BOTH codes
-and scales — two requests whose block tables point at the same page read identical bytes (the
-genuine-pooling property the old B-replicated scheme could not express).
+and scales, so two requests whose block table entries point at the same page read identical bytes.
+That is the pooling this layout provides.
 
 CODE POOL GEOMETRY.  Everything about where a code byte sits is computed here and nowhere else:
 `code_row_bytes` gives the `per` of the K and V rows, `code_row_chunks` their 16-byte chunk count
 C, `code_block_shape` / `code_pool_shape` the block and pool shape in either order, and
 `code_block_word_strides` / `code_chunk_offset` where row word w, or chunk c of thread t, sits in
 a block, and `code_word_offset` where row word w sits in a whole pool, with the page widened to
-64 bits before it is multiplied.  The pingpong kernel, IntAppend, the pool writers (`repack_rs.py`, the adapter) and
+64 bits before it is multiplied.  The pingpong kernel, IntAppend, the pool writers and
 this module's own checks call these, so a head dimension or width has one formula.  They are
 generic in the head dimension D: the layout is defined for any D whose rows are whole chunks
 (D = 128 and 256 at both widths), and the pingpong kernel reads both: at D=256 its grouped body
 copies one 128-channel group of a row at a time (`IntPingPongDecodeSm90._code_group_words`).
 
 CODE POOL ORDERS.  Thread t's plane-word A-fragment row holds `per` bytes (`code_row_bytes`:
-32 int4 / 16 int2 at D=128, 64 / 32 at D=256; `scripts/probes/repack_rs.py` defines the bytes).
+32 int4 / 16 int2 at D=128, 64 / 32 at D=256; the pool writers define the bytes).
 A (page, kv-head) block stores the 128 rows in one of two orders, and the READER decides which:
   "row"      [128, per]           row t contiguous.  No kernel reads this order; it is the
                                   thread-row layout the packers produce and the pool shape
@@ -77,7 +78,7 @@ import torch
 CODE_CHUNK_BYTES = 16
 
 #: Channels of one V^T output half: the PV mma emits 64 output channels per run, so a V row
-#: holds head_dim/64 halves stacked along the row (`repack_rs.repack_V_rs`).
+#: holds head_dim/64 halves stacked along the row.
 CODE_V_HALF_CHANNELS = 64
 
 
@@ -196,13 +197,12 @@ def code_word_offset(order, per, num_kv_heads, page, kv_head, thread, word, *, w
 
 
 def scatter_map_file(head_dim):
-    """The file name, under `scripts/`, of IntAppend's scatter map at `head_dim`.
+    """The file name of IntAppend's scatter map at `head_dim`.
 
     The map inverts the packer's fragment gather at one head dimension, so each head dimension
-    has its own file: `frag_scatter_k16.pt` at 128, the file every D=128 append has read, and
-    `frag_scatter_k16_d<D>.pt` at any other.  `scripts/probes/append_scatter.py --head-dim D`
-    writes it under its byte-exact inverse gate, and IntAppend reads it; both take the name
-    from here."""
+    has its own file: `frag_scatter_k16.pt` at 128 and `frag_scatter_k16_d<D>.pt` at any other.
+    The map generator writes it under its byte-exact inverse gate, and IntAppend reads it; both
+    take the name from here."""
     if head_dim <= 0 or head_dim % CODE_V_HALF_CHANNELS:
         raise ValueError(f"no scatter map at head_dim={head_dim}: the code pool is defined for "
                          f"whole {CODE_V_HALF_CHANNELS}-channel V halves")
@@ -313,8 +313,8 @@ def make_serving_cache(per_req_codes_k, per_req_codes_v, per_req_scales, seq_len
     NP = sum_b pages_per[b] physical pages via torch.randperm (shuffle=True) so a wrong page-id
     read lands in another request's data; block_table[b, gt] records the global page id.
 
-    identity_block_table=True (or shuffle=False) lays pages out as base_b + gt (no permutation) —
-    the contiguous-stand-in case (the retired page_size=0 path is exactly an identity block table).
+    identity_block_table=True (or shuffle=False) lays pages out as base_b + gt (no permutation),
+    the contiguous stand-in case, i.e. an identity block table.
     identity_block_table forces no shuffle.
 
     Returns a ServingCache.

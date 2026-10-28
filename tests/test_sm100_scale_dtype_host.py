@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 import torch
 
+pytest.importorskip("cuda", reason="needs the CUDA Python bindings")
+
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1] / "src/cutedsl_decode"
 SM100_DIR = PACKAGE_DIR / "_sm100"

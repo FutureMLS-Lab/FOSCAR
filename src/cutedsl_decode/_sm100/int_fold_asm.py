@@ -1,17 +1,16 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 """Single-instruction inline-asm primitives for the SM100 fold decode kernel.
 
-Each function here wraps ONE PTX instruction (or one short straight-line
-sequence with no control flow) that the DSL has no operator for. They carry no
-kernel state, read nothing from a ring, and mutate no pipeline, so they are the
-one layer of `int_fold_decode.py` that could move out with nothing to verify
-beyond "the emitted PTX did not change".
+Each function here wraps one PTX instruction, or one short straight-line sequence
+with no control flow, that the DSL has no operator for. They carry no kernel
+state, read nothing from a ring, and mutate no pipeline, so they can move out of
+`int_fold_decode.py` without any check beyond "the emitted PTX did not change".
 
-WHAT DOES NOT BELONG HERE. The byte maps (`map_int4`, `map_int2_k`, ...) are a
-different layer: they encode a POOL LAYOUT, so they stay in the kernel module beside
-the deposits that read it. Their closure defaults are also load-bearing, so the
-concurrent-stream arms can hand the same map their own staging tensors.
+The byte maps (`map_int4`, `map_int2_k`, ...) belong in the kernel module
+instead. They encode a pool layout, so they stay beside the deposits that read
+it, and their closure defaults let a concurrent stream hand the same map its own
+staging tensors.
 """
 from cutlass import Float32, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -22,32 +21,32 @@ from cutlass._mlir.dialects import llvm
 def _lift_exp(amax, *, loc=None, ip=None):
     """The channel-K Q'-plane po2 lift exponent, read off the f32 exponent field.
 
-    Returns ``m = clamp(floor(log2(amax)) - 7, -14, 10)``, which for every
-    NONNEGATIVE FINITE ``amax`` is EXACTLY what the 24-step compare ladder it
-    replaces returned — "largest e in [-13, 10] with amax >= 2^(e+7), else -14":
+    Returns ``m = clamp(floor(log2(amax)) - 7, -14, 10)`` for every NONNEGATIVE
+    FINITE ``amax``, which is the largest ``e`` in [-13, 10] with
+    ``amax >= 2^(e+7)``, else -14:
 
       * normal amax: biased exponent ``e_b = (bits >> 23) & 0xFF`` gives
         ``floor(log2(amax)) = e_b - 127``, so ``m = e_b - 134`` before the clamp.
       * ``amax == 0`` and subnormal amax: ``e_b == 0`` -> ``-134`` -> clamps to
-        ``-14``, matching the ladder (every subnormal is below its 2^-6 floor).
-        The zero case is not hypothetical — an out-of-range group loads
-        ``s_raw == 0``, so it happens on the tail tile of most sequences.
+        ``-14``, below the 2^-6 floor. The zero case is not hypothetical — an
+        out-of-range group loads ``s_raw == 0``, so it happens on the tail tile
+        of most sequences.
 
-    The mantissa is irrelevant to the answer, which is why the ladder's 24
-    FSETP + 24 SEL can be four integer instructions.
+    The mantissa does not affect the answer, which is why four integer
+    instructions suffice.
 
-    DOMAIN, stated because "bit-identical" is only true on it.
-    Outside the nonnegative finites the two forms DISAGREE: the ladder's ordered
-    ``>=`` compares are false for NaN so it yields -14, while the exponent read
-    sees ``e_b == 255`` and clamps to +10; and for a negative input the ladder
-    yields -14 while the exponent read ignores the sign bit and returns the
-    magnitude's exponent. Neither is reachable here — ``amax`` starts at
-    ``Float32(0)`` and is an ``fmax`` chain over ``s_eff[j] * rMaxq[rr, j]``,
-    where ``rMaxq`` is ``fmax(qv, -qv) >= 0`` and ``s_eff`` is a stored
-    quantization scale (``(max-min).clamp_min(1e-8)/qmax``, strictly positive)
-    times 1.0 or 2.0. So the input is nonnegative by construction, and NaN
-    requires already-NaN pool data. If a future caller widens that domain, this
-    helper stops matching ``_po2_lift`` and the host reference must follow.
+    The domain is the nonnegative finites, and only there does this match an
+    ordered compare ladder. Outside it the two disagree: the ladder's ``>=``
+    compares are false for NaN so it yields -14, while the exponent read sees
+    ``e_b == 255`` and clamps to +10, and a negative input yields its
+    magnitude's exponent rather than -14. Neither is reachable here — ``amax``
+    starts at ``Float32(0)`` and is an ``fmax`` chain over
+    ``s_eff[j] * rMaxq[rr, j]``, where ``rMaxq`` is ``fmax(qv, -qv) >= 0`` and
+    ``s_eff`` is a stored quantization scale
+    (``(max-min).clamp_min(1e-8)/qmax``, strictly positive) times 1.0 or 2.0. So
+    the input is nonnegative by construction, and NaN requires already-NaN pool
+    data. A caller that widens that domain gets a different result, and the
+    host reference must follow.
     """
     return Int32(llvm.inline_asm(
         T.i32(), [Float32(amax).ir_value(loc=loc, ip=ip)],
@@ -65,11 +64,10 @@ def _lift_exp(amax, *, loc=None, ip=None):
 
 @dsl_user_op
 def _prmt_r(a, b, c, *, loc=None, ip=None):
-    # PRMT with a REGISTER selector — the byte-LUT dequant primitive (lifted from
-    # probe_sm100_dequant): each of c's 4 low nibbles picks a byte of {a,b}; a
-    # selector nibble with bit3 set sign-replicates the selected byte's MSB
-    # (exploited: MSB-0 table bytes make out-of-half codes read 0x00, so the
-    # two int4 table halves OR together).
+    # PRMT with a REGISTER selector, the byte-LUT dequant primitive: each of c's
+    # 4 low nibbles picks a byte of {a,b}; a selector nibble with bit3 set
+    # sign-replicates the selected byte's MSB (exploited: MSB-0 table bytes make
+    # out-of-half encodings read 0x00, so the two int4 table halves OR together).
     return Int32(llvm.inline_asm(
         T.i32(), [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip),
                   Int32(c).ir_value(loc=loc, ip=ip)],
@@ -79,17 +77,12 @@ def _prmt_r(a, b, c, *, loc=None, ip=None):
 
 # ---- fold-off (fold_scale_zero=False) element-wise dequant primitives ----
 #
-# The ablation arm dequantizes with ONE PACKED FMA PER TWO ELEMENTS, in bf16,
-# and only then converts to the e4m3 operand. That is a deliberate choice about
-# what the arm is allowed to be: it is the BASELINE of a fold-vs-dequant
-# comparison, so it must pay what element-wise affine dequantization costs, not
-# what a clever encoding of it costs. (An earlier version exploited int2 having
-# only four possible values per token and gathered them with a per-token PRMT
-# table — one op per FOUR elements, about the same as the fold's own feed map.
-# It was correct and byte-exact, and it made the arm's dequant side nearly free,
-# which biases exactly the comparison the arm exists to make.) bf16 also matches
-# the sm90 arm's `_hfma2_bf16` dequant, so the two architectures' ablations
-# differ in operand dtype and nothing else.
+# The fold-off path dequantizes with ONE PACKED FMA PER TWO ELEMENTS, in bf16,
+# and only then converts to the e4m3 operand. That is deliberate: it is the
+# baseline of a fold-versus-dequant comparison, so it must pay what element-wise
+# affine dequantization costs, not what a clever encoding of it costs. bf16 also
+# matches the sm90 path's `_hfma2_bf16` dequant, so the two architectures differ
+# in operand dtype and nothing else.
 #
 # There is no bf16 -> fp8 pack in PTX (`cvt.rn.satfinite.e4m3x2.bf16x2` is
 # rejected by ptxas on sm_100a, as is `cvt.rn.bf16x2.e4m3x2` the other way), so
@@ -97,13 +90,13 @@ def _prmt_r(a, b, c, *, loc=None, ip=None):
 # integer ops — and uses the f32 form. `fma.rn.f16x2` + the direct
 # `cvt.rn.satfinite.e4m3x2.f16x2` would save those two ops and carry 10 mantissa
 # bits instead of 7; bf16 is chosen for parity with sm90. Either way the value is
-# rounded TWICE (to the FMA dtype, then to
-# e4m3), which the reference and the byte-exact gate both model.
+# rounded TWICE (to the FMA dtype, then to e4m3), which the reference and the
+# byte-exact gate both model.
 @dsl_user_op
 def _fma2_bf16(a, b, c, *, loc=None, ip=None):
     # d = fma.rn per bf16 lane on .b32-packed bf16x2 words: ONE rounding of the
     # exact a*b + c into bf16, which is what lets the host expectation replay it
-    # by rounding an f64 product-sum once (`repack_sm100.dequant_bf16_fma_e4m3`).
+    # by rounding an f64 product-sum once (`cutedsl_decode.pool.dequant_bf16_fma_e4m3`).
     return Int32(llvm.inline_asm(
         T.i32(),
         [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip),
@@ -114,7 +107,7 @@ def _fma2_bf16(a, b, c, *, loc=None, ip=None):
 
 @dsl_user_op
 def _sub2_bf16(a, b, *, loc=None, ip=None):
-    # d = a - b per bf16 lane. Used to take the magic base back off the feed
+    # d = a - b per bf16 lane. Takes the magic base back off the feed
     # (y = 4 + q -> q), which is EXACT here by Sterbenz.
     return Int32(llvm.inline_asm(
         T.i32(),
@@ -144,7 +137,7 @@ def _e4m3x4_of_bf16x2(w01, w23, *, loc=None, ip=None):
     registers are untyped. Then one `cvt.rn.satfinite.e4m3x2.f32` per pair and a
     vector `mov.b32` to place the two halves, so the whole pack is 7 ops per 4
     elements. (`cvt.u32.u16` is NOT the way to widen the 16-bit result: ptxas
-    rejects it — "Unknown field '.u32'" — hence the `{%e, %z}` vector mov.)
+    rejects it — "Unknown field '.u32'" — hence the vector `mov.b32`.)
 
     RNE + satfinite is `torch.Tensor.to(float8_e4m3fn)`'s rounding, and the
     saturation matters: a dequantized value past 448 must clamp rather than
@@ -200,8 +193,8 @@ def _opaque_i32(x, *, loc=None, ip=None):
     their source order: the PTX tests the value against the MMA-KQ and TMA-VO warp numbers
     first, and ptxas then places those two bodies after the dequant loops, which moves every
     other role's loop and costs instruction-cache hits. With each check comparing its own copy,
-    the checks stay a chain in source order and the bodies keep the layout of a build that reads
-    the warp index once, at kernel entry.
+    the checks stay a chain in source order and the bodies keep the layout produced by reading
+    the warp index once at kernel entry.
     """
     return Int32(llvm.inline_asm(
         T.i32(), [Int32(x).ir_value(loc=loc, ip=ip)], "mov.b32 $0, $1;", "=r,r",

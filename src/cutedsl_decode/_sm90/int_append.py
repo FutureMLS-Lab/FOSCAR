@@ -1,11 +1,12 @@
-"""IntAppend — fused token-wise quantize + fragment-order SCATTER append into a ServingCache.
+# Copyright 2026 Donglin Zhuang
+# SPDX-License-Identifier: Apache-2.0
+"""IntAppend: fused token-wise quantize and fragment-order scatter append into a ServingCache.
 
-The device write-path for the serving-readiness contract (serving_cache.ServingCache): given new
-K/V token vectors, quantize them token-wise (the quant_ref contract) and write the resulting codes
-+ (scale, zero) DIRECTLY into the GLOBAL paged fragment-order pool that IntPingPongDecodeSm90, the
-production SM90 decode, consumes, byte/value-exact with the host oracle (repack_*_rs(order=
-"chunk16") -> make_serving_cache).  Spec:
-docs/superpowers/specs/2026-06-16-int-decode-serving-readiness-design.md.
+This module is the device write path for serving_cache.ServingCache. Given new K/V token
+vectors, it quantizes them token-wise and writes the resulting values and their (scale, zero)
+pairs directly into the global paged fragment-order pool that IntPingPongDecodeSm90, the SM90
+decode kernel, reads. The write matches the host path that builds the same pool from
+chunk16-ordered thread rows (`serving_cache.make_serving_cache`), value for value.
 
 CONTRACT (writes serving_cache.ServingCache, exactly):
   codes_k uint8 [NP, HKV, per_k/16, 128, 16]  /  codes_v uint8 [NP, HKV, per_v/16, 128, 16]
@@ -20,29 +21,23 @@ INPUTS to __call__:
   mSlot   int32 [num_new, 2]            per new token: (global_page, intra-tile pos t in [0, N)).
   codes_k, codes_v, scales              the ServingCache tensors to write INTO (must be ZEROED at
                                         allocation: the scatter is an RMW-OR, so codes accumulate).
-The scatter map of the head dimension (`serving_cache.scatter_map_file`: scripts/frag_scatter_k16.pt
-at D=128, scripts/frag_scatter_k16_d256.pt at D=256) is loaded on the host by `_ensure_scatter`
-BEFORE compile; __call__ reads it as gmem int32 [N, D, 3] tensors.
+The scatter map of the head dimension (`serving_cache.scatter_map_file`: `frag_scatter_k16.pt` at
+D=128, `frag_scatter_k16_d256.pt` at D=256) is loaded on the host by `_ensure_scatter` before
+compile; `__call__` reads it as gmem int32 [N, D, 3] tensors.
 
-QUANT (mirrors scripts/probes/fold_numerics.quant_tokenwise == quant_ref.quant_tokenwise, token-
-LOCAL over the D channels, no cross-token dependency):  z = min_d x ;  s = (max_d x - min_d x)/qmax clamp
-1e-8 ;  q = round((x - z)/s).clamp(0, qmax).  qmax = 2^bits - 1.  round = round-to-nearest-EVEN
-(cvt.rni.s32.f32 — matches torch.round's tie rule, so the codes are byte-exact with the oracle).
+QUANT (token-local over the D channels, no cross-token dependency):  z = min_d x ;  s = (max_d x
+- min_d x)/qmax clamp 1e-8 ;  q = round((x - z)/s).clamp(0, qmax).  qmax = 2^bits - 1.  round =
+round-to-nearest-even (cvt.rni.s32.f32, which matches torch.round's tie rule, so the written
+values equal the host's).
 
-BF16-QUANT ORACLE COUPLING — the device `_bf()` helper rounds intermediate arithmetic results
-through bf16 (Float32 -> BFloat16 -> Float32) to EXACTLY match fold_numerics.quant_tokenwise,
-which keeps all arithmetic in bf16 (the K/V inputs are bf16 and are never up-cast to f32 on the
-host).  This means:
-  - the round-trip test gate (`test_serving_roundtrip.py`) is only byte-exact against
-    fold_numerics.quant_tokenwise (the bf16-arithmetic oracle), NOT against quant_ref.quantize_tokenwise
-    (which casts to f32 before quantizing and therefore rounds differently).
-  - IF the host quant is ever migrated from fold_numerics (bf16) to quant_ref (f32), then BOTH
-    the device `_bf()` rounding in `_quant` / `kernel` AND the round-trip oracle in the test must
-    move together to f32 arithmetic — changing one without the other will silently break byte-exact
-    correctness even though individual numbers may look close.  The coupling is intentional and
-    must be kept in sync.
+BF16 ARITHMETIC: the `_bf()` helper rounds each intermediate arithmetic result through bf16
+(Float32 -> BFloat16 -> Float32) because the host quantizer keeps all arithmetic in bf16: the
+K/V inputs are bf16 and are never up-cast to f32.  Matching that rounding is what makes the
+written values equal the host's.  If the host quantizer ever moves to f32 arithmetic, the
+`_bf()` rounding in `_quant` and in `kernel` must move with it; changing one side alone breaks
+the match even though individual numbers may look close.
 
-SCATTER (gate-0 verdict = SHARED/RMW, but DISJOINT bit-fields — scripts/probes/append_scatter.py):
+SCATTER (shared read-modify-write, disjoint bit-fields):
 a single token's D channel codes land in plane-words shared with OTHER tokens of the same tile,
 but no two tokens ever claim the same (row, word, field_bit).  So the append RMW-ORs each code's
 bits into the destination u32 word (preserving the bits other tokens already wrote).  Concurrent
@@ -56,8 +51,8 @@ across the whole launch.  The scatter map of the head dimension:
   code-pool order, and `serving_cache.code_word_offset` gives it: word w of row t is at word
   t*thread + (w // 4)*chunk + w % 4 of the (page, kv-head) block, which for chunk16 is
   (chunk, row, word-in-chunk) = (w // 4, t, w % 4).  That is the one place the order enters.
-The V^T orientation + the D/64 stacked output halves are ALREADY baked into scatter_v (absolute word
-index over the per_v row), so the V path just follows scatter_v with no extra transpose.
+The V^T orientation and the D/64 stacked output halves are already baked into scatter_v (an
+absolute word index over the per_v row), so the V path follows scatter_v with no extra transpose.
 
 GRID / THREAD DESIGN:
   grid  = [num_new, 1, 1]                one CTA per new token (covers single-token decode append AND
@@ -67,11 +62,9 @@ GRID / THREAD DESIGN:
   lane L owns channels L + 32*e, e in [0, D/32).  min/max is a lane-local reduce over the owned
   channels then a warp butterfly (offsets 1,2,4,8,16); s,z are then warp-uniform.  Each lane
   quantizes its channels and atomic_or-scatters them; lane 0 writes the (s_k,z_k,s_v,z_v) vector
-  store to scales[page, hk, t, :].  At D=128 the body is the four-scalar form it has always been,
-  kept verbatim because no standing gate compares this kernel's D=128 PTX with a reference: the
-  PTX fingerprint covers the decode kernel, and `scripts/test_int_append_wide_offsets.py` checks
-  only how this one computes its offsets.  Any other D holds the owned values in two register
-  tensors of D/32 elements, with the same reduce, butterfly and scatter.
+  store to scales[page, hk, t, :].  At D=128 the body holds each lane's four owned values in four
+  scalars; any other D holds them in two register tensors of D/32 elements, with the same reduce,
+  butterfly and scatter.
 """
 import os
 
@@ -106,16 +99,16 @@ def _fmin(a, b):
 
 @cute.jit
 def _bf(x):
-    """Round an f32 through bf16 and back (models torch bf16-arithmetic rounding).  The host
-    oracle (fold_numerics.quant_tokenwise) computes s, z and q in BF16 arithmetic (the K/V inputs
-    are bf16 and never cast to f32), so the device must round each arithmetic step to bf16 to be
-    byte-exact: s = bf(bf(mx-mn)/qmax), q = round(bf(bf(x-z)/s))."""
+    """Round an f32 through bf16 and back, modeling the host's bf16 arithmetic.  The host
+    quantizer computes s, z and q in bf16 arithmetic (the K/V inputs are bf16 and are never cast
+    to f32), so the device rounds each arithmetic step to bf16 to match it:
+    s = bf(bf(mx-mn)/qmax), q = round(bf(bf(x-z)/s))."""
     return Float32(BFloat16(x))
 
 
 class IntAppend:
     def __init__(self, head_dim, page_size=64, bits=4, sdtype=Float32):
-        # The head dimensions the reader decodes, each of which has a committed scatter map
+        # The head dimensions the reader decodes, each of which has its own scatter map
         # (`serving_cache.scatter_map_file`). A raise, not an assert: `python -O` removes an
         # assert, and a head dimension without its map would write codes where no reader looks.
         if head_dim not in SM90_HEAD_DIMS:
@@ -128,8 +121,8 @@ class IntAppend:
         self.bits = bits
         self.qmax = (1 << bits) - 1
         self.sdtype = sdtype
-        # THE POOL IS THE READER'S, asked of it rather than restated: the serving path follows
-        # the production decode's code-pool order. The thread-row bytes come from the pool
+        # THE POOL IS THE READER'S, asked of it rather than restated: the append follows
+        # the decode kernel's code-pool order. The thread-row bytes come from the pool
         # geometry the reader uses too (`serving_cache`, CODE POOL GEOMETRY), and from both,
         # `code_word_offset` places each row word in the pool, which is all `kernel`'s
         # addressing uses.
@@ -167,9 +160,8 @@ class IntAppend:
         page = mSlot[(i, 0)]
         t = mSlot[(i, 1)]
 
-        # THE D=128 BODY IS THE FOUR-SCALAR FORM, VERBATIM, because no standing gate compares
-        # this kernel's D=128 PTX with a reference (the module docstring); any other head
-        # dimension holds its owned values in register tensors.
+        # The D=128 body holds each lane's four owned values in four scalars; any other head
+        # dimension holds them in register tensors of D/32 elements (the module docstring).
         if cutlass.const_expr(self.head_dim == 128):
             # ---- load the 4 channels this lane owns (channel = lane + 32*e) ----
             x_k0 = Float32(mK[(i, hk, lane + 0)]);   x_v0 = Float32(mV[(i, hk, lane + 0)])
@@ -191,8 +183,9 @@ class IntAppend:
                 mnk = _fmin(mnk, cute.arch.shuffle_sync_bfly(mnk, offset=o))
                 mnv = _fmin(mnv, cute.arch.shuffle_sync_bfly(mnv, offset=o))
 
-            # s = bf(bf(max-min) clamp 1e-8 / qmax) ; z = min  (bf16-arithmetic quant_tokenwise contract;
-            # mx,mn are exact bf16 — comparisons don't round — so only the sub/div need bf16 rounding).
+            # s = bf(bf(max-min) clamp 1e-8 / qmax) ; z = min  (bf16 arithmetic, the host
+            # quantizer's rule; mx,mn are exact bf16 — comparisons don't round — so only the
+            # sub/div need bf16 rounding).
             sk = _bf(cute.arch.fmax(_bf(mxk - mnk), Float32(_S_CLAMP)) / qmax)
             sv = _bf(cute.arch.fmax(_bf(mxv - mnv), Float32(_S_CLAMP)) / qmax)
             zk = mnk
@@ -289,11 +282,11 @@ class IntAppend:
 
     @cute.jit
     def _quant(self, x, z, s, qmax):
-        """q = clamp(round(bf(bf(x - z) / s)), 0, qmax) as Int32 (round-to-nearest-even via cvt.rni;
-        bf16-rounded sub + div to match the host bf16-arithmetic quant_tokenwise byte-exactly).
-        round then clamp == clamp(f32 unrounded) then round (integer bounds), so the f32 clamp on
-        the rounded value is applied AFTER cvt.rni — done here by clamping the bf16 ratio in float
-        then cvt.rni (monotone: identical integer result)."""
+        """q = clamp(round(bf(bf(x - z) / s)), 0, qmax) as Int32, round-to-nearest-even via
+        cvt.rni, with the sub and div bf16-rounded to match the host's bf16 arithmetic exactly.
+        Rounding then clamping equals clamping the f32 ratio then rounding, because the bounds
+        are integers; so the bf16 ratio is clamped in float and then cvt.rni'd, which is monotone
+        and gives the identical integer result."""
         ratio = _bf(_bf(x - z) / s)                       # bf16(bf16(x-z)/s) — the host's pre-round value
         ratio = cute.arch.fmax(Float32(0.0), _fmin(ratio, qmax))
         return _cvt_rni_s32(ratio)

@@ -1,6 +1,0 @@
-
-Resource usage:
- Common:
-  GLOBAL:0
- Function regions_kernel:
-  REG:80 STACK:240 SHARED:0 LOCAL:0 CONSTANT[0]:548 TEXTURE:0 SURFACE:0 SAMPLER:0

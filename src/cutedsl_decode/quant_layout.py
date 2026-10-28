@@ -1,5 +1,7 @@
+# Copyright 2026 Donglin Zhuang
+# SPDX-License-Identifier: Apache-2.0
 # src/cutedsl_decode/quant_layout.py
-"""The scale-block layout and quantization envelope, shared by BOTH decode kernels.
+"""The scale-block layout and quantization envelope, shared by both decode kernels.
 
 Torch-free, so the kernel modules can import it.  Per (page, kv-head) the scale
 block is SECTIONED, sdtype, contiguous:
@@ -14,47 +16,33 @@ channel sections (read per token-GROUP; ride the same per-page block):
                      duplicated per page when Gt > N (pages of one group carry
                      identical copies)
 
-The legacy interleaved [N, 4] = (s_k, z_k, s_v, z_v) layout is preserved
-EXACTLY when both tensors are ("token", D) — the shipped fast path keeps its
-[NP, HKV, N, 4] f32 mScale contract and compiles byte-identical.
+When both tensors are ("token", D) the block uses the interleaved
+[N, 4] = (s_k, z_k, s_v, z_v) layout instead, which keeps the
+[NP, HKV, N, 4] f32 mScale contract of the fast path.
 
-THIS FILE IS THE ONE COPY, AND IT MUST STAY THAT WAY.  `quant_block_offsets`
-was once transcribed into a second module, kept honest by a drift check that
-compared the two; one implementation is better than two that agree, and it leaves
-that check nothing to do.
-
-`validate_quant_flex` is the same rule for the envelope, and duplicating it is
-worse than duplicating a layout, because the copies need not even disagree
-visibly: spelled as inline constructor asserts, SM90's envelope once ADMITTED V
-token-64 in its granularity assert and refused it in a second assert
-twenty-five lines below.  This function refuses it once, where a reader looking
-for the envelope will find it.  Reading only the first of two asserts is what
-produced five RUN-FAIL cells on a pristine build (docs/kernel/int_decode_pingpong_sm90.md).
-
-`sm90_wide_refusal` and `sm90_wide_layouts` are the SM90 decode's rule for a head
-dimension other than 128, an SM90 rule like SM100's own head-dimension rule.  They live
-here for the same reason: the constructor refuses with the first, and the gate scripts,
-which load this file by path, generate their rows at that head dimension from the second.
+This file holds the single implementation of each rule, and a caller must not
+transcribe one elsewhere.  `quant_block_offsets` gives the layout,
+`validate_quant_flex` gives the envelope, and `sm90_wide_layouts` with
+`sm90_wide_refusal` gives the SM90 rule for a head dimension other than 128.
+Two copies need not disagree visibly to be wrong: spelled as separate constructor
+asserts, an envelope can admit a configuration in one check and refuse it in
+another below, and a reader who stops at the first check learns the wrong rule.
+`sm90_wide_refusal` returns its reason as a string so the constructor can raise
+`ValueError` under `python -O`; `sm90_wide_layouts` lists the layouts that head
+dimension accepts, for callers that generate configurations instead of validating
+them.
 """
 
 
 def _norm_pair(q, which):
     """Normalize one (axis, group) config to a plain `(str, int)` tuple.
 
-    The point of normalizing HERE, once, is consistency: the SM90 original compared
-    `k_quant == ("token", D)` to detect the legacy layout, so a LIST `["token", 128]`
-    fell through to the sectioned path and produced a DIFFERENT scale-pool layout for
-    the same configuration. The SM100 transcription normalized first and did not have
-    that hole. This is that behaviour, and it is the whole of the input contract:
-    `int()` on the group, exactly as `validate_quant_flex` has always done, so callers
-    that already pre-convert (`wrapper.py`, `fold_runtime.quant_cfg_of`) and callers
-    that do not agree on what a config means.
-
-    It reads `q[0]` and `q[1]` and converts, exactly as the original did, and adds no
-    validation of its own. Two assertions on the shape and the axis type were tried
-    here and removed: neither existed in the function this replaces, no caller can
-    produce an input that trips them, and adding them made the equivalence claim above
-    false for inputs the originals accepted.
+    Every entry point in this module normalizes through this function first, so a
+    list `["token", 128]` and a tuple `("token", 128)` name the same
+    configuration. That is the whole of the input contract: it reads `q[0]` and
+    `q[1]`, applies `int()` to the group, and adds no validation of its own, so
+    callers that pre-convert (`wrapper.py`, `fold_runtime.quant_cfg_of`) and
+    callers that do not agree on what a configuration means.
     """
     return (q[0], int(q[1]))
 
@@ -141,8 +129,8 @@ def sm90_wide_refusal(head_dim, k_quant, v_quant, *, sdtype, fold_scale_zero, nu
 
 
 def validate_quant_flex(k_quant, v_quant, page_size, head_dim):
-    """Normalize + validate the per-tensor (axis, group) configs against the
-    SM100 fold kernel's envelope (SM90 IntPingPongDecodeSm90 parity):
+    """Normalize and validate the per-tensor (axis, group) configs against the
+    SM100 fold kernel's envelope, at SM90 parity:
       K: ("token", D), ("token", D//2), ("channel", Gt in {64, 128, 256})
       V: ("token", D), ("channel", Gt in {64, 128, 256})
     Returns (k_quant, v_quant) as plain tuples."""

@@ -1,40 +1,37 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
-"""Library-side compile/launch glue for ``IntPingPongDecodeSm90`` (SM90 quantized KV).
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: Apache-2.0
+"""Compile and launch glue for ``IntPingPongDecodeSm90``, the SM90 quantized KV kernel.
 
-The Hopper sibling of ``_sm100/fold_runtime.py``: it is what
+This is the Hopper sibling of ``_sm100/fold_runtime.py``: it is what
 :class:`cutedsl_decode.PagedDecodeWrapper` calls when ``plan(bits=...)`` runs on
-an SM90 device, so the quantized path has ONE public entry point on both
-architectures.
+an SM90 device, so the quantized path has one public entry point on both
+architectures. The entry points are ``compile_pingpong`` and
+``compile_constructed`` for compilation, ``alloc_pingpong_workspace`` for the
+per-plan workspace, and ``launch_pingpong`` for the launch.
 
-Validated on H100 SXM5; the validation record is in
-``docs/kernel/int_decode_pingpong_sm90.md``.
-
-TWO THINGS THAT ARE NOT BUGS AND LOOK LIKE THEM
+INVARIANTS
 
   * The accuracy floor is ~2.4e-3, not SM100's ~1.8e-3, because ``mQ`` here is
-    **bf16** where ``IntDecodeSm100`` takes fp8_e4m3. 2**-9 is the floor.
-  * ``plan_splits`` can emit split counts outside ``_sm100``'s ``{1,2,4,8,16}``.
-    It returns the occupancy-model pick (16 at B=1, KV 8k-32k); the
-    legacy ``capacity // base`` value, 33 at B=1/KV=32768, survives only as a
-    candidate and as the unknown-width fallback. Any count is legal, because the
-    kernel ceil-partitions and tolerates empty tail splits, which the parity gate
-    exercises deliberately at up to 2x the tile count.
+    bf16 where ``IntDecodeSm100`` takes fp8_e4m3. 2**-9 is the floor.
+  * ``plan_splits`` may emit split counts outside ``_sm100``'s ``{1,2,4,8,16}``.
+    It returns the occupancy model's pick (16 at B=1, KV 8k-32k), and it falls
+    back to ``capacity // base`` for an unknown width. Any count is legal,
+    because the kernel ceil-partitions and tolerates empty tail splits.
 
 DESIGN NOTES THAT MATTER IF YOU CHANGE THIS
 -------------------------------------------
 * ``mCnt`` (int32 ``[B*HKV]``) is the fused-combine arrival counter. The kernel
-  contract says: allocate zeroed ONCE, the reducing CTA rearms its own cell to
-  0 each launch. So it must NOT be re-zeroed per call, and it must NOT be
+  contract is: allocate it zeroed once, and the reducing CTA rearms its own cell
+  to 0 each launch. So it must not be re-zeroed per call, and it must not be
   carved out of a buffer that something else writes. It is allocated in
   ``plan()`` and owned by the wrapper.
-* ``fused_combine`` is a TRACE-TIME ctor flag, not a runtime one, and
+* ``fused_combine`` is a trace-time constructor flag, not a runtime one, and
   ``plan_fused_combine`` is its enable policy. It must therefore be decided
-  before the compile — which is why the split plan happens first in ``plan()``,
-  same ordering rule as the SM100 side (reduction mode is also compile-time
-  there).
-* When ``outer_splits > 1`` and the fused combine is OFF, a SECOND kernel
-  (``SplitKCombine``) has to run after the decode. When it is ON, the decode
-  kernel's last CTA does the merge and the second launch must be skipped —
+  before the compile, which is why the split plan happens first in ``plan()``.
+  The SM100 side follows the same ordering, because its reduction mode is also
+  compile-time.
+* When ``outer_splits > 1`` and the fused combine is off, a second kernel
+  (``SplitKCombine``) runs after the decode. When it is on, the decode kernel's
+  last CTA does the merge and the second launch must be skipped, because
   running both would double-reduce.
 """
 import os
@@ -73,15 +70,14 @@ NVVM_LSR_OFF = "-Xllc -disable-lsr={}"
 #: recomputations. The setmaxnregs split cannot pay for the extra registers instead: at two CTAs
 #: per SM the consumers' 104 is already the most the pool allows.
 REMAT_OFF_HEAD_DIMS = (128,)
-#: The head dimensions whose direct A/Bs named `lsr_off`'s classes; at any other head dimension
-#: strength reduction stays on.
+#: The head dimensions at which strength reduction is off; at any other head dimension it stays
+#: on.
 LSR_OFF_HEAD_DIMS = (128,)
 #: What every SM90 kernel other than the decode compiles with under DSL 4.8, so that such a kernel
 #: does not inherit a decode compile's values: the remat pass on, pressure-aware CSE and loop
 #: strength reduction on, which are libNVVM's defaults, and a remat cost threshold of 10, a reset
-#: value. libNVVM does not expose that threshold's default; 10 is the lowest value with which each
-#: non-decode SM90 kernel tried compiles to the same binary as with no options at all, which does
-#: not establish that it is the default.
+#: value. libNVVM does not expose that threshold's default; 10 is the lowest value that compiles
+#: each SM90 non-decode kernel to the same binary as with no options at all.
 NVVM_DEFAULTS = " ".join([NVVM_REMAT.format("true"), "-Xllc -cost-threshold-remat=10",
                           NVVM_MCSE_OFF.format("true"), NVVM_LSR_OFF.format("false")])
 #: The nvidia-cutlass-dsl releases the SM90 decode compiles under, by major.minor: whether that
@@ -100,12 +96,13 @@ _NORMALIZED_VERSION = re.compile(
 
 
 def mcse_off(kern):
-    """Whether `kern` compiles with machine CSE that ignores register pressure. It does except in
-    the configuration classes in which a direct A/B of the two settings measured the
-    pressure-aware CSE, NVVM 23's default, faster, which is no known mechanism, so the classes
-    are named rather than derived: INT4 with K token-wise per half of the head dimension, INT4
-    with channel-wise K whose group spans more than one tile and token-wise V, and a
-    fused-combine kernel at a head dimension where the remat pass stays on."""
+    """Whether `kern` compiles with machine CSE that ignores register pressure.
+
+    It does except in the configuration classes below, where pressure-aware CSE, NVVM 23's
+    default, is faster: INT4 with K token-wise per half of the head dimension, INT4 with
+    channel-wise K whose group spans more than one tile and token-wise V, and a fused-combine
+    kernel at a head dimension where the remat pass stays on. The classes are named rather than
+    derived."""
     if kern.fused_combine and kern.head_dim not in REMAT_OFF_HEAD_DIMS:
         return False
     if kern.bits == 4:
@@ -118,14 +115,13 @@ def mcse_off(kern):
 
 
 def lsr_off(kern):
-    """Whether `kern` compiles with loop strength reduction off: the configuration classes at
-    head dimension 128 in which two independent direct A/Bs of the two settings both measured it
-    faster, which is no known mechanism, so the classes are named rather than derived. Each is
-    channel-wise K whose group spans more than one tile, outside a fused-combine kernel, and
-    either INT2 with token-wise V or INT4 with channel-wise V whose group is one tile. Classes
-    that only one of the two A/Bs favoured off keep it on. Everywhere else strength reduction
-    stays on, including head dimension 256, where the A/B favoured it on in four cells and off
-    in one."""
+    """Whether `kern` compiles with loop strength reduction off.
+
+    It is off in the configuration classes below, all at head dimension 128, where strength
+    reduction is faster: each is channel-wise K whose group spans more than one tile, outside a
+    fused-combine kernel, and either INT2 with token-wise V or INT4 with channel-wise V whose
+    group is one tile. The classes are named rather than derived. Everywhere else strength
+    reduction stays on, including head dimension 256."""
     if (kern.head_dim not in LSR_OFF_HEAD_DIMS or kern.fused_combine
             or kern.k_axis != "channel" or kern.k_group <= kern.page_size):
         return False
@@ -139,8 +135,8 @@ def nvvm_options(kern):
     kernel, every one stated explicitly (see `NVVM_REMAT`).
 
     The head dimension decides the remat setting as a compile-time stand-in for spill risk,
-    which the SASS census checks per configuration, because the options must be fixed when the
-    kernel is traced. `mcse_off` and `lsr_off` decide the other two."""
+    because the options must be fixed when the kernel is traced. `mcse_off` and `lsr_off`
+    decide the other two."""
     remat_off = kern.head_dim in REMAT_OFF_HEAD_DIMS
     return " ".join([
         NVVM_REMAT.format("false" if remat_off else "true"),
@@ -187,11 +183,9 @@ def plan_pingpong(batch, num_kv_heads, kv_len, *, bits, head_dim, sm_count=None)
     """``(outer_splits, min_blocks_per_sm, fused_combine)`` for one launch.
 
     Thin adapter over ``_sm90/scheduler.plan_splits`` + ``plan_fused_combine``,
-    so the wrapper reaches the calibrated H100 cost model. The dense wave-fill
-    rule was removed with the dense path (9490340), and the quantized path plans
-    only through ``plan_splits_sm100`` and ``plan_splits``. ``head_dim`` is
-    required and forwarded, because the planner's model is fitted per head
-    dimension.
+    so the wrapper reaches the calibrated H100 cost model. The quantized path
+    plans only through ``plan_splits``. ``head_dim`` is required and forwarded,
+    because the planner's model is fitted per head dimension.
     """
     from .scheduler import plan_fused_combine, plan_splits
 
@@ -238,17 +232,16 @@ def compile_pingpong(*, head_dim, num_qo_heads, num_kv_heads, bits,
     scale block shapes are static because the kernel's TMA views assert on
     their exact strides.
 
-    Returns the compiled callable. Cross-compiles on a non-Hopper box, where it
-    must NOT then be invoked (sticky CUDA 209); launched and validated on H100 —
-    see the module docstring.
+    Returns the compiled callable. It cross-compiles on a non-Hopper machine, where it must
+    not then be launched, because the device returns a sticky CUDA error 209; it is launched
+    and validated on H100.
 
-    THE FOLD IS NOT OPTIONAL HERE. The kernel accepts `fold_scale_zero=False`, the
-    classic-dequant ablation arm that measures what folding is worth, but this function
-    does not take it and will not: a public compile API offering a caller the choice
-    between a fast path and a slow one is the defect CLAUDE.md's "instruction-efficient
-    operand path" rule is about, because it lets a caller get the slow path by
-    forgetting. Callers of this function get the fold, always. A harness that must
-    compile the ablation constructs the kernel itself and calls `compile_constructed`.
+    The fused fold is not optional here. The kernel accepts `fold_scale_zero=False`, but
+    this function does not take that flag: a public compile API that offers a caller the
+    choice between a fast path and a slow one lets a caller reach the slow path by
+    forgetting the flag. Callers of this function always get the folded path. A caller
+    that must compile the unfolded kernel constructs the kernel itself and calls
+    `compile_constructed`.
     """
     import cutlass
     import cutlass.cute as cute
@@ -317,8 +310,8 @@ def pingpong_compiler(kern, opt_level):
     """`(compile, options)` for the constructed `IntPingPongDecodeSm90` `kern`, with the NVVM
     options `nvvm_options` derives from it (`_compiler`).
 
-    Every compile of the decode kernel goes through this, the gates' static-shape compiles
-    included, so that a gate tests the object the library ships.
+    Every compile of the decode kernel goes through this, including the static-shape
+    compiles in the tests, so that a test exercises the object the library ships.
     """
     return _compiler(opt_level, nvvm_options(kern))
 
@@ -333,26 +326,24 @@ def sm90_compiler(opt_level):
 
 def compile_constructed(kern, *, head_dim, num_qo_heads, num_kv_heads,
                         page_size=POOL_PAGE_SIZE, opt_level=None):
-    """Compile an ALREADY-CONSTRUCTED ``IntPingPongDecodeSm90`` against symbolic shapes.
+    """Compile an already constructed ``IntPingPongDecodeSm90`` against symbolic shapes.
 
     Separate from `compile_pingpong` so that the fold remains non-optional on the
-    public entry point while a harness that must compile the classic-dequant
-    ablation still can. The rule it serves is CLAUDE.md's
-    "instruction-efficient operand path": a caller must not be able to select the slow
-    path by passing a flag, so the flag is not on the API -- a caller that genuinely
-    wants a non-default kernel builds that kernel itself and brings it here.
+    public entry point while a harness that must compile the unfolded kernel still
+    can. A caller must not be able to select the slow path by passing a flag, so the
+    flag is not on the public API; a caller that genuinely wants a non-default kernel
+    builds that kernel itself and brings it here.
 
-    Besides `compile_pingpong`, its callers are the gates and harnesses that compile a
-    kernel the public entry point does not build, such as the fold-off ablation arm or a
-    kernel with the int2 phase lock switched off, and those that need the constructed kernel
-    object itself, which `compile_pingpong` does not return.
+    Besides `compile_pingpong`, it is called by tests that compile a kernel the public
+    entry point does not build, such as the unfolded kernel or a kernel with the int2
+    phase lock switched off, and by callers that need the constructed kernel object
+    itself, which `compile_pingpong` does not return.
     """
     # THE KERNEL AND THE TENSORS MUST AGREE ON D. `kern` is already built and carries
     # its own head_dim; the `head_dim` argument here only sets the fake Q and output
-    # extents. Nothing tied the two together, so a D=128 kernel could be compiled
-    # against D=64 tensors: the traced code would still write both 64-channel halves,
-    # past the end of a 64-wide row. The constructor guard cannot see this, because
-    # both values are individually legal. (codex, 2026-09-04)
+    # extents. A D=128 kernel compiled against D=64 tensors would trace code that still
+    # writes both 64-channel halves, past the end of a 64-wide row. The constructor
+    # guard cannot see this, because both values are individually legal.
     if head_dim != kern.head_dim:
         raise ValueError(
             f"compile_constructed was given head_dim={head_dim} for a kernel built at "
@@ -527,15 +518,14 @@ def alloc_pingpong_workspace(batch, num_qo_heads, num_kv_heads, head_dim,
 def launch_pingpong(compiled, combine, *, q_bhd, mKq, mVq, mScale, block_table,
                     seq_lens, o_partial, out_bhd, lse, counters,
                     scale_s, scale_o, outer_splits, num_kv_heads, batch):
-    """Launch the decode (+ the external combine when supplied).
+    """Launch the decode, and the combine kernel when one is supplied.
 
-    Validated on H100 SXM5 at every split count and both combine mechanisms
-    (baselines/check_sm90_split_parity.py).
+    Validated on H100 SXM5 at every split count and with both combine mechanisms.
 
     ``combine`` must be None when the kernel was compiled with
-    ``fused_combine=True`` or when ``outer_splits == 1``; passing it anyway
-    would double-reduce. The caller (`PagedDecodeWrapper`) owns that choice —
-    see ``plan_pingpong``.
+    ``fused_combine=True`` or when ``outer_splits == 1``, because passing it anyway
+    would double-reduce. The caller (`PagedDecodeWrapper`) owns that choice; see
+    ``plan_pingpong``.
 
     ``mKq``/``mVq`` must be C-contiguous and in the kernel's ``code_pool_order``;
     a row-major ``[NP, HKV, 128, per]`` pool is refused here by name, before the

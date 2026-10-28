@@ -1,6 +1,0 @@
-
-Resource usage:
- Common:
-  GLOBAL:0
- Function kernel_cutlass_kernel_cutedsl_decode_sm90splitk_combineSplitKCombine_object_at__tensorptrf32_gmem_align16_o_128i64_div128i64_div1281281_tensorptrf32_gmem_align16_o_i64i641_tensorptrbf16_g_0:
-  REG:28 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:636 TEXTURE:0 SURFACE:0 SAMPLER:0

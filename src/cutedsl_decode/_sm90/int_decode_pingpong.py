@@ -1,3 +1,5 @@
+# Copyright 2026 Donglin Zhuang
+# SPDX-License-Identifier: Apache-2.0
 """PING-PONG int2/int4 quantized-KV GQA decode (SM90): two SYMMETRIC full-attention
 consumer warpgroups per CTA, i.e. an intra-CTA split-K.
 

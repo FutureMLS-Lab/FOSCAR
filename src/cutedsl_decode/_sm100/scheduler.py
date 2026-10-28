@@ -1,3 +1,5 @@
+# Copyright 2026 Donglin Zhuang
+# SPDX-License-Identifier: Apache-2.0
 """Split-KV planner for the SM100 quantized-KV fold decode kernel.
 
 At plan time this module picks ``(kv_splits, reduction_mode)`` for

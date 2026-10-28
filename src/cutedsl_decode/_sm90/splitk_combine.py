@@ -1,10 +1,14 @@
-"""Fused split-K (flash-decode) LSE combine kernel — the trtllm multi-block-reduction strategy as a CuTe DSL kernel.
-Merges the OUTER split-K partials produced by IntPingPongDecodeSm90 (_sm90/int_decode_pingpong.py) into the final
-output, replacing the slow torch reduction.
+# Copyright 2026 Donglin Zhuang
+# SPDX-License-Identifier: Apache-2.0
+"""Fused split-K (flash-decode) LSE combine kernel in CuTe DSL, following the trtllm multi-block reduction strategy.
+Merges the OUTER split-K partials produced by IntPingPongDecodeSm90 (_sm90/int_decode_pingpong.py) into the
+final output.
   op  : [OUTER, B, HQ, D] f32   (per-partition partial O, normalized by that partition's own softmax sum)
   lse : [OUTER, B, HQ]    f32   (per-partition log-sum-exp = localMax + log(localSum))
-  out : [B, HQ, D]        bf16  = sum_o softmax_o(lse) * op_o   (online over OUTER; numerically safe)
+  out : [B, HQ, D]        bf16  = sum_o softmax_o(lse) * op_o   (online over OUTER, rescaling by the running max)
 One block per (b, hq); D threads, each owns one head-dim element and reduces over the OUTER partitions online.
+Entry point: `SplitKCombine(head_dim)`; `main()` compiles one configuration and checks it against torch.
+Caller contract: `outer` equals the leading dimension of `op` and `lse`; `head_dim` is the trailing dimension of `op`.
 """
 import os, sys
 import torch, cutlass, cutlass.cute as cute

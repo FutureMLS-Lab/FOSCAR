@@ -1,3 +1,5 @@
+# Copyright 2026 Donglin Zhuang
+# SPDX-License-Identifier: Apache-2.0
 """Canonical warp-MMA quantized paged-decode (SM90) — UNIFIED, configurable-granularity baseline.
 
 Multi-warp CTA flash-decode (CuTe DSL, int4/int2 quantized KV, in-register dequant via a CONFLICT-FREE

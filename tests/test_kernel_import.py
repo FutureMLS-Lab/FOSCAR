@@ -2,6 +2,8 @@
 import torch
 import pytest
 
+pytest.importorskip("cuda", reason="needs the CUDA Python bindings")
+
 
 def test_sm100_shared_reduction_library_imports():
     # Imports must succeed regardless of running arch (no device code runs at import).

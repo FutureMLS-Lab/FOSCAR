@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
 import math
 from typing import Literal, Type, Tuple, cast
@@ -45,11 +45,8 @@ gmem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="gpu")
 
 
 class GroupedQueryAttentionDecode:
-    # The unquantized kernel this class used to carry -- __init__, the @cute.jit
-    # __call__, the @cute.kernel decode body, and the example run()/__main__
-    # harness -- went with the rest of the dense decode path. What remains is
-    # deliberately NOT a kernel: it is the split-K reduction library that the
-    # quantized kernel imports, which is why this file survived at all.
+    # This file holds the split-K reduction library that the quantized kernel
+    # imports. It is not a kernel itself.
     #
     # int_fold_decode.py takes 11 module-level names from here, and uses this
     # CLASS as the namespace for the reduction members below, so neither the
@@ -61,9 +58,9 @@ class GroupedQueryAttentionDecode:
     #     than taking it as an argument.
     # Pruning either one fails at TRACE time, not at import time.
     #
-    # `can_implement` is called UNBOUND with a foreign `self` -- the fold kernels
-    # pass their own instance -- which is why it stays a plain method on a class
-    # that is now never instantiated.
+    # `can_implement` is called unbound with a caller-supplied `self`, since the
+    # fold kernels pass their own instance, so it is a plain method on a class
+    # that is never instantiated.
     ##############################
     # Launch helpers
     ##############################
@@ -496,12 +493,13 @@ class GroupedQueryAttentionDecode:
             cute.copy(cpasync_atom, gM_partial_n, sM_partial_n)
 
         cute.arch.cp_async_commit_group()
-        # The first `o_pf` splits' partial outputs are loaded here, before the wait for the
-        # partial maxima and sums, so the two loads overlap instead of following each
-        # other. Each load reads an existing split (the index is clamped), so it is in
-        # range whether or not that split produced a row; the loop below accumulates a
-        # split's output only where it did before, in the same order, so the result is
-        # unchanged. Without whole d blocks (`not_oob_d` dynamic) nothing is prefetched.
+        # The first `o_pf` partial outputs are loaded here, before the barrier on
+        # the partial maxima and sums, so the two loads overlap instead of running
+        # one after the other. Each load reads an existing split (the index is
+        # clamped), so it is in bounds whether or not that split produced a row.
+        # The loop below still adds a split's contribution only when that split
+        # produced one, in the same order, so the result is unchanged. When d is
+        # not a whole multiple of the block, no prefetch is done (`o_pf` is zero).
         o_pf = 16 if cutlass.const_expr(d % d_per_blk == 0) else 0
         rO_pf = [
             tCgO_partial[None, cutlass.min(Int32(j), splits - 1)].load()

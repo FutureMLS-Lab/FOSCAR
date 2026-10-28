@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 Donglin Zhuang (standalone cutedsl-decode adaptation).
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 # Adapted from FlashInfer's CuTe DSL paged-decode wrapper (see NOTICE).
 
 """PagedDecodeWrapper — PyTorch-facing API for paged GQA decode attention.
@@ -33,8 +33,6 @@ import functools
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-
-import cutlass
 
 from ._utils import (
     api as flashinfer_api,
@@ -75,21 +73,25 @@ _ACCEPTED_HEAD_DIMS = {"sm90": (128, 256), "sm100": (128,)}
 # ---------------------------------------------------------------------------
 
 
-_TORCH_TO_CUTLASS_DTYPE = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float8_e5m2: cutlass.Float8E5M2,
-    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-}
+def _torch_to_cutlass(dtype: torch.dtype):
+    """Map a torch dtype to the CuTe DSL dtype of the same width.
 
+    The DSL is imported here rather than at module scope so that importing the
+    package does not require a CUDA toolkit to be installed.
+    """
+    import cutlass
 
-def _torch_to_cutlass(dtype: torch.dtype) -> "cutlass.dtype":
-    if dtype not in _TORCH_TO_CUTLASS_DTYPE:
+    table = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    }
+    if dtype not in table:
         raise TypeError(
-            f"cute-dsl decode does not support {dtype}; "
-            f"supported: {list(_TORCH_TO_CUTLASS_DTYPE)}"
+            f"cutedsl-decode does not support {dtype}; supported: {list(table)}"
         )
-    return _TORCH_TO_CUTLASS_DTYPE[dtype]
+    return table[dtype]
 
 
 
@@ -978,7 +980,7 @@ class PagedDecodeWrapper:
 
         NOTHING CAN DETECT THIS FROM THE BYTES. The kernel reads a K pool
         whose codes were permuted at store time by
-        `repack_sm100.k_store_perm_sm100_f4`: at int4 at EVERY configuration
+        `cutedsl_decode.pool.k_store_perm_sm100_f4`: at int4 at EVERY configuration
         (the raw-feed 8-slot shuffle) and at int2 with the E2M1 feed at either
         K axis. A pool written in
         `pack_rows_lut` order has the same dtype, the same shape and the same byte
@@ -1037,7 +1039,7 @@ class PagedDecodeWrapper:
                 "this plan reads a PERMUTED K pool, and the order cannot be "
                 "detected from the pool itself, so run() requires you to declare "
                 "it: pass k_pool_order='permuted' if the K codes were permuted "
-                "by repack_sm100.k_store_perm_sm100_f4 before packing, which is "
+                "by cutedsl_decode.pool.k_store_perm_sm100_f4 before packing, which is "
                 "what this configuration reads (bits=4 at every configuration, "
                 "or bits=2 with the E2M1 feed at either K axis). A pool in "
                 "pack_rows_lut order is silently wrong "
@@ -1047,7 +1049,7 @@ class PagedDecodeWrapper:
                 "k_pool_order='logical' contradicts this plan, which reads a "
                 "PERMUTED K pool (bits=4 everywhere; bits=2 with the E2M1 feed "
                 "at either K axis). Permute "
-                "the K codes with repack_sm100.k_store_perm_sm100_f4 before "
+                "the K codes with cutedsl_decode.pool.k_store_perm_sm100_f4 before "
                 "packing, or plan a configuration that reads logical order; see "
                 "docs/K_STORE_PERM.md")
 
@@ -1316,7 +1318,7 @@ class PagedDecodeWrapper:
             shuffle) and INT2 with the E2M1 feed at either K axis. A caller
             that omits it where it is required is refused rather than run wrong.
             ``"permuted"`` says the K codes were reordered by
-            ``repack_sm100.k_store_perm_sm100_f4`` before packing; ``"logical"``
+            ``cutedsl_decode.pool.k_store_perm_sm100_f4`` before packing; ``"logical"``
             says they are in plain ``pack_rows_lut`` order. ``None`` is accepted
             only for configurations that read logical order: dense callers and
             the INT2 e4m3 feed.

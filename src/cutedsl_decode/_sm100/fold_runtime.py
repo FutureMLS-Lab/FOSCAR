@@ -1,27 +1,24 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
-"""Library-side compile/launch glue for ``IntDecodeSm100`` (quantized-KV decode).
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: Apache-2.0
+"""Compile and launch glue for the SM100 quantized decode kernel.
 
-This module is the SINGLE place that knows how to build and launch the SM100
-fold kernel. It was lifted out of ``scripts/_fold_harness.py`` (a benchmark
-helper) so that :class:`cutedsl_decode.PagedDecodeWrapper` — the public API —
-can drive the quantized kernels through exactly the same code the gates and
-benchmarks drive. ``scripts/_fold_harness.py`` now re-exports from here; there
-is one compile path and one launch path, not two that can drift.
+This module is the single place that compiles and launches the SM100 fold
+kernel, so :class:`cutedsl_decode.PagedDecodeWrapper`, the public API, and the
+benchmark drivers share one compile path and one launch path.
 
-What lives here
----------------
-``BITS_TUNING``      per-bits ctor knobs applied to every compile (see its docstring)
+Entry points
+------------
+``BITS_TUNING``      per-bits ctor knobs applied to every compile
 ``compile_fold``     ctor + symbolic-shape ``cute.compile``
-``launch_fold``      the raw 20-argument launch (ONE call site)
-``run_fold``         ``launch_fold`` + workspace handling (harness-compatible)
+``launch_fold``      the raw 20-argument launch
+``run_fold``         ``launch_fold`` + workspace handling
 ``alloc_fold_workspace``  out/m/o_partial/l_partial/m_partial allocation
 ``global_pscale_lp`` / ``global_pscale_lp_flex``  launch-global P scale exponent
 
-What does NOT live here: pool CONSTRUCTION (``build_pools_lut`` /
-``build_pools_flex`` / ``v_store_perm_sm100*``). Those are in
-``scripts/probes/repack_sm100.py`` and are a test/benchmark fixture — a serving
-integration packs its own KV cache. ``_fold_harness.v_pool_perm`` therefore
-stays in the harness.
+Two invariants hold for every caller. A kernel is compiled once for every batch
+size and KV length, because those dims are symbolic, so memoise on the static
+arguments. And the packed pools ``mKq``/``mVq``/``mScale`` are the kernel's only
+input contract; pool construction does not live here, and a serving integration
+packs its own KV cache.
 """
 import os
 
@@ -31,67 +28,28 @@ import torch
 #: Per-bits constructor knobs applied to every compile unless the caller
 #: overrides them.
 #:
-#: They exist because a benchmark round measured these values and then left the
-#: ctor defaults conservative, on the understanding that callers would tune. No
-#: caller did, so int4 shipped wrong on three knobs in a published table. Applying
-#: them here is what makes the measured configuration the one a caller gets.
+#: They are applied here so that the measured configuration is the one a caller
+#: gets. The constructor defaults stay conservative, and no caller tunes them.
 #:
-#: NOT BIT-IDENTICAL. Applying the tuning is a tiny reassociation, not a no-op: it
-#: holds at 9 of 12 shipped head configs under torch.equal and differs at
-#: QH32/KVH8 with reduction="none" by rel_l2 2.03e-04, about 25x inside the 5.0e-03
-#: gate. Do not describe it as bit-identical.
+#: The result is NOT bit-identical to an untuned kernel, because applying the
+#: tuning is a small reassociation rather than a no-op. It holds at 9 of 12
+#: shipped head configs under torch.equal and differs at QH32/KVH8 with
+#: reduction="none" by rel_l2 2.03e-04, about 25x inside the 5.0e-03 gate.
 #:
-#: The dequant warpgroup count was a tuning knob until 2026-09-14: int2 always ran
-#: one warpgroup, and int4 moved from two to one on 2026-09-04, when dwg=2 measured
-#: 1.3% to 2.5% slower at every batch of 32 and above with no numerics difference
-#: (`data/b200_i{2,4}_dwg_ab_{fwd,rev}_20260831.csv`, both directions, ssr-b200 GPU 7).
-#: One warpgroup has been hardcoded since 2026-09-14, as the paragraph below records.
+#: `scale_stages=16` at int4 produces a nondeterministic numerical failure at
+#: g=8, on the cell int4/uniform/kv8192/g=8/QH64-KVH8/splits=4/scale=f32, so
+#: int4 leaves `scale_stages` unset and only int2 sets it. The knob is worth
+#: 0.5% to 3.3% at int4, but it does not ship there. int2 keeps ss=16, and its
+#: worst rel_l2 is 1.768e-03.
 #:
-#: scale_stages STAYS UNSET ON int4, AND THE ISOLATION DOES NOT REPRODUCE. Four arms
-#: on the g=8 gate, worst int4 rel_l2 against a 5.0e-03 bar:
+#: The kernel has one dequant warpgroup at both widths, and
+#: `dequant_warpgroups` is not a constructor knob; the constructor refuses it
+#: with TypeError and every kernel_kwargs reader refuses it through
+#: `_RETIRED_KERNEL_KWARGS` below.
 #:
-#:     arm                     2026-07      2026-09-04
-#:     dwg2 + cs16             PASS         PASS, PASS  (1.796e-03)
-#:     dwg1 + cs16             --           PASS, PASS  (1.796e-03)
-#:     dwg1 + cs16 + ss16      PASS         FAIL x2     (1.741e-02, 2.294e-02)
-#:     dwg2 + cs16 + ss16      FAIL         PASS, PASS  (1.796e-03)
-#:
-#: THE TWO COLUMNS ARE INVERTED ON THE ss16 ROWS. July concluded the fault was the
-#: TRIPLE with dwg2 and that ss16 was safe without it; September measures the exact
-#: opposite. An intermediate draft of this comment asserted September's half as the
-#: rule -- "ss=16 is the leg, at any dwg" -- and arm dwg2+cs16+ss16 then passed twice,
-#: which is how that overclaim was caught.
-#:
-#: So the honest reading is neither table: `scale_stages=16` at int4 produces a
-#: NONDETERMINISTIC failure at g=8, and the September samples did not reproduce
-#: July's arm pattern. Two or three trials per arm cannot establish more than that. Every failure lands on the same cell,
-#: int4/uniform/kv8192/g=8/QH64-KVH8/splits=4/scale=f32. Until someone explains the
-#: mechanism, ss=16 does not ship at int4 under EITHER count, and a passing arm is not
-#: evidence: three of these arms passed on a day the configuration was broken.
-#:
-#: That costs something real. ss=16 is worth 0.5% to 3.3% on int4, measured both
-#: directions with the arms swapped and `arms_bitwise_equal` true:
-#:   data/b200_i4_ss16_ab_fwd_20260904.csv  and  ..._rev_20260904.csv
-#:
-#: THE EVIDENCE FOR THE TABLE ABOVE, so no number here is prose only:
-#:   data/b200_int4_ss16_g4_isolation_20260904.log   the four arms, two runs each,
-#:                                                   from baselines/isolate_int4_ss16_g4.sh
-#:   data/b200_int4_ss16_g4_firstruns_20260904.log   the three earlier ad-hoc runs of
-#:                                                   dwg1+cs16+ss16, and the int2 worst Re-run
-#: scripts/test_int_decode_sm100.py at g=8 SEVERAL times before believing any pass: the
-#: failure is nondeterministic and neighbouring passes prove nothing.
-#:
-#: int2 keeps ss=16 and is unaffected; its worst is 1.768e-03 across every arm above.
-#:
-#: SINCE 2026-09-14 THERE IS ONE DEQUANT WARPGROUP, HARDCODED. `dequant_warpgroups`
-#: is no longer a constructor knob (the constructor refuses it with TypeError, and
-#: every kernel_kwargs door refuses it through `_RETIRED_KERNEL_KWARGS` below), so
-#: the dwg2 arms above are history that cannot be re-run as written; the ss=16
-#: finding stands on the dwg1 rows, and `baselines/isolate_int4_ss16_g4.sh` now
-#: runs the two arms that still build. `k_op_stages` is the K operand ring's depth
-#: of the split K/V operand rings, unconditional at both widths since the same
-#: date; 3 is the measured INT4 best (the int2 default, min(2, kv_stages // 2),
-#: resolves to 2 and is left to the trace-time default).
+#: `k_op_stages` is the depth of the split K/V operand rings and is accepted at
+#: both widths. 3 is the measured int4 best; None resolves to
+#: min(2, kv_stages // 2) at trace time, which is the int2 default.
 BITS_TUNING = {
     2: {"code_stages": 16, "scale_stages": 16},
     4: {"code_stages": 16, "k_op_stages": 3},
@@ -191,27 +149,25 @@ _RETIRED_KERNEL_KWARGS = {
 def refuse_retired_kernel_kwargs(kernel_kwargs, where="compile_fold"):
     """Raise if a `kernel_kwargs` dict carries a name retired outright.
 
-    THIS IS THE ONE PLACE, and it is a function rather than a line inside
-    `compile_fold` because a dict read BY NAME is a door that discards instead
-    of raising. A keyword argument that no longer exists raises on its own; a
-    dict key that no longer means anything is simply ignored, and the caller
-    gets a default it did not ask for and no warning. So every helper that
-    consumes a `kernel_kwargs` dict has to consult this, not only the compile
-    entry point.
+    This is the one place that refuses a retired name, and it is a function
+    rather than a line inside `compile_fold` because a dict read by name
+    discards instead of raising. A keyword argument that does not exist
+    raises on its own; a dict key that does not mean anything is simply
+    ignored, and the caller gets a default it did not ask for and no warning.
+    So every helper that consumes a `kernel_kwargs` dict has to consult this,
+    not only the compile entry point.
 
-    The doors, counted here because two rounds of codex review each found one
-    more (2026-09-08): `compile_fold`, whose `**kernel_kwargs` and
-    `bits_tuning` merge into one dict (it refuses after that merge, so a
-    retired name raises this message rather than the constructor's generic
-    TypeError, and so a compile_fold-level parameter such as `dump` or
-    `kernel_cls` that the splat would otherwise hand to the constructor is
-    named as retired); `quant_cfg_of`, and `scale_pool_dtype_of` through it,
-    which resolve the quant-flex configuration out of the same dict;
-    `_fold_harness.k_pool_perm` / `v_pool_perm`, which resolve the POOL ORDER
-    out of it, where a silently defaulted answer is wrong at every K channel
-    and raises nothing; and `PagedDecodeWrapper`, whose plan refuses the dict
-    it is handed and whose run refuses the planned dict it reads the K pool
-    order out of.
+    The callers are `compile_fold`, whose `**kernel_kwargs` and `bits_tuning`
+    merge into one dict (it checks after that merge, so a retired name raises
+    this message rather than the constructor's generic TypeError, and so a
+    compile_fold-level parameter such as `dump` or `kernel_cls` that the splat
+    would otherwise hand to the constructor is named as retired);
+    `quant_cfg_of`, and `scale_pool_dtype_of` through it, which resolve the
+    quant-flex configuration out of the same dict; `k_pool_perm` /
+    `v_pool_perm`, which resolve the pool order out of it, where a silently
+    defaulted answer is wrong at every K channel and raises nothing; and
+    `PagedDecodeWrapper`, whose plan refuses the dict it is handed and whose
+    run refuses the planned dict it reads the K pool order out of.
     """
     if not kernel_kwargs:
         return
@@ -223,11 +179,10 @@ def refuse_retired_kernel_kwargs(kernel_kwargs, where="compile_fold"):
 def quant_cfg_of(page_size, head_dim, kernel_kwargs=None):
     """Normalized (k_quant, v_quant, sdtype_str, qoff) from a kernel-kwargs
     dict (the compile-keying entry for the quant-flex configs; absent kwargs
-    mean the legacy token-128 pair, f32 pool — the shipped default).
+    mean the legacy token-128 pair, f32 pool, which is the shipped default).
 
     K token-64 keeps its shipped bf16 default, but an explicit ``sdtype="f32"``
-    selects the full-precision metadata path. Bf16 metadata remains exclusive
-    to K token-64.
+    selects the f32 scale pool. Bf16 is legal only with K token-64.
     """
     from ..quant_layout import quant_block_offsets
 
@@ -282,9 +237,9 @@ def resolve_fold_tiling(k_quant, v_quant, *, sequence_tile=None, o_stages=None):
 def global_pscale_lp(mScale):
     """Launch-global P pscale exponent: lp = floor(log2(448 / max
     s_v over the pool)) (s_v = mScale[..., 2]). Certified conservative-safe
-    to 64x (scripts/probes/certify_global_pscale_sm100.py).
+    to 64x.
 
-    Takes the LEGACY 4-D pool [NP, HKV, N, 4]."""
+    Takes the legacy 4-D pool [NP, HKV, N, 4]."""
     import math
     sv_max = float(mScale[..., 2].max().item())
     return float(math.floor(math.log2(448.0 / max(sv_max, 1e-30))))
@@ -336,13 +291,13 @@ def pscale_lp_for_pool(mScale, k_quant=None, v_quant=None, *,
 
 
 def _refuse_cuda12_dsl_backend():
-    """Blackwell builds need the DSL's CUDA 13 backend (`cutedsl-decode[cu13]`).
+    """Refuse a DSL loaded with the CUDA 12 backend on Blackwell.
 
-    nvidia-cutlass-dsl 4.8.0's CUDA 12 backend vendors ptxas 12.9, and on B200 it left
-    output elements of this kernel unwritten (2026-10-07, the shipped B = 1 cell and a
-    channel-64 K cell) while its CUDA 13 backend (ptxas 13.4) is correct. Blackwell runs
-    CUDA 13; the cu12 extra is for Hopper. Called before tracing, so it costs nothing at
-    launch and a cached object, keyed on the DSL's CUDA version, never reaches it.
+    nvidia-cutlass-dsl 4.8.0's CUDA 12 backend vendors ptxas 12.9, which on
+    B200 leaves output elements of this kernel unwritten; its CUDA 13 backend
+    (ptxas 13.4) is correct. Blackwell runs CUDA 13, and the cu12 extra is for
+    Hopper. This is called before tracing, so it costs nothing at launch and a
+    cached object, keyed on the DSL's CUDA version, never reaches it.
     """
     from cutlass.base_dsl import version_info
 
@@ -378,32 +333,28 @@ def compile_fold(
     packed LUT pools `mKq`/`mVq`/`mScale`. `debug_s` adds the matching
     gmem debug tensor (`mDbgS`).
 
-    ONE compile serves every batch size and every KV length — the batch, page
-    count and kv_splits dims are `cute.sym_int()`. Memoise on the remaining
-    (static) arguments; a trace costs 10 to 13 s on B200 with DSL 4.5.2 (measured
-    2026-09-11), and `cutedsl_decode.kernel_cache` serves a repeat of the same
-    trace from disk in milliseconds.
+    One compile serves every batch size and every KV length, because the batch,
+    page count and kv_splits dims are `cute.sym_int()`. Memoise on the remaining
+    (static) arguments: a trace costs 10 to 13 s on B200 with DSL 4.5.2, and
+    `cutedsl_decode.kernel_cache` serves a repeat of the same trace from disk in
+    milliseconds.
 
     `bits_tuning`: the per-bits ctor knobs to apply (default `BITS_TUNING`).
-    Overridable so an A/B driver can compile a control arm WITHOUT the
-    promoted tuning (`baselines/check_bit_identity.py` does exactly that);
-    pass `{}` for "no tuning". Whatever is passed is also what the
+    Overridable so a caller can compile a control build without the promoted
+    tuning; pass `{}` for "no tuning". Whatever is passed is also what the
     post-construction guard below checks, so a caller cannot silently get a
     kernel that did not receive the knobs it asked for.
 
     `kernel_out`: optional dict, filled with `{"kernel": <the constructed
     IntDecodeSm100>}` before the compile. This function returns the compiled
-    CALLABLE, which carries none of the resolution the constructor did, so a caller
-    had no way to ask whether the kernel it just built actually reached the
-    configuration it asked for. That is not hypothetical: the `i2_persist_multi`
-    anchor cell sat at `reduction="kernel"` for weeks, where `self.persistent`
-    resolves to False, so the one cell named for the persistent item loop never
-    entered it and the anchor could not tell. (item E3)
+    callable, which carries none of the resolution the constructor did, so
+    without this a caller could not ask whether the kernel it just built
+    reached the configuration it asked for.
 
-    `knobs_out`: optional dict, filled with the tuned knobs READ BACK OFF THE
-    CONSTRUCTED KERNEL. The guard below already asserts on those values, but a
+    `knobs_out`: optional dict, filled with the tuned knobs read back off the
+    constructed kernel. The guard below already asserts on those values, but a
     memoising caller (the wrapper) only traces once and would never see the
-    assert again on a cache hit — so it stores this and re-checks per plan().
+    assert again on a cache hit, so it stores this and re-checks per plan().
     """
     import cutlass
     import cutlass.cute as cute
@@ -427,14 +378,14 @@ def compile_fold(
         if _k not in kernel_kwargs:
             kernel_kwargs[_k] = _v
 
-    # A RETIRED SPELLING MUST RAISE BY NAME, and `**kernel_kwargs` is where one
-    # hides. Splatting into `IntDecodeSm100` already gives TypeError, but a generic
-    # one that does not say what replaced the name, so the renamed spellings are
-    # refused here with the new spelling in the message.
+    # A retired spelling must raise by name, and `**kernel_kwargs` is where one
+    # hides. Splatting into `IntDecodeSm100` already gives TypeError, but a
+    # generic one that does not say what replaced the name, so the renamed
+    # spellings are refused here with the new spelling in the message.
     #
-    # AFTER the bits_tuning merge, not before it. `bits_tuning` is a caller-supplied
-    # dict of ctor knobs, so it is a second way in, and a guard placed ahead of the
-    # merge misses it.
+    # This runs after the bits_tuning merge, not before it. `bits_tuning` is a
+    # caller-supplied dict of ctor knobs, so it is a second way in, and a guard
+    # placed ahead of the merge misses it.
     for _retired, _now in (("grouped_head_tile", "q_head_tile"),
                            ("headdim", "head_dim"),
                            ("n_tile", "page_size")):
@@ -456,18 +407,13 @@ def compile_fold(
             "accepted and ignored rather than honoured. The runtime prediction "
             "axis is unaffected; what the knob bought was packing several query "
             "tokens into one MMA N tile.")
-    # RETIRED OUTRIGHT, and NOTHING REPLACED IT. `identity_dequant` was a
-    # bring-up scaffold: it swapped the input contract for plain e4m3
-    # `k_bshd`/`v_bshd` tensors, turned the affine fold off everywhere, and left
-    # the dequant warpgroup relaying raw bytes through shared memory. It existed
-    # to be compared bitwise against an unquantized baseline kernel, and that
-    # baseline is gone, so there is no mode left for it to select. Refused HERE,
-    # after the bits_tuning merge and before construction, for the same reason
-    # as the guards above. The messages, and the other doors that consult the
-    # same table, live in `refuse_retired_kernel_kwargs`. `kernel_cls` is in that
-    # table too: it was a parameter of this function until 2026-10-07, so a
-    # caller still passing it lands in `**kernel_kwargs` and is told it is
-    # retired rather than handed to the constructor.
+    # RETIRED OUTRIGHT, with nothing replacing it. Refused here, after the
+    # bits_tuning merge and before construction, for the same reason as the
+    # guards above: the constructor splat would otherwise raise a generic
+    # TypeError. The messages, and the other callers that consult the same
+    # table, live in `refuse_retired_kernel_kwargs`. `kernel_cls` is in that
+    # table too, so a caller still passing it lands in `**kernel_kwargs` and is
+    # told it is retired rather than handed to the constructor.
     refuse_retired_kernel_kwargs(kernel_kwargs, where="compile_fold")
 
     # Quant-config tiling. Resolved HERE as well as inside the ctor because the
@@ -499,11 +445,10 @@ def compile_fold(
         **kernel_kwargs,
     )
 
-    # Prove the resolved tiling reached the object. Same guard class, and the
-    # same recorded reason, as the bits_tuning assert below: three separate
-    # false nulls came from an override wired to a ctor the caller never
-    # reached (int_fold_decode.py's FOLD_TRACE_TILING comment). Reads
-    # `_o_stages` -- `o_stages` does not exist until __call__.
+    # Prove the resolved tiling reached the object, the same guard class as the
+    # bits_tuning assert below. An override wired to a ctor the caller never
+    # reaches otherwise fails silently. Reads `_o_stages`, because `o_stages`
+    # does not exist until __call__.
     assert fmha.sequence_tile == sequence_tile, (
         f"resolve_tiling disagreement: compile_fold resolved "
         f"sequence_tile={sequence_tile}, kernel has {fmha.sequence_tile}")
@@ -571,10 +516,8 @@ def compile_fold(
         "CUTE_DSL_OPT_LEVEL", "2" if bits == 2 else "3")
     # GUARD: prove the per-bits tuning actually reached the constructed kernel.
     # Applying it as a dead statement AFTER construction is a silent no-op, whose
-    # only symptom is timings that come back bit-for-bit identical. A measured
-    # optimisation that the object never receives is a recurring failure in this
-    # repo, the split-K planner having been unwired the same way, so assert rather
-    # than trust.
+    # only symptom is timings that come back bit-for-bit identical, so assert
+    # rather than trust.
     for _k, _v in tuning.get(bits, {}).items():
         _got = getattr(fmha, _k, None)
         if knobs_out is not None:
@@ -620,15 +563,15 @@ def compile_fold(
             options=options,
         )
 
-    # THE TRACE GOES THROUGH THE PERSISTENT KERNEL CACHE. Everything above this line
-    # still runs on a cache hit: the constructor resolves the tiling, the guards
-    # assert the tuning reached the object, and `kernel_out` / `knobs_out` read the
-    # constructed kernel, so a hit hands back the same evidence a trace would. What a
-    # hit skips is `cute.compile` itself, 10 to 13 s on B200. The key carries the
-    # constructed kernel's RESOLVED attributes (not the raw kernel kwargs: an omitted
-    # knob and its explicit default resolve to the same attribute and must share a
-    # key), the trace arguments that are not attributes, the options string and the DSL
-    # identity.
+    # The trace goes through the persistent kernel cache. Everything above this
+    # line still runs on a cache hit: the constructor resolves the tiling, the
+    # guards assert the tuning reached the object, and `kernel_out` / `knobs_out`
+    # read the constructed kernel, so a hit hands back the same evidence a trace
+    # would. What a hit skips is `cute.compile` itself, 10 to 13 s on B200. The
+    # key carries the constructed kernel's resolved attributes (not the raw
+    # kernel kwargs: an omitted knob and its explicit default resolve to the same
+    # attribute and must share a key), the trace arguments that are not
+    # attributes, the options string and the DSL identity.
     from .. import kernel_cache
     from . import int_fold_decode as _ifd
 
@@ -669,11 +612,11 @@ def launch_fold(compiled, *, kv_splits, seqlens, table_offsets, page_table,
                 m_partial=None, scale_s=1.0, scale_o=1.0,
                 mKq=None, mVq=None, mScale=None, pscale_lp=0.0,
                 dbg=None, enable_pdl=True):
-    """THE launch site for a `compile_fold`-compiled kernel.
+    """The launch site for a `compile_fold`-compiled kernel.
 
-    Everything (the harness `run_fold`, `PagedDecodeWrapper.run`) funnels
-    through here, so the 20-argument positional contract exists once. All
-    tensors are torch tensors; scalars are Python floats/ints.
+    Everything (`run_fold`, `PagedDecodeWrapper.run`) funnels through here, so
+    the 20-argument positional contract exists once. All tensors are torch
+    tensors; scalars are Python floats/ints.
 
     Note the `tvm_ffi.use_torch_stream()` scope: the kernel is compiled with
     `use_tvm_ffi_env_stream=True`, so this is what binds the launch to torch's
@@ -710,20 +653,19 @@ def launch_fold(compiled, *, kv_splits, seqlens, table_offsets, page_table,
 def alloc_fold_workspace(p, kv_splits, reduction):
     """Pre-allocate everything `run_fold` would otherwise allocate per call.
 
-    Pass the result as `run_fold(..., ws=...)` to keep ALLOCATION out of a
+    Pass the result as `run_fold(..., ws=...)` to keep allocation out of a
     timed region: five `torch.empty`/`torch.full` calls per launch at
-    reduction="kernel", one at "none". Every external baseline in `baselines/`
-    allocates in `build()`, so ours has to as well or the protocol is not
-    uniform -- which is the one thing that harness exists to guarantee.
+    reduction="kernel", one at "none". External baselines allocate in their
+    build step, so this path offers the same split.
 
-    WHAT DOES NOT HOIST, AND WHY. The `m` buffer is not a scratch output; the
+    What does not hoist, and why. The `m` buffer is not a scratch output; the
     kernel reduces into it with a device-side atomic max
     (`gqa_decode.reduction_epilogue` -> `gmem_fmax`), so it must hold the
-    identity `-inf` at the start of EVERY launch. `run_fold` therefore refills
+    identity `-inf` at the start of every launch. `run_fold` therefore refills
     it per call even with a supplied workspace. That fill is a real launch, but
-    it is the kernel's own precondition -- a serving integration pays it too --
-    not benchmark overhead, so removing it would flatter our column rather than
-    make the comparison fair.
+    it is the kernel's own precondition, which a serving integration pays too,
+    so it is not benchmark overhead and removing it would misstate the
+    comparison.
     """
     dev = torch.device("cuda")
     b, h_q = p["b"], p["h_q"]
@@ -742,15 +684,15 @@ def alloc_fold_workspace(p, kv_splits, reduction):
 
 def run_fold(compiled, p, kv_splits, reduction, scale_s, scale_o=1.0, *,
              pools=None, dbg=None, pscale_lp=None, ws=None):
-    """Launch a `compile_fold`-compiled kernel on a harness problem dict.
+    """Launch a `compile_fold`-compiled kernel on a problem dict.
 
     `pools=(mKq,mVq,mScale)` are the packed quantized pools the kernel reads.
     Returns the squeezed [b, h_q, d] bf16 output.
 
     `ws` is an `alloc_fold_workspace()` dict. Supply it to hoist allocation out
-    of the call; omit it and the workspace is allocated per call as before.
-    A reused `m` is re-filled with `-inf` here because the kernel atomic-maxes
-    into it -- see `alloc_fold_workspace` for why that one launch must stay.
+    of the call; omit it and the workspace is allocated per call. A reused `m`
+    is re-filled with `-inf` here because the kernel atomic-maxes into it; see
+    `alloc_fold_workspace` for why that one launch must stay.
     """
     if ws is None:
         ws = alloc_fold_workspace(p, kv_splits, reduction)
@@ -787,15 +729,13 @@ def run_fold(compiled, p, kv_splits, reduction, scale_s, scale_o=1.0, *,
 def plan_fold(p, bits, *, sequence_tile=256):
     """(kv_splits, reduction) the SM100 planner would choose for this problem.
 
-    Thin adapter from a problem dict (the `_fold_harness.make_pool_problem`
-    shape: keys "b", "h_kv", "seq_lens") to
+    Thin adapter from a problem dict (keys "b", "h_kv", "seq_lens") to
     `cutedsl_decode._sm100.scheduler.plan_splits_sm100`, so the planner is
-    reachable from the one place every fold launch goes through instead of
-    being library code nobody calls.
+    reachable from the one place every fold launch goes through.
 
     `PagedDecodeWrapper` does NOT go through here — it calls
     `plan_splits_sm100` directly from real plan() arguments. This entry point
-    exists for the benchmark/gate drivers that already speak problem dicts.
+    exists for the benchmark and gate drivers that already speak problem dicts.
     """
     from .scheduler import plan_splits_sm100
 

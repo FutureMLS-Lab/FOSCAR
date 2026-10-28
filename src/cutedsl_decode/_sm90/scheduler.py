@@ -1,3 +1,5 @@
+# Copyright 2026 Donglin Zhuang
+# SPDX-License-Identifier: Apache-2.0
 """Split-KV planning for the SM90 quantized-KV decode kernel.
 
 At plan time this module decides how many thread blocks one request's KV is
