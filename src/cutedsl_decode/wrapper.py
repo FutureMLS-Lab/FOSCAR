@@ -51,12 +51,12 @@ _QUANT_PAGE_SIZE = 64
 # The accepted set is therefore per architecture, keyed by the names `_utils.get_capabilities`
 # reports. A value is listed once a kernel implements AND a run covers it, or plan() admits a
 # configuration that writes out of range (below 128) or that nothing has measured:
-#   "sm90" lists 256 because the SM90 kernel implements it (#119), its ring depth and phase
-#   lock were timed there (profile/h100_planb_prd_20261002/), and the SM90 planner has a
-#   D=256 entry fitted on its own split ladder (`_sm90/scheduler.py`, PINGPONG_MODEL).
+#   "sm90" lists 256 because the SM90 kernel implements it, it was timed there, and the
+#   SM90 planner has a D=256 entry fitted on its own split ladder
+#   (`_sm90/scheduler.py`, PINGPONG_MODEL).
 #   "sm100" lists 128 only: its kernel builds 256, but no run measures it there.
-# It stays one literal, because `baselines/bench_sweep.py` reads it from this file's syntax
-# tree with `ast.literal_eval` rather than importing the package.
+# It stays one literal so that tooling can read it from this file's syntax tree
+# with `ast.literal_eval` rather than importing the package.
 _ACCEPTED_HEAD_DIMS = {"sm90": (128, 256), "sm100": (128,)}
 
 
@@ -156,7 +156,7 @@ def _get_compiled_fold_kernel(
     Keyed on the STATIC configuration only: ``compile_fold`` traces batch,
     physical page count and kv_splits as ``cute.sym_int()``, so one compiled
     module serves every batch size and KV length. A trace costs 10 to 13 s on
-    B200 (DSL 4.5.2, measured 2026-09-11), so this in-process memo is the
+    B200, so this in-process memo is the
     difference between a usable plan() and an unusable one, and
     :mod:`cutedsl_decode.kernel_cache` underneath it serves a repeat of the same
     trace from disk across processes.
@@ -981,17 +981,16 @@ class PagedDecodeWrapper:
         caller state what it wrote and to check the statement against the
         configuration.
 
-        This is the public surface, and it is where the risk actually lives: the
-        installed package ships no pool builder, no serving append path emits this
-        order, and `docs/K_STORE_PERM.md` is the specification an external writer
-        has to meet. Routing every in-repo caller through
-        `_fold_harness.k_pool_perm` makes the wrong pairing unreachable for them
-        and does nothing for a library caller, which is why this guard exists too.
+        This is where the risk lives: a pool writer can build the order the
+        kernel does not read, and nothing in the pool's bytes reveals which order
+        it carries. `cutedsl_decode.pool` and `docs/K_STORE_PERM.md` give a writer
+        the order it has to meet; this guard covers a caller that builds pools
+        some other way.
 
         `k_pool_order` is "permuted" or "logical", and it is required only for the
         configurations that read a permuted pool: INT4 everywhere and INT2 with
-        the E2M1 feed at either K axis. Dense callers may omit it. An undeclared
-        pool is refused rather than read wrong.
+        the E2M1 feed at either K axis. An undeclared pool is refused rather than
+        read wrong.
         """
         if self._is_sm90 or self._bits is None:
             return
@@ -1000,8 +999,8 @@ class PagedDecodeWrapper:
         # sets this attribute, so a real wrapper always carries it; the host
         # tests reach the pre-launch guards through `__new__`.
         kkw = dict(getattr(self, "_quant_kernel_kwargs", None) or {})
-        # The SAME predicate the pool writer asks (`_fold_harness.k_pool_perm`),
-        # so the pool writer and the launch agree.
+        # The SAME predicate the pool builder asks, so the builder and the
+        # launch agree.
         from ._sm100.int_fold_decode import IntDecodeSm100
         want_permuted = IntDecodeSm100.k_pool_is_permuted(
             self._bits,
@@ -1283,7 +1282,7 @@ class PagedDecodeWrapper:
             main SM100 kernel, rebuild INT4 V caches created before the
             K-major V alignment: their shape is unchanged but their byte
             order is incompatible. Resolve the writer's order with
-            ``_fold_harness.v_pool_perm(bits, kernel_kwargs)``; see
+            ``cutedsl_decode.pool.v_store_perm_sm100_f4(bits)``; see
             ``docs/K_STORE_PERM.md``. INT2 layouts are unchanged by that
             alignment. On Hopper both code pools are in the chunk16 order that
             ``IntPingPongDecodeSm90.code_pool_order`` names,

@@ -45,19 +45,15 @@ E4M3_MAX = 448.0      # fp8 e4m3 saturation magnitude (trtllm-style per-tensor Q
 def quant_tokenwise(x, bits):
     """x [..., T, D] -> codes uint8 in [0, 2^bits-1], s, z per token (f32).
 
-    Computes on `x`'s device. THE DEVICE IS PART OF THE ANSWER: f32 division rounds
-    differently on the CPU and on CUDA, and `torch.round` sits on top of it, so the same
-    bf16 values quantise to codes that differ by +-1 in a small fraction of positions
-    between the two. Measured on B200 on 2026-09-11 against 1.07G codes at
-    B=32/KV=32768: 187,607 differ at int2 (0.017%) and 763,129 at int4 (0.071%); at
-    B=8/KV=8192, 11,549 of 67M at int2 (0.017%). Every fixture whose bytes are anchored
-    therefore quantises on the CPU. `baselines/accuracy_reference.py` documents the same
-    CPU-versus-CUDA quantisation difference from the gate side, with its own numbers.
+    Computes on ``x``'s device, and the device is part of the answer: f32 division
+    rounds differently on the CPU and on CUDA, and ``torch.round`` sits on top of
+    it, so the same bf16 values quantise to codes that differ by +-1 in a small
+    fraction of positions between the two. A fixture whose bytes are anchored
+    must therefore quantise on the CPU.
 
-    One float32 materialisation and one `aminmax` pass rather than three `.float()`
-    conversions; the values are identical (min and max are exact, the division and the
-    rounding see the same float32 inputs), which the fixture probe of 2026-09-11 checked
-    with `torch.equal` on codes, scales and zeros.
+    One float32 materialisation and one ``aminmax`` pass rather than three
+    ``.float()`` conversions. The values are identical: the minimum and maximum
+    are exact, and the division and the rounding see the same float32 inputs.
     """
     qmax = 2**bits - 1
     xf = x.float()
@@ -243,16 +239,18 @@ def _reduction_store_perm(bits, length):
 
 def v_store_perm_sm100_f4(bits):
     """MODE-KEYED V store order for the main kernel's reinterpreting feeds.
-    (The _f4 name is historical, from the int2 E2M1 feed that introduced it;
-    the bits==4 branch serves the E4M3 raw-code feed, 2026-08-15.)
+    (The ``_f4`` name is historical: it comes from the int2 E2M1 feed that
+    introduced this order. At 4 bits the same order serves the E4M3 raw-code
+    feed.)
 
     int2 (dequant_int2_to_f4): dim-major runs (dim d's 64 tokens = one
     16B LDS.128), pre-interleaved so the kernel's 2->4 expand is
     lo = w & 0x33333333 (tokens 16w..16w+7), hi = (w >> 2) & 0x33333333 (16w+8..15).
     Composed against pack_rows_lut's int2 slot->bit map b(i) via the self-inverse
     16-slot sub-perm sigma(i) = (i&3) | ((i&4)<<1) | ((i&8)>>1). A pool built with
-    this perm is valid ONLY for dequant_int2_to_f4=1 kernels (spec 2026-07-08).
-    Gate: G1f4 (below) is the enforcing oracle -- do not edit one without the other.
+    this permutation is valid only for kernels compiled with
+    ``dequant_int2_to_f4=1``. ``check_k_store_perm_f4`` is the enforcing oracle;
+    do not edit one without the other.
 
     int4: the same dim-major base order, with `_T8_I4` along TOKENS inside
     each packed word. The two masks produce tokens 8w..8w+3 and 8w+4..8w+7
@@ -289,7 +287,7 @@ def k_store_perm_sm100_f4(bits):
     b = 4j+2 is exactly sigma. The deposit then collapses from the 7-op
     two-part gather to V's 3-op two masks.
 
-    int4 (raw-code feed, 2026-08-15): the 8-slot shuffle `_T8_I4` within each
+    int4 (raw-code feed): the 8-slot shuffle `_T8_I4` within each
     8-channel group (one packed u32). The stored nibble sequence becomes
     [q0, q4, q1, q5, q2, q6, q3, q7], so `w & 0x0F0F0F0F` already IS the
     operand word for channels 8w..8w+3 and `(w >> 4) & 0x0F0F0F0F` for
@@ -300,8 +298,7 @@ def k_store_perm_sm100_f4(bits):
     are the enforcing oracles. A pool built without the perm and read by the
     mask deposit is wrong at every K channel and raises nothing, so the
     pairing is settled in one place: `IntDecodeSm100.k_pool_is_permuted`
-    states which configurations carry this order, and
-    `_fold_harness.k_pool_perm` is what a pool writer calls."""
+    states which configurations carry this order."""
     return _reduction_store_perm(bits, D)
 
 
@@ -453,15 +450,15 @@ def build_pools_lut(k, v, bits, v_store_perm=None, k_store_perm=None):
     `k_store_perm` (default None = identity = K rows token-major and unpermuted)
     reorders the K CHANNEL positions before packing, which is what the mask
     deposits read (int2 f4 at either K axis; int4 everywhere since
-    2026-08-15); see `k_store_perm_sm100_f4` and ask
+    see `k_store_perm_sm100_f4` and ask
     `IntDecodeSm100.k_pool_is_permuted` whether a given configuration needs it.
     `v_store_perm` (default None = identity = plain
     dim-major V^T rows) reorders the V code positions BEFORE `pack_rows_lut`:
-      - (PS,) tensor: legacy Task-1 token-axis permutation within each V row (kept for the
-        G1e plumbing regression);
+      - (PS,) tensor: token-axis permutation within each V row (kept for the
+        plumbing regression);
       - (D*PS,) tensor: full per-page code-position permutation — stored flat position j
         holds the code at dim-major flat position perm[j]. This is what the SM100 kernel
-        consumes. Resolve it through `_fold_harness.v_pool_perm(bits, kwargs)`;
+        consumes. Resolve it through `v_store_perm_sm100_f4(bits)`;
         the main INT2/FP4 and INT4 feeds use `v_store_perm_sm100_f4(bits)`."""
     NP, ps, HKV, d = k.shape
     assert ps == PS and d == D
@@ -478,8 +475,8 @@ def pack_pools_lut(qk, k_sz, qv, v_sz, bits, v_store_perm=None, k_store_perm=Non
     `quant_tokenwise` returned for them. Everything here is a permutation, an integer
     shift or an or, so the bytes are the same on every device, and the work runs where
     the codes are; the pools come back there too. A fixture that has to keep its
-    anchored bytes quantises on the CPU and hands the codes to the GPU before calling
-    this, which is what `_fold_harness.make_pool_problem` does.
+    anchored bytes quantises on the CPU and hands the codes to the GPU before
+    calling this.
     """
     dev = qk.device
     sk, zk = k_sz
@@ -541,7 +538,7 @@ def dequant_pools_lut(mKq, mVq, mScale, bits, v_store_perm=None,
 
 
 # ---------------------------------------------------------------------------
-# Quant-granularity flex pools (2026-07-23 design): per-tensor (axis, group)
+# Quant-granularity flex pools: per-tensor (axis, group)
 # configs — token-wise {D, D/2} / channel-wise token-groups {64, 128, 256},
 # K and V independent. Codes keep the LUT pack (pack_rows_lut; v_store_perm
 # applies unchanged); the scale pool becomes the SECTIONED flat block of
@@ -816,8 +813,8 @@ def dequant_bf16_fma_e4m3(codes, s, z):
 
     One implementation, used by the operand-matched reference
     (`ref_paged_attention_fp8q(kv_round="bf16_fma")`); the byte-exact stage
-    gate that shared it was retired with `dump_stage` on 2026-09-14. Kept as the
-    single copy because two hand-transcribed copies of a numerics model drift.
+    Kept as the single copy because two hand-transcribed copies of a numerics
+    model drift.
 
     The kernel dequantizes element-wise with ONE `fma.rn.bf16x2` per element
     pair and then converts to the e4m3 operand, so there are exactly three
@@ -1353,10 +1350,10 @@ def main():
         print(f"[G1c bits={bits}] constant-token round-trip (max abs err {err:g}): "
               f"{'OK' if g1c else 'FAIL'}")
 
-    # G1g gates: quant-granularity flex pools (2026-07-23).
+    # Quant-granularity flex pools.
     ok &= _gate_flex_pools()
 
-    # G1f4 / G1f4-rt / G1f4-flagoff: the new flag-on (dequant_int2_to_f4) V pool perm
+    # The flag-on (dequant_int2_to_f4) V pool permutation
     # (int2-only) -- see v_store_perm_sm100_f4 docstring for the frame derivation.
     g1f4 = _gate_f4_v_perm()
     ok &= g1f4
@@ -1365,7 +1362,7 @@ def main():
     g1f4_flagoff = _gate_f4_flagoff_unchanged()
     ok &= g1f4_flagoff
 
-    # G1i4 / G1i4-rt: the int4 raw-feed store shuffle (2026-08-15) -- see
+    # The int4 raw-feed store shuffle -- see
     # v_store_perm_sm100_f4's int4 branch and check_k_store_perm_i4 for K.
     ok &= _gate_i4_v_perm()
     ok &= _gate_i4_v_perm_roundtrip()
