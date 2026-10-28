@@ -63,11 +63,20 @@ _MODULE_DUNDERS = {"__file__", "__name__", "__doc__", "__spec__", "__package__",
 
 
 def _tracked_python():
-    out = subprocess.run(["git", "-C", str(ROOT), "ls-files", "*.py"],
-                         capture_output=True, text=True, check=True)
-    for rel in out.stdout.split("\n"):
-        rel = rel.strip()
-        if rel.startswith(VENDORED):
+    """Every Python file in the tree, from git when there is a checkout.
+
+    A source tarball or an exported directory has no `.git`, and the gate is
+    about the tree rather than about git being installed, so the fallback walks
+    the tree instead of failing.
+    """
+    try:
+        out = subprocess.run(["git", "-C", str(ROOT), "ls-files", "*.py"],
+                             capture_output=True, text=True, check=True)
+        rels = [r.strip() for r in out.stdout.split("\n")]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        rels = [str(p.relative_to(ROOT)) for p in ROOT.rglob("*.py")]
+    for rel in rels:
+        if rel.startswith(VENDORED) or "__pycache__" in rel:
             continue
         if rel and (ROOT / rel).is_file():
             yield rel

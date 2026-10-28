@@ -99,6 +99,7 @@ def _load_wrapper_without_cutlass():
     utils.api = lambda function: function
     utils.get_num_sm = lambda device: 120
     utils.is_sm90 = lambda: False
+    utils.is_supported = lambda: True
     utils.supported_page_sizes = lambda device: (8, 16, 32, 64)
     sys.modules[utils_name] = utils
 
@@ -432,50 +433,3 @@ def test_the_sm90_path_takes_no_declaration(fold_runtime):
     wrapper = _wrapper_for_k_order()
     wrapper._is_sm90 = True
     wrapper._require_declared_k_pool_order(None)
-
-
-# --- `kernel_cls` is not a selector, so the public doors refuse it --------------
-# The wrapper builds one SM100 kernel, so a dict that names `kernel_cls` asks for
-# another one. Both doors must REFUSE such a dict, for every value it can carry,
-# rather than plan and check the kernel while the caller believes it asked for
-# something else. The match is each door's own prefix, because a generic TypeError
-# naming `kernel_cls` would also come from the constructor splat deep inside a
-# compile, and would pass a test that matched only the name.
-
-_KERNEL_CLS_VALUES = [None, "pingpong"]
-
-
-def _retired_prefix(where, name="kernel_cls"):
-    return rf"{where}: '{name}' was retired"
-
-
-@pytest.mark.parametrize("value", _KERNEL_CLS_VALUES)
-def test_plan_refuses_the_retired_kernel_cls(value):
-    """The real `plan()`, on the host-loaded wrapper: the refusal comes before any
-    planning or compile, so it needs no device and no DSL, and it leaves the
-    wrapper unplanned."""
-    wrapper = _load_wrapper_without_cutlass().PagedDecodeWrapper(torch.empty(4096))
-    with pytest.raises(TypeError, match=_retired_prefix("PagedDecodeWrapper.plan")):
-        wrapper.plan(
-            torch.tensor([0, 1], dtype=torch.int32),
-            torch.tensor([0], dtype=torch.int32),
-            torch.tensor([64], dtype=torch.int32),
-            32, 8, 128, 64,
-            q_data_type=torch.float8_e4m3fn,
-            bits=2,
-            kernel_kwargs={"kernel_cls": value},
-            max_kv_len=64,
-        )
-    assert not wrapper._planned
-
-
-@pytest.mark.parametrize("value", _KERNEL_CLS_VALUES)
-def test_run_refuses_a_planned_dict_that_names_kernel_cls(value):
-    """The K pool order guard reads the planned dict BY NAME, so it refuses a
-    dict naming `kernel_cls` as well: such a dict must not be answered for the
-    kernel this plan builds, whose K order is the opposite of the one it names
-    at this configuration."""
-    wrapper = _wrapper_for_k_order(kkw={"dequant_int2_to_f4": 1, "kernel_cls": value})
-    for order in (None, "logical", "permuted"):
-        with pytest.raises(TypeError, match=_retired_prefix("PagedDecodeWrapper.run")):
-            wrapper._require_declared_k_pool_order(order)

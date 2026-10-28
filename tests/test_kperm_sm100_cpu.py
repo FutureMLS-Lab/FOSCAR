@@ -53,7 +53,7 @@ def test_k_and_v_shuffle_only_the_reduction_axis(bits):
 
 @pytest.mark.parametrize("bits", [2, 4])
 def test_v_two_mask_expansion_and_pool_shape(bits):
-    from repack_sm100 import _gate_f4_v_perm, _gate_i4_v_perm
+    from cutedsl_decode.pool import _gate_f4_v_perm, _gate_i4_v_perm
     gate = _gate_f4_v_perm if bits == 2 else _gate_i4_v_perm
     assert gate(seed=17)
     torch.manual_seed(31)
@@ -78,20 +78,29 @@ def test_old_int4_whole_page_order_is_not_the_main_pool_contract(monkeypatch):
     assert torch.equal(torch.sort(new).values, torch.arange(D * PS))
     # Sensitivity control: the expansion oracle must reject an old-layout pool,
     # not simply agree with whichever packing convention it is handed.
-    import repack_sm100
-    monkeypatch.setattr(repack_sm100, "v_store_perm_sm100_f4", lambda bits: old)
-    assert not repack_sm100._gate_i4_v_perm(seed=17)
+    from cutedsl_decode import pool as pool_mod
+    monkeypatch.setattr(pool_mod, "v_store_perm_sm100_f4", lambda bits: old)
+    assert not pool_mod._gate_i4_v_perm(seed=17)
 
 
 def k_pool_perm(bits, kernel_kwargs=None):
-    """`_fold_harness.k_pool_perm`, imported LAZILY.
+    """The K pool permutation for this configuration, or None when it has none.
 
-    That module pulls in `cutedsl_decode`, hence cutlass, and several gates in
-    this file are pure Python over the permutation itself. A module-level import
-    would make the whole file uncollectable on a host without the DSL installed,
-    which is where the cheap gates are most useful."""
-    from _fold_harness import k_pool_perm as _impl
-    return _impl(bits, kernel_kwargs)
+    Which order a K pool must be written in is a property of the configuration,
+    so this asks the kernel's own predicate rather than reading a flag out of the
+    dict. The import is lazy because the predicate lives beside the kernel, which
+    pulls in the CuTe DSL; the gates above are pure Python and must stay
+    collectable without it."""
+    from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
+
+    kkw = dict(kernel_kwargs or {})
+    if not IntDecodeSm100.k_pool_is_permuted(
+            bits,
+            dequant_int2_to_f4=kkw.get("dequant_int2_to_f4"),
+            k_quant=tuple(kkw.get("k_quant", ("token", 128))),
+            fold_scale_zero=bool(int(kkw.get("fold_scale_zero", 1)))):
+        return None
+    return k_store_perm_sm100_f4(bits)
 
 #: First 16 values and the full-perm sha256.
 #: An edit that perturbs either changes which channel every stored slot holds,
@@ -265,7 +274,7 @@ def unpack(mKq, k_store_perm):
     caller passes the FORWARD perm to model the regression and the inverse to
     model the correct reference; the parameter carries the contract name so
     `test_pool_call_sites_cpu` sees the order is taken, not assumed."""
-    from repack_sm100 import unpack_rows_lut
+    from cutedsl_decode.pool import unpack_rows_lut
     return unpack_rows_lut(mKq, 4, D).float()[..., k_store_perm.long()]
 
 
@@ -350,7 +359,7 @@ def test_channel_wise_k_is_permuted_too():
         for d in range(perm.numel()):
             assert int(perm[d]) // 16 == d // 16, (d, int(perm[d]))
     # And the property the safety actually rests on, stated where it is used.
-    from repack_sm100 import check_k_store_perm_f4
+    from cutedsl_decode.pool import check_k_store_perm_f4
     assert check_k_store_perm_f4() is True
 
 
