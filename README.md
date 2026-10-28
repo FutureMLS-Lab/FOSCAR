@@ -126,6 +126,51 @@ a kernel run against that reference measures the kernel's own error, because
 both sides consume the same integer values, the same scale and offset, and the
 same Q dtype.
 
+## Benchmarks
+
+Decode latency in microseconds on one NVIDIA B200, against FlashInfer and
+TensorRT-LLM's `trtllm-gen` decode kernels. Lower is better.
+
+| Batch | KV len | int2 | int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 | int2 vs NVFP4 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 8K | **11.5** | 12.4 | 16.1 | 12.5 | 13.0 | 1.13x |
+| 1 | 32K | **16.6** | 19.7 | 35.3 | 22.9 | 18.5 | 1.12x |
+| 8 | 8K | **22.9** | 28.2 | 55.5 | 31.6 | 22.9 | 1.00x |
+| 8 | 32K | **63.0** | 75.7 | 166.9 | 95.5 | 69.2 | 1.10x |
+| 32 | 8K | **65.1** | 75.2 | 170.2 | 95.5 | 72.2 | 1.11x |
+| 32 | 32K | **214.1** | 257.0 | 602.4 | 317.9 | 250.7 | 1.17x |
+| 128 | 8K | **214.6** | 248.0 | 600.4 | 314.8 | 223.3 | 1.04x |
+| 128 | 32K | **765.9** | 877.7 | 2323.6 | 1189.8 | 832.7 | 1.09x |
+
+What the columns store per cached value, including the scale and offset:
+
+| | int2 | int4 | NVFP4 | FP8 | bf16 |
+|---|---:|---:|---:|---:|---:|
+| bits per value | 2.5 | 4.5 | 4.5 | 8 | 16 |
+
+Two things follow from that table and are worth stating plainly.
+
+The 2-bit kernel reads about 1.8 times fewer bytes than NVFP4 and finishes
+between 1.00 and 1.17 times sooner. It is not bandwidth-bound at these shapes:
+the dequantization and the on-chip work absorb most of the traffic saving.
+
+At 4 bits, where this package and NVFP4 store the same number of bits per value,
+the two are within a few percent of each other, and TRT-LLM is faster at seven of
+the eight shapes. The 2-bit setting is where this kernel wins.
+
+Measurement conditions: one query token per request, 32 query heads over 8 KV
+heads, `head_dim` 128, page size 64, paged cache, fp8 Q for this package and for
+TRT-LLM, bf16 for FlashInfer. Every column ran on the same card in one session.
+The reported number is the CUDA kernel span from CUPTI, over a cold L2, as the
+median of the fully observed iterations. It excludes host dispatch and the
+paged-attention wrapper around the kernel, so it is not an end-to-end serving
+latency.
+
+The benchmark harness that produced the competitor columns is not part of this
+release, so the competitor numbers cannot be regenerated from this repository.
+The two columns for this package can: they were measured by driving
+`PagedDecodeWrapper` through the same timing function.
+
 ## Testing
 
 ```sh
@@ -140,9 +185,11 @@ runs in about ten seconds.
 
 - Only the quantized path exists. There is no dense bf16, fp16 or fp8 KV mode.
 - `head_dim` 256 on SM90 requires token-wise K and V with an f32 scale pool.
-- The published latency comparison against other decode kernels is not
-  reproducible from this repository; the benchmark harness that produced it is
-  not part of this release.
+- The benchmark harness that produced the competitor columns in
+  [Benchmarks](#benchmarks) is not part of this release.
+- Pool construction for SM90 from a bf16 cache is not packaged; that
+  architecture's kernel takes pre-quantized codes through
+  `cutedsl_decode._sm90.serving_cache`.
 
 ## License
 
