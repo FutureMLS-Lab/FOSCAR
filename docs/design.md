@@ -26,7 +26,9 @@ src/cutedsl_decode/
 ├── quant_layout.py             per-(page, kv-head) scale-block layout and quantization envelope
 ├── kernel_contract.py          the constructor contract both decode kernels share
 ├── kernel_cache.py             persistent on-disk cache of compiled kernels
-├── pool.py                     pool construction and the reference attention
+├── pool.py                     SM100 pool construction and the reference attention
+├── pool_sm90.py                SM90 pool construction and the host repacker
+├── quant_ref.py                reference quantization both builders share
 ├── _vendor/                    QuACK and flash-attention subsets
 ├── _sm90/
 │   ├── int_decode_pingpong.py  the Hopper decode kernel

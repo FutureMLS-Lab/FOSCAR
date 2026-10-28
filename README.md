@@ -103,18 +103,40 @@ is supported.
 
 ## Building pools
 
-`cutedsl_decode.pool` turns a bf16 logical cache into the packed pools the
-kernel reads, and provides a reference implementation of the same attention so a
-kernel run can be checked against a storage-matched oracle.
+Both architectures ship a builder that turns a bf16 KV cache into the packed
+pools their kernel reads.
+
+On Blackwell, `cutedsl_decode.pool` packs the pools and also carries a reference
+implementation of the same attention, so a kernel run can be checked against a
+storage-matched oracle:
+
+```python
+from cutedsl_decode import pool
+
+k_pool, v_pool, scale_pool = pool.build_pools_lut(
+    k, v, bits,                                  # k, v: [pages, 64, kv_heads, dim]
+    k_store_perm=pool.k_store_perm_sm100_f4(bits),
+    v_store_perm=pool.v_store_perm_sm100_f4(bits))
+```
+
+On Hopper, `cutedsl_decode.pool_sm90` quantizes and repacks into the chunk-major
+pools the SM90 kernel reads, and lays the pages out as one global pool behind a
+block table:
+
+```python
+from cutedsl_decode import pool_sm90
+
+cache = pool_sm90.build_pools_sm90(
+    k, v, bits,                                  # k, v: [batch, kv_heads, kv_len, dim]
+    seq_lens=seq_lens)                           # -> codes_k, codes_v, scales, block_table
+```
 
 The stored integer values are permuted in a way the kernel requires and the bytes
-do not reveal, so ask the pool builder for the permutation
-(`k_store_perm_sm100_f4`, `v_store_perm_sm100_f4`) rather than reproducing it.
-`run()` refuses a K pool whose order the caller has not declared through
-`k_pool_order`.
-
-Pool construction for SM90 is not yet packaged. That architecture's kernel takes
-pre-quantized codes through `cutedsl_decode._sm90.serving_cache`.
+do not reveal. Ask the builder for the permutation rather than reproducing it:
+`k_store_perm_sm100_f4` / `v_store_perm_sm100_f4` on Blackwell, and the
+`order=` argument on Hopper, which defaults to the `chunk16` order the SM90
+kernel reads. On Blackwell, `run()` refuses a K pool whose order the caller has
+not declared through `k_pool_order`.
 
 ## Accuracy
 
@@ -193,9 +215,9 @@ runs in about ten seconds.
 - `head_dim` 256 on SM90 requires token-wise K and V with an f32 scale pool.
 - The benchmark harness that produced the competitor columns in
   [Benchmarks](#benchmarks) is not part of this release.
-- Pool construction for SM90 from a bf16 cache is not packaged; that
-  architecture's kernel takes pre-quantized codes through
-  `cutedsl_decode._sm90.serving_cache`.
+- `pool_sm90` is checked on the CPU: it round-trips its values through the
+  kernel's own read pattern, and its layout is gated. The SM90 kernel path itself
+  was not run from this repository, because no Hopper device was available.
 
 ## License
 

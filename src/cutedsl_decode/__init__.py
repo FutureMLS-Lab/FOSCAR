@@ -3,10 +3,10 @@
 """Quantized-KV paged GQA decode for Hopper (SM90) and Blackwell (SM100).
 
 The public API is architecture-agnostic: `PagedDecodeWrapper` dispatches to the
-right kernel and gates the features that kernel supports. Pool construction
-lives in `cutedsl_decode.pool`.
+right kernel and gates the features that kernel supports. Pool construction lives in
+`cutedsl_decode.pool` (SM100) and `cutedsl_decode.pool_sm90` (SM90).
 """
-from . import pool
+from . import pool, pool_sm90
 from ._utils import get_capabilities, is_supported
 from .wrapper import PagedDecodeWrapper
 
@@ -16,5 +16,6 @@ __all__ = [
     "get_capabilities",
     "is_supported",
     "pool",
+    "pool_sm90",
     "__version__",
 ]
