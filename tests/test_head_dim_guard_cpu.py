@@ -1,29 +1,26 @@
 # Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
 """The head_dim guards are a memory-safety boundary, so pin them BEHAVIOURALLY.
 
-Before these guards, `PagedDecodeWrapper.plan(head_dim=64)` reached the SM90 decode
-kernel: the wrapper accepted any multiple of 64, resolved `("token", head_dim)` and
-passed it on explicitly, `validate_quant_flex` accepted g == D for any D, and the
-kernel had no head_dim check. The epilogue then stored channels `output_row` and
-`64 + output_row`, and the fused split-K tail indexed the output channel by
-warpgroup thread index over 128 lanes, so D=64 wrote past its own row.
+A decode epilogue stores its output row over 128 lanes, and the fused split-K tail
+indexes the output channel by warpgroup thread index over the same 128 lanes, so a head
+dimension the kernel does not build writes past the end of its own row. Every entry
+point that fixes a head dimension therefore refuses a value it does not build, and this
+file pins that refusal by constructing the object rather than by reading source text.
 
 THE TWO ARCHITECTURES DIFFER AND THE TESTS MUST NOT FLATTEN THAT. SM90 builds 128 and
 256, and 256 in one layout only: its grouped body tiles the output accumulators and the
 fused combine by D, and `quant_layout.sm90_wide_refusal` refuses everything else there.
 SM100 is any positive multiple of 128, because it tiles D at 128 and masks no partial
-tile; demanding exactly 128 there would reject the D=256 its legacy token-D path is
-tiled for. On SM100 the wrapper is what narrows the shipped surface to 128, on the ground
-that nothing measures anything else there.
+tile; demanding exactly 128 there would reject the D=256 its token-D path is tiled for.
+On SM100 the wrapper is what narrows the shipped surface to 128, on the ground that
+nothing measures anything else there.
 
-WHY THESE CONSTRUCT RATHER THAN GREP. The first version of this file tested the
-SOURCE TEXT: it asserted `"head_dim != 128" in txt` and that a `raise` followed. A
-dead comment plus an unrelated nearby `raise` satisfied that, one of its cases was
-vacuous (it counted asserts that occur before the guard either way), and it missed
-two reachable constructors entirely. Constructing the object is what pins behaviour.
-The source-text check that remains is only the one a constructed object cannot
-show: that the guard is a `raise` rather than an `assert`, since `python -O` is not
-what pytest runs under. (codex, 2026-09-04)
+WHY THESE CONSTRUCT RATHER THAN GREP. A source-text check is satisfied by a dead
+comment beside an unrelated `raise`, counts statements that run before the guard either
+way, and misses a reachable constructor. Constructing the object is what pins behaviour.
+The source-text check that remains is only the one a constructed object cannot show:
+that the guard is a `raise` rather than an `assert`, since `python -O` is not what pytest
+runs under.
 """
 import ast
 import importlib.util
@@ -57,10 +54,9 @@ needs_dsl = pytest.mark.skipif(
 
 #: How to construct each kernel with a given head_dim, because the two signatures
 #: differ: SM90 takes head_dim first and requires the keyword-only `heads_per_kv`,
-#: and SM100 takes (page_size, head_dim, q_head_tile). A single positional helper
-#: raised TypeError wherever its call did not fit the signature, and so tested nothing.
-#: The quant granularity travels WITH head_dim, because `plan()` resolves
-#: `("token", head_dim)` and that is the route the hole was reachable by. For the SM100
+#: and SM100 takes (page_size, head_dim, q_head_tile). The quant granularity travels
+#: WITH head_dim, because `plan()` resolves `("token", head_dim)` and that is the route
+#: a head dimension the kernel does not build reaches it by. For the SM100
 #: builder it must: leaving `IntDecodeSm100`'s default ("token", 128) at D=64 makes
 #: `quant_layout` reject the pair first, so the test would pass for the wrong reason and
 #: prove nothing about the head_dim guard. `IntPingPongDecodeSm90` resolves the same pair
@@ -85,8 +81,8 @@ def _build(module, name, head_dim):
 @needs_dsl
 @pytest.mark.parametrize("module,name", ALL_FIXED_D)
 #: Multiples of 64 only. 0, a negative, and 100 are rejected earlier by other shape
-#: rules, so parametrizing them would test those rules rather than this guard. 64 is
-#: the value that actually reached the SM90 epilogue and wrote past its row.
+#: rules, so parametrizing them would test those rules rather than this guard. 64 is the
+#: multiple of 64 that reaches the SM90 epilogue and writes past its row.
 @pytest.mark.parametrize("bad", [64, 192])
 def test_every_fixed_d_kernel_refuses_a_bad_head_dim(module, name, bad):
     """A rejected D must raise ValueError, not sail through and not AssertionError."""
@@ -99,10 +95,10 @@ def test_every_fixed_d_kernel_refuses_a_bad_head_dim(module, name, bad):
 @needs_dsl
 @pytest.mark.parametrize("module,name", MULTIPLE_OF_128)
 def test_sm100_kernels_accept_a_larger_multiple_of_128(module, name):
-    """256 is tiled, not rejected. Guarding SM100 at exactly 128 was an over-constraint."""
+    """256 is tiled, not rejected; guarding SM100 at exactly 128 would over-constrain it."""
     try:
         _build(module, name, 256)
-    except ValueError as exc:  # pragma: no cover - the regression this pins
+    except ValueError as exc:  # pragma: no cover - the defect this test guards
         pytest.fail(f"{name} rejected head_dim=256, which its 128-tiling admits: {exc}")
     except Exception:
         # Any other failure is some later constructor rule, not the head_dim guard,
@@ -127,8 +123,7 @@ def test_the_guard_raises_rather_than_asserts(module, name):
 
 
 def _accepted_head_dims_literal():
-    """`_ACCEPTED_HEAD_DIMS` as the one literal `wrapper.py` states, read from its syntax tree,
-    the way `baselines/bench_sweep.py` reads it."""
+    """The single `accepts` rule `wrapper.py` states, read from its syntax tree."""
     tree = ast.parse((SRC / "wrapper.py").read_text())
     found = [node.value for node in tree.body if isinstance(node, ast.Assign)
              and [getattr(t, "id", None) for t in node.targets] == ["_ACCEPTED_HEAD_DIMS"]]

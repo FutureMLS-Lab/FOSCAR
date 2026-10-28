@@ -1,7 +1,7 @@
 """The SM100 compile path refuses nvidia-cutlass-dsl's CUDA 12 backend.
 
-That backend vendors ptxas 12.9, which left output elements of the SM100 kernel unwritten
-on B200 under DSL 4.8.0 (2026-10-07); Blackwell runs the CUDA 13 backend (README,
+That backend vendors ptxas 12.9, which leaves output elements of the SM100 kernel
+unwritten on B200 under DSL 4.8.0, while Blackwell runs the CUDA 13 backend (README,
 "Install"). The guard is `fold_runtime._refuse_cuda12_dsl_backend`, called in
 `compile_fold`'s trace closure before `cute.compile`.
 """

@@ -12,10 +12,17 @@ nvfp4.
 
 ## Install
 
+From a source checkout:
+
 ```sh
-pip install "cutedsl-decode[cu13]"    # CUDA 13: Blackwell, and Hopper
-pip install "cutedsl-decode[cu12]"    # CUDA 12: Hopper only
+git clone https://github.com/donglinz/fosca.git
+cd fosca
+pip install -e ".[cu13]"    # CUDA 13: Blackwell, and Hopper
+pip install -e ".[cu12]"    # CUDA 12: Hopper only
 ```
+
+The same extras work with `pip install "cutedsl-decode[cu13]"` once the package
+is published to PyPI.
 
 The package contains no compiled extensions. Everything is JIT-compiled by
 `nvidia-cutlass-dsl` on first use, and the result is memoized in process and

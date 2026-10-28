@@ -16,7 +16,9 @@ jobs:
         run: |
           set -e
           fail=0
-          check() { if git grep -nE "$1" -- src/ ; then echo "FAILED: $2"; fail=1; fi }
+          # The vendored trees keep their upstream comments, so they are excluded.
+          check() { if git grep -nE "$1" -- src/ ':!src/cutedsl_decode/_vendor'; then
+                      echo "FAILED: $2"; fail=1; fi }
           check '20[0-9]{2}-[0-9]{2}-[0-9]{2}'        "a date"
           check '\b(codex|owner decision|CLAUDE\.md)' "a review or agent reference"
           check 'the paper repository|the paper repo' "a paper reference"

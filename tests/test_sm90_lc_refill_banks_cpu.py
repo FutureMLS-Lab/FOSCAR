@@ -4,27 +4,25 @@
 Once per tile, after the tile's PV wgmmas (`pv_tile_restart`), the strip is copied from shared
 memory into the A registers of the lc wgmma: by lanes 0-7 of warp 0 on the whole-D body, the
 threads that hold the rows of l and c, and by every thread on the grouped body (head dimension
-256), thread t reading thread t % 8's bytes. The copy by warp 0's lanes 0-7 used to take 16
-scalar loads per tile, each at 2 wavefronts against an ideal of 1, because lanes 0-3 and 4-7 read
-rows 32 words apart. Its physical order is now `_lc_factor_layout`, in which each 16-token step is
-one 128-byte row in the registers' order, so the copy is 4 16-byte loads per warp per tile.
+256), thread t reading thread t % 8's bytes. `_lc_factor_layout` gives the strip its physical
+order, in which each 16-token step is one 128-byte row in the registers' order, so the copy is 4
+16-byte loads per warp per tile. The same words fetched one 4-byte word at a time on lanes 0-7
+cost 2 wavefronts each against an ideal of 1, because lanes 0-3 and 4-7 read rows 32 words apart.
 
 This file proves by lane arithmetic that every load of the copy is at its ideal, that the other
 access to the buffer (the lc writer) stays at its ideal, and that the reader and the writer
-still agree on every value. It also re-derives, for the layout at 6d4a06e, the per-instruction
-counts ncu measured there, so the model is anchored before it is used:
-`profile/h100_chunk16_bankconf_20260925/chunk16/analysis.txt`, INT4 and INT2 at B=128,
-KV=8192, records the refill LDS at 2.00/1.00 on 8 threads and the lc writer STS.U16 at
-1.00/1.00 on 8 threads (that tree's kernel is 6d4a06e's at these sites).
+still agree on every value. It also re-derives the per-instruction counts ncu measures at these
+sites, so the model is anchored before it is used: for INT4 and INT2 at B=128 and KV=8192, the
+refill LDS reads 2.00/1.00 on 8 threads and the lc writer's STS.U16 reads 1.00/1.00 on 8 threads.
 
 THE MODEL is the suite's one shared-memory bank model, `tests/_smem_banks.py`: the servicing
-rule that a lane-pattern microbenchmark measured on B200 and H100 on 2026-09-29, whose measured
+rule that a lane-pattern microbenchmark measured on B200 and H100, whose measured
 patterns `test_smem_bank_model_cpu.py` pins. A 16-byte load is served one 8-lane quarter warp at a time, merged into one
 wavefront per 16-lane half warp when that half touches at most 128 bytes on distinct banks, and
 a 4-byte access is served as the whole warp. Each group costs the largest number of distinct
 4-byte words in one bank. The microbenchmark measured no 2-byte access, so the lc writer's
-STS.U16 is costed by the 4-byte rule, and ncu's 1.00/1.00 for it at 6d4a06e is the measurement
-that anchors that choice here.
+STS.U16 is costed by the 4-byte rule, and ncu's 1.00/1.00 for it is the measurement that
+anchors that choice here.
 
 A buffer's base only rotates the banks every lane sees, so each check runs at every 16-byte
 aligned base offset modulo 128; both buffers are allocated at 16-byte alignment.

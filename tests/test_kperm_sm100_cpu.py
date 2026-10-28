@@ -7,9 +7,9 @@ wrong at every K channel, and nothing at runtime can detect that. These gates ar
 what make the contract checkable without a GPU. There is no flag to set: the
 order follows from the stored width and the resolved feed, and
 ``k_pool_is_permuted`` is the one predicate a POOL WRITER asks. Two orders
-exist: int2's self-inverse 16-slot sigma (either K axis, since 2026-08-13) and
-int4's 8-slot raw-feed shuffle (every configuration, since 2026-08-15), which
-is NOT self-inverse, so its gates pin the inverse separately.
+exist: int2's self-inverse 16-slot sigma, which applies to either K axis, and
+int4's 8-slot raw-feed shuffle, which applies at every configuration and is
+NOT self-inverse, so its gates pin the inverse separately.
 
 Run: pytest tests/test_kperm_sm100_cpu.py
 """
@@ -68,7 +68,8 @@ def test_v_two_mask_expansion_and_pool_shape(bits):
 
 
 def test_old_int4_whole_page_order_is_not_the_main_pool_contract(monkeypatch):
-    """Old pools have the same shape but different bytes; require rebuilding."""
+    """The whole-page int4 order and the main pool contract have the same shape
+    but different bytes, so a pool built with one cannot be read as the other."""
     old = v_store_perm_sm100(4)
     index = torch.arange(D * PS)
     old = old[8 * (index // 8) + torch.tensor(_T8_I4)[index % 8]]
@@ -92,8 +93,8 @@ def k_pool_perm(bits, kernel_kwargs=None):
     from _fold_harness import k_pool_perm as _impl
     return _impl(bits, kernel_kwargs)
 
-#: First 16 values and the full-perm sha256, recorded when the perm was added.
-#: A later edit that perturbs it changes which channel every stored slot holds,
+#: First 16 values and the full-perm sha256.
+#: An edit that perturbs either changes which channel every stored slot holds,
 #: so it must trip a gate rather than silently move every K operand.
 _K_PERM_FIRST16 = [0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15]
 _K_PERM_SHA256 = (
@@ -118,8 +119,8 @@ def test_perm_is_a_self_inverse_permutation_of_D():
 
 
 def test_perm_is_the_same_sigma_the_v_order_composes():
-    """K reuses V's 16-slot sigma. If they ever diverge, the appendix claim
-    that one shuffle serves both tensors stops being true."""
+    """K reuses V's 16-slot sigma. If they diverge, one shuffle cannot serve
+    both tensors."""
     sigma = [(i & 3) | ((i & 4) << 1) | ((i & 8) >> 1) for i in range(16)]
     perm = k_store_perm_sm100_f4(2)
     for group in range(D // 16):
@@ -142,8 +143,8 @@ def test_perm_values_are_pinned():
     assert digest == _K_PERM_SHA256
 
 
-#: First 16 values and the full-perm sha256 of the INT4 shuffle, recorded when
-#: it was added (2026-08-15). Same rationale as the int2 pin above.
+#: First 16 values and the full-perm sha256 of the INT4 shuffle. Same rationale
+#: as the int2 pin above.
 _K_PERM_I4_FIRST16 = [0, 4, 1, 5, 2, 6, 3, 7, 8, 12, 9, 13, 10, 14, 11, 15]
 _K_PERM_I4_SHA256 = (
     "5e30506735c33024c524a22c93fb526a5d8f0f1810e1744c75105367d6e77f1f")
@@ -270,12 +271,11 @@ def unpack(mKq, k_store_perm):
 
 def test_only_the_int2_e4m3_feed_is_logical():
     """The int2 e4m3 feed reads `pack_rows_lut` spacing, so the predicate must
-    answer False for it and the pool writer must leave it logical. int4 left
-    this list on 2026-08-15: its raw-code deposit reads the 8-slot shuffle at
-    every configuration, so the predicate answers True with no feed term.
+    answer False for it and the pool writer must leave it logical. int4's
+    raw-code deposit reads the 8-slot shuffle at every configuration, so the
+    predicate answers True for it with no feed term.
 
-    This used to be a ctor REFUSAL of an explicit flag. With the flag gone the
-    same property is a POSITIVE statement about the predicate, which is the
+    The property is a positive statement about the predicate, which is the
     stronger form: a refusal only fires when a caller asks, while the predicate
     is what every caller gets."""
     from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
@@ -309,8 +309,8 @@ def test_validator_rejects_non_permutations_and_cross_width_perms():
 
 def test_legacy_pool_builder_applies_and_inverts_the_perm():
     """`build_pools_lut` is the legacy path `make_pool_problem` and the e2e gate
-    use. Before this change it silently ignored the K order, so a flag-on kernel
-    could be handed an unpermuted pool."""
+    use. It applies the K store permutation to the K pool only, and its
+    reference dequantization inverts it."""
     torch.manual_seed(0)
     # build_pools_lut takes [NP, PS, HKV, D]
     k = torch.randn(2, PS, 1, D, dtype=torch.bfloat16)

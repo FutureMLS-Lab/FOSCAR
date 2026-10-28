@@ -6,12 +6,10 @@ the byte addresses of one warp-wide shared-memory instruction into the (actual, 
 wavefronts per execution that ncu reports for it as `L1 Wavefronts Shared` and
 `L1 Wavefronts Shared Ideal`.
 
-THE SERVICING RULE. It was measured on 2026-09-29 by a lane-pattern microbenchmark on B200
-(ssr-b200, sm_100a) and H100 (research-secure-26, sm_90a): 21 lane patterns, each issued by one
-warp as one `ld.shared` and one `st.shared` at its own PC, 100 times, under ncu SourceCounters.
-Both GPUs gave identical counts for all 42 instructions; the ncu reports are kept on those nodes
-under `remote_workspace/bankconf_20260929/`. The warp is served in groups of lanes, formed by
-access width and by lane index:
+THE SERVICING RULE. A lane-pattern microbenchmark on B200 (sm_100a) and H100 (sm_90a) pins it:
+21 lane patterns, each issued by one warp as one `ld.shared` and one `st.shared` at its own PC,
+100 times, under ncu SourceCounters. Both GPUs give identical counts for all 42 instructions.
+The warp is served in groups of lanes, formed by access width and by lane index:
 
 - A 16-byte access, load or store, is served one 8-lane quarter warp at a time. A load also
   serves a 16-lane half warp as one wavefront when that half's lanes touch at most 128 distinct
@@ -34,15 +32,15 @@ THE IDEAL is ncu's own count, and the formula below is a fit to it, not a servic
 
 The measured patterns do not separate whether a 16-byte quarter is the 8 lanes of that index
 or the next 8 active lanes, and they do not include a 16-byte load whose half-warp merge spans
-two 128-byte rows. The microbenchmark measured 4-, 8- and 16-byte accesses only, so a 1- or
-2-byte access is costed by the 4-byte rule. None of these three questions changes a result of
-the lane maps the tests cost with this model.
+two 128-byte rows. The measurement covers 4-, 8- and 16-byte accesses only, so a 1- or 2-byte
+access is costed by the 4-byte rule. None of these three questions changes a result of the lane
+maps the tests cost with this model.
 
-This rule replaces the two that the tests carried from 2026-09-24. "16 active lanes per group"
-served 8- and 16-byte accesses in groups of 16 active lanes. The microbenchmark falsified it:
-it predicts 4/4 for the operand deposit lane map at start row 0, where both GPUs measure 8/4
-for the load and for the store. `test_smem_bank_model_cpu.py` pins the measured patterns that
-this model must reproduce, the conflicted ones included.
+The alternative rule, 16 active lanes per group, serves 8- and 16-byte accesses in groups of
+16 active lanes, and the measurement rules it out: it predicts 4/4 for the operand deposit lane
+map at start row 0, where both GPUs measure 8/4 for the load and for the store.
+`test_smem_bank_model_cpu.py` pins the measured patterns this model reproduces, the conflicted
+ones included.
 """
 from __future__ import annotations
 

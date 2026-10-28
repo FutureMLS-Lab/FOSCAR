@@ -360,13 +360,13 @@ def test_invalid_sdtype_replan_discards_prior_kernel_and_fails_closed(monkeypatc
         wrapper.pscale_lp(torch.empty(1, 1, 384, dtype=torch.float32))
 
 
-# --- the K pool order must be DECLARED (kwarg removed 2026-08-12) -----------
+# --- the K pool order must be DECLARED ---------------------------------------
 # `run()` cannot tell a permuted K pool from a logical one: same dtype, same
 # shape, same byte count, and a wrong pairing decodes to finite values with every
-# K channel taken from the wrong slot inside its 16-channel group. Removing
-# `k_f4_prepermuted` closed that hole for every caller that resolves its pool
-# through `_fold_harness.k_pool_perm`, and left it open on the PUBLIC API, which
-# is where an external cache writer arrives. Raised by codex, 2026-08-12.
+# K channel taken from the wrong slot inside its 16-channel group. Every caller
+# that reads a permuted pool therefore declares its order, and the public API
+# refuses to launch on an undeclared one, which is the door an external cache
+# writer arrives at.
 
 def _wrapper_for_k_order(k_quant=("token", 128), bits=2, kkw=None):
     PagedDecodeWrapper = _load_wrapper_without_cutlass().PagedDecodeWrapper

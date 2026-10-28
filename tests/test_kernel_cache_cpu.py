@@ -10,11 +10,11 @@ failing the benchmark: an unwritable root or a damaged sidecar must compile unca
 raise (the robustness tests). The DSL is stood in for by a fake compile function whose
 `export_to_c` writes bytes, and a fake loader that reads them back; what these tests do not
 exercise is the real `export_to_c` / `load_module` round trip and the DSL identity, which
-the GPU validation of 2026-09-11 covered on both architectures.
+require a GPU and the real DSL.
 
 THE REQUIRED NAMES ARE SPELLED OUT HERE, not imported from the module: a test that derives
 its cases from the implementation's own constant would pass with a variable removed from
-both. Modelled on flashinfer's `tests/jit/test_cute_dsl_cache.py`.
+both.
 """
 from __future__ import annotations
 
