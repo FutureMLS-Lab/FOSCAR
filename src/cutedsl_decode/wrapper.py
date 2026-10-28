@@ -3,30 +3,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from FlashInfer's CuTe DSL paged-decode wrapper (see NOTICE).
 
-"""PagedDecodeWrapper — PyTorch-facing API for paged GQA decode attention.
+"""PyTorch-facing API for paged GQA decode attention.
 
-Provides :class:`PagedDecodeWrapper` for paged KV cache decode on SM90 (Hopper)
-and SM100 (Blackwell) GPUs, dispatching automatically to the correct kernel.
+:class:`PagedDecodeWrapper` drives the SM90 (Hopper) and SM100 (Blackwell)
+quantized-KV decode kernels behind one interface, dispatching on the compute
+capability of the current device.
 
-Kernels compile with symbolic dimensions (``cute.sym_int``) so the same
-compiled module is reused across varying batch sizes, and memoize compilation
-via :func:`functools.cache` keyed on the static configuration.
+Every decode path is quantized. K and V live in the cache as packed 2-bit or
+4-bit integer values plus a separate scale-and-offset pool, and ``plan()``
+requires ``bits=2`` or ``bits=4``. In this mode ``run()``'s ``k_cache`` and
+``v_cache`` are the packed pools, and the affine block arrives as
+``scale_pool``.
 
-TWO MODES, ONE ENTRY POINT
---------------------------
-``plan(bits=None)`` (the default) is DENSE decode: bf16/fp16/fp8 K/V read
-straight out of a paged cache. Unchanged from before quantized support existed.
-
-``plan(bits=2)`` / ``plan(bits=4)`` is QUANTIZED-KV decode, driving
-``IntDecodeSm100`` on Blackwell and ``IntPingPongDecodeSm90`` on Hopper. In this
-mode ``run``'s ``k_cache``/``v_cache`` carry the PACKED CODE POOLS (uint8) and
-the affine (scale, zero) block arrives separately as ``scale_pool``.
-
-The split-K planners are deliberately NOT shared between the two modes; see
-:meth:`PagedDecodeWrapper._plan_quantized` for why.
-
-Development record for the pre-launch guards, and what each of them was written
-against: ``docs/kernel/wrapper.md``.
+Kernels compile with symbolic dimensions, so one compiled module serves varying
+batch sizes, and compilation is memoized in process and cached on disk keyed by
+the static configuration.
 """
 
 import functools
@@ -38,6 +29,7 @@ from ._utils import (
     api as flashinfer_api,
     get_num_sm,
     is_sm90 as _is_sm90,
+    is_supported as _is_supported,
 )
 
 _QUANT_BITS = (2, 4)
@@ -491,23 +483,29 @@ class PagedDecodeWrapper:
         kernel_kwargs: Optional[Dict[str, Any]],
     ) -> None:
         """Plan the quantized-KV kernel. Called by :meth:`plan` when ``bits``
-        is set; never touched in dense mode.
+        is set.
 
-        Both quantized cost models (``_sm100/scheduler.plan_splits_sm100``,
-        ``_sm90/scheduler.plan_splits``) are KEYED BY ``bits`` and were
-        calibrated against the QUANTIZED kernels — their per-tile cost
-        constants come from measured int2/int4 sweeps (int2 0.791 us/tile
-        unsplit vs int4 1.25 on B200; the two differ by ~1.6x). Feeding them a
-        bf16 problem would be a category error: there is no bf16 entry in
-        ``T_US`` at all, and if there were it would be a different kernel with
-        a different prologue and a different reduction cost.
-
-        The dense wave-fill rule was removed with the dense path (9490340), and
-        the quantized path plans only through ``plan_splits_sm100`` and
-        ``plan_splits``.
-
-        DO NOT "unify" the two planners.
+        Both cost models (``_sm100/scheduler.plan_splits_sm100`` and
+        ``_sm90/scheduler.plan_splits``) are keyed by ``bits`` and calibrated
+        against the quantized kernels, whose per-tile cost differs by about 1.6
+        times between the two bit widths. They are not shared with each other
+        and must not be unified: the two architectures plan by different cost
+        forms.
         """
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "paged decode needs a CUDA GPU, and torch reports no CUDA "
+                "device. Install a CUDA build of torch and run on an SM90 "
+                "(Hopper) or SM100 (Blackwell) device."
+            )
+        if not _is_supported():
+            major, minor = torch.cuda.get_device_capability()
+            raise ValueError(
+                f"this package runs on SM90 (Hopper) and SM100 (Blackwell) "
+                f"only; the current device reports compute capability "
+                f"{major}.{minor}. Use get_capabilities() to check a device "
+                f"before planning."
+            )
         if bits not in _QUANT_BITS:
             raise ValueError(f"bits must be one of {_QUANT_BITS} or None; got {bits}")
         if page_size != _QUANT_PAGE_SIZE:
