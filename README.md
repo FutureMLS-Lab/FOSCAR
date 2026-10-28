@@ -128,8 +128,10 @@ same Q dtype.
 
 ## Benchmarks
 
-Decode latency in microseconds on one NVIDIA B200, against FlashInfer and
-TensorRT-LLM's `trtllm-gen` decode kernels. Lower is better.
+Decode latency on one NVIDIA B200, against FlashInfer and TensorRT-LLM's
+`trtllm-gen` decode kernels. Lower is better.
+
+![Decode latency against batch size at KV lengths 8K and 32K](docs/decode-latency.png)
 
 | Batch | KV len | int2 | int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 | int2 vs NVFP4 |
 |---:|---:|---:|---:|---:|---:|---:|---:|
@@ -160,16 +162,20 @@ the eight shapes. The 2-bit setting is where this kernel wins.
 
 Measurement conditions: one query token per request, 32 query heads over 8 KV
 heads, `head_dim` 128, page size 64, paged cache, fp8 Q for this package and for
-TRT-LLM, bf16 for FlashInfer. Every column ran on the same card in one session.
-The reported number is the CUDA kernel span from CUPTI, over a cold L2, as the
-median of the fully observed iterations. It excludes host dispatch and the
-paged-attention wrapper around the kernel, so it is not an end-to-end serving
-latency.
+TRT-LLM, bf16 for FlashInfer. All five columns were measured on the same B200
+card on 2026-10-28, in one session, through one timing function. The reported
+number is the CUDA kernel span from CUPTI, over a cold L2, as the median of the
+fully observed iterations. It excludes host dispatch and the paged-attention
+wrapper around the kernel, so it is not an end-to-end serving latency.
 
-The benchmark harness that produced the competitor columns is not part of this
-release, so the competitor numbers cannot be regenerated from this repository.
-The two columns for this package can: they were measured by driving
-`PagedDecodeWrapper` through the same timing function.
+Which code produced each column:
+
+- **int2 and int4** were measured by driving `PagedDecodeWrapper` from this
+  release. `benchmarks/decode_latency.csv` holds the values and
+  `benchmarks/plot_decode.py` renders the figure above.
+- **FlashInfer and TRT-LLM** were measured by the project's benchmark harness,
+  which is not part of this release. Those three columns cannot be regenerated
+  from this repository.
 
 ## Testing
 
