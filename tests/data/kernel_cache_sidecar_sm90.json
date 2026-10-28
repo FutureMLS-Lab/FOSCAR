@@ -1,0 +1,95 @@
+{
+ "created_utc": "2026-09-30T12:00:04Z",
+ "exporter": {
+  "executable": "/home/donglin/flashinfer/.venv/bin/python",
+  "python": "3.12.13"
+ },
+ "format": 1,
+ "key": "6f1d84b5d07f1cc7827eaa0bc6a291711ba727a4ce77777dd09e1c05b5c38609",
+ "key_document": {
+  "config": {
+   "kernel": {
+    "ALPHA_INV": 1.0,
+    "BETA_FOLD": 4.0,
+    "__class__": "cutedsl_decode._sm90.int_decode_pingpong.IntPingPongDecodeSm90",
+    "_min_blocks": 2,
+    "bits": 2,
+    "fold": true,
+    "fused_combine": false,
+    "head_dim": 128,
+    "heads_per_kv": 4,
+    "k_axis": "token",
+    "k_code_bytes_per_thread": 16,
+    "k_group": 128,
+    "lc_ones_quad": false,
+    "num_stages": 4,
+    "num_threads": 384,
+    "page_size": 64,
+    "phase_lock": true,
+    "phase_lock_active": true,
+    "q_head_tile": 8,
+    "qoff": {
+     "block_tot": 256,
+     "k_ch": null,
+     "k_ring": 0,
+     "legacy": true,
+     "ring_tot": 256,
+     "v_ch": null,
+     "v_ring": 0
+    },
+    "scale_element_bytes": 4,
+    "scale_element_type": "cutlass.base_dsl.typing.Float32",
+    "sdtype": "torch.float32",
+    "sdtype_name": "f32",
+    "v_axis": "token",
+    "v_code_bytes_per_thread": 16,
+    "v_group": 128
+   },
+   "trace": {
+    "block_tot": 256,
+    "code_pool_order": "chunk16",
+    "head_dim": 128,
+    "legacy": true,
+    "num_kv_heads": 8,
+    "num_qo_heads": 32,
+    "page_size": 64,
+    "per_k": 16,
+    "per_v": 16,
+    "scale_element_type": "cutlass.base_dsl.typing.Float32"
+   }
+  },
+  "env": {
+   "CUTE_DSL_ENABLE_ASSERTIONS": null,
+   "CUTE_DSL_LIBS": null,
+   "CUTE_DSL_LINEINFO": null
+  },
+  "format": 1,
+  "identity": {
+   "arch": "sm_90a",
+   "backend": "_cutlass_ir.cpython-312-x86_64-linux-gnu.so",
+   "cuda_version": "DSLCudaVersion(major=12, minor=9)",
+   "packages": [
+    "nvidia-cutlass-dsl-libs-base==4.5.2",
+    "nvidia-cutlass-dsl==4.5.2"
+   ]
+  },
+  "kind": "sm90_IntPingPongDecodeSm90",
+  "options": "--enable-tvm-ffi --opt-level 3",
+  "sources": {
+   "_sm90/int_decode_pingpong.py": "4e6fa4dcf09d190cb2d4293fa80c4c72cfcc1af8f309ca492a91eb58e51115b5",
+   "_sm90/pingpong_runtime.py": "aebe7bdc31d4c2bf3d3aec3346cc7f9001b08ea15670b94550a1d4282163abbf",
+   "_sm90/scheduler.py": "3aa794ecd23b05ed200b261e8b98dd20ed69dfa055ca541d57f8a7674abf2dbf",
+   "_sm90/serving_cache.py": "8a31b4830a4c6ef4de86f411f4495ce76023927ea1d5bad12d551e18dcfbedc4",
+   "_sm90/splitk_combine.py": "ead85cdd92a82458c28dacdfaadee546e28570c56d7e7f886e372ddd5a5da55e",
+   "_vendor/flash_attn/cute/copy_utils.py": "d4fe05c3fe4eba9100a86d4c01aa4458d382ecd5db7182ef8470a48410fea30b",
+   "_vendor/quack/sm90_utils.py": "57dfbb46554fbd2e21b8e5f6cc18fab03fa14a5cce770511dd4c1a44f8887c84",
+   "kernel_cache.py": "1c30fc1863b7b52d559efe4767be24714a7468a683af981a723be20eaad23cf0",
+   "kernel_contract.py": "f2090a1c8167b5d41392c975f3140b17475dd0ca3a796a0a51983e43b862718d",
+   "quant_layout.py": "cc6fdb4c74828113a5b58188df3ae25f67d180a909982326558ebe9b5d8c9d9a"
+  }
+ },
+ "kind": "sm90_IntPingPongDecodeSm90",
+ "object_sha256": "f0f81108bb2d5812950fc1f03ca40fc263acd40fae587e96526a5ad055107638",
+ "symbol": "cutedsl_decode_sm90_IntPingPongDecodeSm90_6f1d84b5d07f1cc7",
+ "trace_seconds": 5.136
+}

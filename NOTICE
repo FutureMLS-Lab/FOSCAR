@@ -1,0 +1,88 @@
+cutedsl-decode
+Copyright 2026 Donglin Zhuang
+
+This product is licensed under the Apache License, Version 2.0. It includes
+material derived from, and redistributes, the following third-party software.
+Each retains its own license, reproduced below.
+
+--------------------------------------------------------------------------------
+Derived work: FlashInfer
+--------------------------------------------------------------------------------
+
+The SM90 decode kernel (`src/cutedsl_decode/_sm90/`) and the paged-decode
+wrapper (`src/cutedsl_decode/wrapper.py`) are adapted from the CuTe DSL GQA
+decode kernels and the paged-decode wrapper in FlashInfer
+(https://github.com/flashinfer-ai/flashinfer), which are licensed under the
+Apache License, Version 2.0. A copy of that license is the LICENSE file at the
+root of this repository.
+
+Changes from the upstream work: every decode path was replaced with a quantized
+one; the paged K/V gather, the flash-decoding split-K reduction and the arch
+dispatch were reimplemented; and the upstream API-logging decorator and SM-count
+helper were replaced with local equivalents. The derived files therefore do not
+track upstream and are not drop-in compatible with it.
+
+--------------------------------------------------------------------------------
+Derived work: NVIDIA CUTLASS
+--------------------------------------------------------------------------------
+
+The SM90 decode kernel is also adapted from the Hopper FMHA CuTeDSL example in
+NVIDIA CUTLASS (https://github.com/NVIDIA/cutlass), which is licensed under the
+BSD 3-Clause License, reproduced below.
+
+Changes from the upstream work: the dense FMHA pipeline was replaced with a
+quantized paged-decode pipeline.
+
+--------------------------------------------------------------------------------
+Redistributed: QuACK
+--------------------------------------------------------------------------------
+
+`src/cutedsl_decode/_vendor/quack/` redistributes a minimal subset of QuACK
+(https://github.com/Dao-AILab/quack), BSD 3-Clause License.
+Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+
+Changes from the upstream work: internal imports were rewritten to the
+`cutedsl_decode._vendor` package path, and the package `__init__.py` files were
+emptied so that importing the subset does not pull in the project's whole kernel
+surface.
+
+--------------------------------------------------------------------------------
+Redistributed: flash-attention (cute submodule)
+--------------------------------------------------------------------------------
+
+`src/cutedsl_decode/_vendor/flash_attn/cute/` redistributes a minimal subset of
+flash-attention (https://github.com/Dao-AILab/flash-attention), BSD 3-Clause
+License. Copyright (c) 2025, Tri Dao.
+
+Changes from the upstream work: internal imports were rewritten to the
+`cutedsl_decode._vendor` package path, and the package `__init__.py` files were
+emptied.
+
+--------------------------------------------------------------------------------
+BSD 3-Clause License
+--------------------------------------------------------------------------------
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

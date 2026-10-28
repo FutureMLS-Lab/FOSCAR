@@ -1,0 +1,119 @@
+{
+ "created_utc": "2026-10-01T06:40:27Z",
+ "exporter": {
+  "executable": "/scratch/workspaces/donglin/workspace/flashinfer/.venv/bin/python",
+  "python": "3.10.12"
+ },
+ "format": 1,
+ "key": "07f16f54ea7c1a21ef7bf20a5ccd97b17694b84316333a72400e6a2a4dee9e83",
+ "key_document": {
+  "config": {
+   "fold_flags": {
+    "_ABL_NO_TCTS2": false,
+    "_ABL_ONECHAIN": false,
+    "_F32_LIFT": false,
+    "_LIFT_STUB": false,
+    "_NO_PF": false
+   },
+   "kernel": {
+    "__class__": "cutedsl_decode._sm100.int_fold_decode.IntDecodeSm100",
+    "_o_stages": 3,
+    "_p_stages": 4,
+    "_pt_stages": 4,
+    "bits": 2,
+    "code_stages": 16,
+    "code_stages_k": 8,
+    "code_stages_v": 8,
+    "debug_s": false,
+    "dequant_int2_to_f4": true,
+    "do_atomic_red": false,
+    "do_kernel_red": false,
+    "do_none_red": true,
+    "fold_scale_zero": true,
+    "head_dim": 128,
+    "k_axis": "token",
+    "k_group": 128,
+    "k_op_stages": null,
+    "k_pool_permuted": true,
+    "k_quant": [
+     "token",
+     128
+    ],
+    "page_size": 64,
+    "persistent": true,
+    "persistent_sm_count": 148,
+    "q_head_tile": 4,
+    "qoff": {
+     "block_tot": 256,
+     "k_ch": null,
+     "k_ring": 0,
+     "legacy": true,
+     "ring_tot": 256,
+     "v_ch": null,
+     "v_ring": 0
+    },
+    "scale_dtype": "cutlass.base_dsl.typing.Float32",
+    "scale_sdtype": "f32",
+    "scale_stages": 16,
+    "sequence_tile": 256,
+    "threads_per_cta": 512,
+    "tma_mask": false,
+    "v_axis": "token",
+    "v_group": 128,
+    "v_quant": [
+     "token",
+     128
+    ]
+   },
+   "trace": {
+    "acc_dtype": "cutlass.base_dsl.typing.Float32",
+    "bits": 2,
+    "debug_s": false,
+    "head_dim": 128,
+    "in_dtype": "cutlass.base_dsl.typing.Float8E4M3FN",
+    "num_kv_heads": 8,
+    "num_qo_heads": 32,
+    "out_dtype": "cutlass.base_dsl.typing.BFloat16",
+    "page_size": 64,
+    "reduction": "none",
+    "scale_fake": {
+     "block_tot": 256,
+     "legacy": true,
+     "sdtype": "f32"
+    }
+   }
+  },
+  "env": {
+   "CUTE_DSL_ENABLE_ASSERTIONS": null,
+   "CUTE_DSL_LIBS": null,
+   "CUTE_DSL_LINEINFO": null
+  },
+  "format": 1,
+  "identity": {
+   "arch": "sm_100a",
+   "backend": "_cutlass_ir.cpython-310-x86_64-linux-gnu.so",
+   "cuda_version": "DSLCudaVersion(major=12, minor=9)",
+   "packages": [
+    "nvidia-cutlass-dsl-libs-base==4.5.2",
+    "nvidia-cutlass-dsl==4.5.2"
+   ]
+  },
+  "kind": "sm100_IntDecodeSm100",
+  "options": "--enable-tvm-ffi --opt-level 2",
+  "sources": {
+   "_sm100/fold_runtime.py": "3b59d435d20287af4300c6300b54f6c3a7e8b96e4930d6f3d8c8bc1ade07614a",
+   "_sm100/gqa_decode.py": "f0ad1d57e6b0fea62cb47cc565c1eadfb35ef10f92838151cbb599656ea5dfe9",
+   "_sm100/int_fold_asm.py": "b069b47b8c9a2e2789fbbab76b1c662540eb3ddcdb6043532f049d4061e8f384",
+   "_sm100/int_fold_decode.py": "6dadfcb6645722890cd2151ba4c4ca007675589cef35fbe8437823ab0cb82dbf",
+   "_sm100/int_fold_decode_pingpong.py": "af2284af236e5028c5fea3c1e357a7167664c3c2a72bc1d372295a2b1f0c5d3c",
+   "_sm100/scheduler.py": "1e4a205b4522ea30b818bea61deed1437ca2fbad48e06205dc253e5ae1ca922b",
+   "kernel_cache.py": "1c30fc1863b7b52d559efe4767be24714a7468a683af981a723be20eaad23cf0",
+   "kernel_contract.py": "f2090a1c8167b5d41392c975f3140b17475dd0ca3a796a0a51983e43b862718d",
+   "quant_layout.py": "cf12a0e2713c66803d1e1f6919f167f151be2cd0e7e3368e0b05113986d30577"
+  }
+ },
+ "kind": "sm100_IntDecodeSm100",
+ "object_sha256": "92c80ca80f5a96815ffc30e2405cb9b6d9edbc7996ec83bed954b73f1f69bb37",
+ "symbol": "cutedsl_decode_sm100_IntDecodeSm100_07f16f54ea7c1a21",
+ "trace_seconds": 10.333
+}

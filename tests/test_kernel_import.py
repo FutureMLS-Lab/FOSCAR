@@ -1,0 +1,36 @@
+# tests/test_kernel_import.py
+import torch
+import pytest
+
+
+def test_sm100_shared_reduction_library_imports():
+    # Imports must succeed regardless of running arch (no device code runs at import).
+    #
+    # `gqa_decode` SURVIVED the dense-path removal because it is the shared split-K
+    # reduction library, not merely the non-paged dense kernel: int_fold_decode
+    # takes 11 names from it at module level, and
+    # `GroupedQueryAttentionDecode` is the namespace for the reduction members. The
+    # class name is load-bearing too -- `launch_reduction` reaches the kernel via a
+    # class-qualified `GroupedQueryAttentionDecode.reduction_kernel(...)` call.
+    from cutedsl_decode._sm100.gqa_decode import GroupedQueryAttentionDecode
+    assert GroupedQueryAttentionDecode is not None
+    for member in ("can_implement", "gqa_pack", "gemm_view", "gemm_view_bsh",
+                   "reduction_none", "reduction_epilogue", "reduction_cluster",
+                   "launch_reduction", "reduction_kernel"):
+        assert hasattr(GroupedQueryAttentionDecode, member), member
+
+
+def test_gmem_fmax_stays_a_module_global():
+    # `reduction_epilogue` resolves `gmem_fmax` as a MODULE GLOBAL instead of
+    # taking it as an argument, so pruning it breaks every reduction="kernel" fold
+    # launch at TRACE time rather than at import time -- much harder to notice, so
+    # it gets its own assertion.
+    from cutedsl_decode._sm100 import gqa_decode
+    assert hasattr(gqa_decode, "gmem_fmax")
+
+
+def test_quantized_kernels_import():
+    from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
+    from cutedsl_decode._sm90.int_decode_pingpong import IntPingPongDecodeSm90
+    assert IntDecodeSm100 is not None
+    assert IntPingPongDecodeSm90 is not None

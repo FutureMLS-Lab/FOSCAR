@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cutedsl-decode"
+version = "0.1.0"
+description = "Quantized-KV paged decode kernels for Hopper (SM90) and Blackwell (SM100), written in CuTe DSL."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Donglin Zhuang", email = "donglinzhuang@outlook.com" }]
+keywords = ["attention", "decode", "kv-cache", "quantization", "cuda", "cute-dsl"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["torch>=2.4"]
+
+[project.optional-dependencies]
+cu12 = ["nvidia-cutlass-dsl==4.8.0", "cuda-python>=12.4,<13"]
+cu13 = ["nvidia-cutlass-dsl[cu13]==4.8.0", "cuda-python>=13,<14"]
+test = ["pytest>=7", "nvidia-cutlass-dsl==4.8.0", "cuda-python>=12.4,<13"]
+
+[project.urls]
+Homepage = "https://github.com/donglinz/fosca"
+Repository = "https://github.com/donglinz/fosca"
+Issues = "https://github.com/donglinz/fosca/issues"
+Changelog = "https://github.com/donglinz/fosca/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cutedsl_decode = ["py.typed", "_vendor/LICENSE", "_vendor/README.md"]
+
+[tool.uv]
+conflicts = [[{ extra = "cu12" }, { extra = "cu13" }]]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: needs an SM90 or SM100 device"]
+addopts = "-m 'not gpu' --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
