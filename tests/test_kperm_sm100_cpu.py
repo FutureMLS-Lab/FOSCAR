@@ -328,24 +328,17 @@ def test_legacy_pool_builder_applies_and_inverts_the_perm():
 def test_channel_wise_k_is_permuted_too():
     """Channel-wise K carries the store permutation, at every group size.
 
-    This assertion has been inverted twice and the history is the point. It first
-    asserted the ctor REFUSED channel-wise K while the flag was on; then that the
-    predicate returned False for it, which routed it to the 7-op gather. Both
-    encoded a missing reference rather than a property of the machine:
     `check_k_store_perm_f4` proves the two deposits emit byte-identical operand
-    words for arbitrary codes with no scale involved, so a channel-wise fold sees
-    the same operands either way. `ref_channel_k_flex` now inverts the order, so
-    the term is gone and these cells read the 3-op deposit.
+    words for arbitrary values with no scale involved, so a channel-wise fold
+    sees the same operands either way. `ref_channel_k_flex` inverts the order
+    before anything downstream reads an operand, so these cells read the 3-op
+    deposit.
 
-    WHAT MAKES IT SAFE is that the deposit restores logical order before anything
-    downstream reads an operand, which `check_k_store_perm_f4` proves exhaustively
-    on a basis rather than by sampling. Group locality is checked below as a
-    separate, weaker property: sigma never moves a code across a 16-channel group,
-    so it never crosses a packed word. An earlier version of this test also
-    asserted that 64, 128 and 256 are multiples of 16, which codex correctly
-    called vacuous: those are token-group sizes, while channel-wise metadata
-    carries one scale per logical channel, so the divisibility said nothing about
-    this pairing."""
+    WHAT MAKES IT SAFE is that the deposit restores logical order before
+    anything downstream reads an operand, which `check_k_store_perm_f4` proves
+    exhaustively on a basis rather than by sampling. Group locality is checked
+    below as a separate, weaker property: sigma never moves a value across a
+    16-channel group, so it never crosses a packed word."""
     from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
     for k_quant in (("channel", 64), ("channel", 128), ("channel", 256)):
         kwargs = {"dequant_int2_to_f4": 1, "k_quant": k_quant}
@@ -362,7 +355,7 @@ def test_channel_wise_k_is_permuted_too():
 
 
 def test_token_wise_k_is_permuted_with_no_kwarg():
-    """The shipped configuration, built the way every caller now builds it.
+    """The shipped configuration, built the way every caller builds it.
 
     No kwarg appears here, which is the property under test: the layout follows
     from bits, feed and axis alone."""
@@ -374,17 +367,18 @@ def test_token_wise_k_is_permuted_with_no_kwarg():
 
 
 def test_the_removed_kwarg_is_gone():
-    """Passing the retired flag must FAIL LOUDLY rather than be ignored.
+    """A kwarg the constructor does not accept must FAIL LOUDLY rather than be
+    ignored.
 
     A kwarg that is silently accepted and does nothing is worse than one that
-    raises: a caller who still passes `k_f4_prepermuted=0` believes it is getting
-    a logical pool from a kernel that reads a permuted one."""
+    raises: a caller who passes `k_f4_prepermuted=0` believes it is getting a
+    logical pool from a kernel that reads a permuted one."""
     from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
     with pytest.raises(TypeError):
         IntDecodeSm100(64, D, 4, bits=2, k_f4_prepermuted=0)
 
 
-# --- the derived layout (kwarg removed 2026-08-12) -------------------------
+# --- the derived layout -----------------------------------------------------
 # These are the gates that matter most: the order follows from the configuration,
 # so the predicate and the pool keying must agree at every knob combination or a
 # pool is built one way and read the other with no symptom.
@@ -398,9 +392,9 @@ def _predicate():
     (2, {}, True),                                    # the shipped int2 path
     (2, {"dequant_int2_to_f4": 1}, True),             # explicit feed, same
     (2, {"k_quant": ("token", 64)}, True),            # the other token axis
-    (4, {}, True),                                    # int4 raw feed, 2026-08-15
+    (4, {}, True),                                    # int4 raw feed
     (2, {"dequant_int2_to_f4": 0}, False),            # e4m3 feed keeps its own
-    (2, {"k_quant": ("channel", 128)}, True),         # axis term removed 2026-08-12
+    (2, {"k_quant": ("channel", 128)}, True),         # channel-wise K carries it too
     (2, {"k_quant": ("channel", 64)}, True),
     (2, {"k_quant": ("channel", 256)}, True),
     (2, {"fold_scale_zero": 0}, False),               # the ablation arm
@@ -429,7 +423,7 @@ def test_pool_keying_cannot_disagree_with_the_kernel(bits, kw):
 
 
 def test_the_shipped_int2_config_is_permuted_with_no_kwarg():
-    """Stated as its own gate because it is what the removal asserts: an int2
+    """Stated as its own gate because it is the shipped configuration: an int2
     kernel built with nothing but its width reads a permuted pool."""
     from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
     k = IntDecodeSm100(64, D, 4, bits=2)

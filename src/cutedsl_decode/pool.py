@@ -556,11 +556,8 @@ def dequant_pools_lut(mKq, mVq, mScale, bits, v_store_perm=None,
 
 
 def _quant_ref_mod():
-    try:
-        import quant_ref
-    except ImportError:
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-        import quant_ref
+    from . import quant_ref
+
     return quant_ref
 
 

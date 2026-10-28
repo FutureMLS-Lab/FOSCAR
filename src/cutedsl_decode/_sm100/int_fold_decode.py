@@ -23,9 +23,6 @@ the ``c_h`` correction and the hi/lo split are there to keep small. The
 ``fold_scale_zero=False`` ablation arm below does dequantize element-wise and is
 less accurate still.
 
-Development record, including the measurements behind every default and the
-experiments that were tried and abandoned: ``docs/kernel/int_fold_decode.md``.
-
 HOST CONTRACT
 -------------
 
@@ -48,14 +45,14 @@ compile and launch path.
     ``block_tot``.
 
 The within-word code order of both pools is MODE-KEYED: whether the store-time
-permutation was applied depends on ``bits`` and the resolved
+permutation is applied depends on ``bits`` and the resolved
 ``dequant_int2_to_f4`` feed. Do not hardcode it. Ask ``k_pool_is_permuted`` for K,
 and ``repack_sm100.v_store_perm_sm100`` or ``v_store_perm_sm100_f4`` for V, keyed the
 same way. The pool builder asks the same classmethods, so the two sides cannot
 disagree.
 Main INT4 and INT2/FP4 V pools pack tokens within channel rows, using only a
-within-word shuffle. INT4 pools built before the K-major V change must be
-rebuilt: the shape is unchanged but the byte order is incompatible.
+within-word shuffle. An INT4 V pool carries the K-major byte order; a pool
+written in any other order has the same shape but an incompatible byte order.
 
 The kernel takes NO q_scale. ``S = sm*(s_t*S_raw + z'_t*QSum)/qs_Q``, and the
 per-tensor ``1/qs_Q`` multiplies the whole folded S, so the host folds it into
@@ -109,9 +106,8 @@ publishes them must be ordered after all of those fences:
   readers, the softmax warpgroup or, under ``fold_scale_zero=False``, both dequant
   streams, fence, run a warp barrier and then release, because the stock
   ``PipelineTmaAsync`` release arrives from lane 0 of each warp only. Without the
-  fence the INT4 softmax read the next occupant of a scale stage (the comment at its
-  scale release records the capture, and ``docs/kernel/int_fold_decode.md`` the
-  resulting nondeterminism). The code rings' readers, the dequant streams, release
+  fence the INT4 softmax can read the next occupant of a scale stage. The code
+  rings' readers, the dequant streams, release
   a code stage only behind the fence that already precedes an operand-ring commit:
   the first one after the stage's LDS, which may be the fence of the block before
   the one the stage feeds, since each stream loads one stage ahead. Every thread of
@@ -182,10 +178,9 @@ the gate to run after any extraction.
 2. **A role must never REBUILD a value that reaches ``kernel`` as a marshalled
    parameter.** Rebuilding traces, runs, and is silently wrong: the marshalled
    object carries runtime fields loaded from param space, and a rebuilt one folds
-   those fields to trace-time constants. This is how the two MMA atoms lost their
-   runtime ACCUMULATE field once, which corrupted the first K tile of any item that
-   reused tmem. Constructing in the callee also satisfies rule 1, which is what
-   makes it a trap.
+   those fields to trace-time constants, which corrupts the first K tile of any
+   item that reuses tmem. Constructing in the callee also satisfies rule 1, which
+   is what makes it a trap.
 
 A name bound only inside a ``const_expr`` guard cannot be passed to a helper
 unconditionally, because the argument is evaluated even when the guard's branch is
@@ -290,7 +285,6 @@ gmem_add = partial(cute.arch.atomic_add, sem="relaxed", scope="gpu")  # count sk
 #: rather than well below it. sm90 tolerates it because ITS operand is bf16; against
 #: an e4m3 operand it is visible, and an ablation baseline must not be gratuitously
 #: inaccurate any more than it may be gratuitously fast. Measurements:
-#: docs/kernel/int_fold_decode.md.
 #:
 #: This 4 is unrelated to ``BETA_FOLD[2]``: that 8 belongs to the FOLD path's
 #: e4m3(8+q) feed, where 8..11 is the codes' exactly-representable window.
@@ -307,14 +301,11 @@ _E4M3_CODES = (0x00, 0x38, 0x40, 0x44, 0x48, 0x4A, 0x4C, 0x4E,
 _T32 = lambda b: b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)
 LUT2C8 = _T32(_E4M3_CODES[8:12])  # int2 K table: e4m3(8+q), q in 0..3 = 0x50..0x53
 
-# Before the dc41f86 dequant-pipeline consolidation, every stage count this kernel
-# exposed was timed against its default on a B200 (``773717d:baselines/sweep_knob_ab_sm100.sh``),
-# and none reached one percent at a configuration the planner selected; `p_stages=5`
-# read 0.3 percent faster than the shipped 4 and the default was kept deliberately.
-# dc41f86 changed the ring topology, and no committed stage-count A/B covers the shipped
-# kernel (docs/kernel/int_fold_decode.md, "Stage counts"). Time a stage-count change as
-# two arms of one ``baselines/bench_sweep.py`` YAML, compared with
-# ``compare_bench_sweeps.py --pair``, before changing a default.
+# Every stage count this kernel exposes is timed against its default on a B200
+# on a B200, and none reaches one percent at a
+# configuration the planner selects; `p_stages=5` reads 0.3 percent faster than the
+# shipped 4, so the default stays 4. Time a stage-count change as two arms of one
+# one sweep, compared as paired runs, before changing a default.
 #
 # ``sp_stages`` is not a knob at all: the block it sizes is allocated only when
 # ``threshold_scale_factor is not None``, which no shipped configuration passes.
@@ -329,7 +320,7 @@ class IntDecodeSm100(GQAPagedDecode):
     # decode to q * 2**-9 exactly: the feed is alpha*q with alpha = 2**-9 and
     # beta = 0, and the fold rescales s' = ALPHA_INV_INT4 * s. Codes 1..7 are
     # subnormal operand bytes, which the tcgen05 kind::f8f6f4 datapath honours on
-    # the A role (silicon-verified by scripts/probes/probe_sm100_e4m3a_subnormal.py).
+    # the A role (see scripts/probes/probe_sm100_e4m3a_subnormal.py).
     #
     # The rescale is applied once per consumer, never twice: token-K at the
     # scale-quad copy, token-V inside the P operand paired with the in-kernel
@@ -338,7 +329,7 @@ class IntDecodeSm100(GQAPagedDecode):
     # po2 ladder clamp leaves no +9 headroom).
     #
     # Every factor is an exact f32 exponent shift, so on scales this feed is
-    # DEFINED for, output is bit-identical to the former e4m3(q) feed. Two bounds
+    # DEFINED for, output is bit-identical to the e4m3(q) feed. Two bounds
     # come with it, and NEITHER IS GUARDED IN CODE, so they are the caller's to
     # respect:
     #   * a scale at or beyond 2**119 overflows its 512x copy to inf. The pool
@@ -350,17 +341,16 @@ class IntDecodeSm100(GQAPagedDecode):
     #     against 512*s rather than against s. THIS one the 1e-8 lower clamp does
     #     defend.
     ALPHA_INV_INT4 = 512.0
-    # CP1+CP2 (dequant_int2_to_f4): the K feed (CP1) AND the V feed (CP2)
-    # become packed e2m1 nibbles read straight from SMEM by the f8f6f4 UMMA —
-    # nibble == the 2-bit code, which decodes to q/2 EXACTLY (0, .5, 1, 1.5
-    # are all e2m1 points). The fold absorbs the /2 into the per-token scales
+    # dequant_int2_to_f4: the K feed AND the V feed become packed e2m1
+    # nibbles read straight from SMEM by the f8f6f4 UMMA — nibble == the
+    # 2-bit code, which decodes to q/2 EXACTLY (0, .5, 1, 1.5 are all e2m1
+    # points). The fold absorbs the /2 into the per-token scales
     # (s' = 2*s_t for K, s'_v = 2*s_v riding inside the P operand for V, each
     # applied ONCE at the scale-quad register copy) and BOTH betas are 0
-    # (z' = z_t, z'_v = z_v) — pinned by probe_mxf4_fold_numerics.py's
-    # f4feed-* rows (exact algebraic identity with the e4m3(8+q)/
-    # BETA_FOLD[2]=8 feed). The launch-global pscale exponent shifts by -1
-    # in-kernel so the quantized P hi/lo bytes stay bit-identical (see the
-    # decode-top comment).
+    # (z' = z_t, z'_v = z_v), an exact algebraic identity with the
+    # e4m3(8+q)/BETA_FOLD[2]=8 feed. The launch-global pscale exponent shifts
+    # by -1 in-kernel so the quantized P hi/lo bytes stay bit-identical (see
+    # the decode-top comment).
     BETA_FOLD_F4 = 0.0
     # P lo-row scale: P_lo = e4m3((w*pscale - float(P_hi)) * 2^LO_SHIFT). This is
     # the certified simulator's dynamic ps2 = 2^floor(log2(448/max|res|)) pinned at
@@ -430,9 +420,9 @@ class IntDecodeSm100(GQAPagedDecode):
     @classmethod
     def flex_wired(cls, k_quant, v_quant, head_dim=128):
         """Which non-legacy (k_quant, v_quant) configs have their kernel arm
-        implemented. Grows per stage (b: channel-V, c: channel-K 128/256,
-        d: K token-64, e: K channel-64); the ctor raises NotImplementedError
-        for legal-but-unwired configs."""
+        implemented: channel-V, channel-K at 64/128/256, K token-64 and K
+        channel-64. The ctor raises NotImplementedError for legal-but-unwired
+        configs."""
         k_ok = k_quant in (("token", head_dim), ("token", head_dim // 2)) or (
             k_quant[0] == "channel" and k_quant[1] in (64, 128, 256)
         )
@@ -483,7 +473,7 @@ class IntDecodeSm100(GQAPagedDecode):
         of 7. `check_k_store_perm_f4` proves the two deposits emit
         byte-identical operand words for arbitrary codes with no scale involved,
         so the permutation is absorbed entirely between the pool and the operand
-        stage and a channel-wise fold sees exactly the operands it saw before.
+        stage and a channel-wise fold sees exactly the operands the token-wise fold does.
         `test_fold_quant_flex_sm100.ref_channel_k_flex` takes `k_store_perm`,
         and `tests/test_pool_call_sites_cpu.py` fails the build if any raw
         unpack stops accounting for the order.
@@ -507,20 +497,20 @@ class IntDecodeSm100(GQAPagedDecode):
 
     #: (sequence_tile, o_stages) for the quant configs where the shipped (256, 3)
     #: is measurably wrong. Everything absent from this table keeps (256, 3), the
-    #: value every published B200 flex number used. Numbers: docs/kernel/int_fold_decode.md.
+    #: value behind every published B200 flex number.
     #:
     #: Keyed on the FULL (k_quant, v_quant) pair, not on v_axis, and that is
     #: load-bearing in three separate ways:
     #:   * V-ch256 CANNOT take 128 -- it fails the `sequence_tile % v_group`
     #:     assert below (128 % 256).
-    #:   * tile 128 made V-ch128 21.2% WORSE, so channel-V alone is the wrong
+    #:   * tile 128 is 21.2% WORSE at V-ch128, so channel-V alone is the wrong
     #:     predicate for the tile.
     #:   * K-ch128/V-ch128 is BOTH axes; o_stages feeds the channel-K Q'-plane
     #:     ring depth (`(o_stages + 2) * k_parts`) and the builder's kb_ahead
     #:     window, so o_stages=2 there is a different, unmeasured kernel.
     #: Deliberately bits-blind: at bits=4 the tile change also halves scale_stages,
-    #: which moves kv_stages. int2 is measured; if int4 regresses this table grows
-    #: a bits dimension.
+    #: which moves kv_stages. The table is measured at int2; it grows a bits
+    #: dimension when int4 is measured.
     QUANT_TILING = {
         (("token", 128), ("channel", 64)): (128, 3),
         (("token", 128), ("channel", 128)): (256, 2),
@@ -627,16 +617,16 @@ class IntDecodeSm100(GQAPagedDecode):
             ``prefetch_iters = min(2, s_stages - 1)`` is 2 at the shipped
             depths and ``assert pt_stages > prefetch_iters + 1`` then demands 4,
             so the ring holds exactly one tile of margin over the lag TMA-VO
-            runs at. The sPT publish rendezvous below records what went wrong
-            the last time VO slipped past that margin. Depths up to 8 are nearly
+            runs at. The sPT publish rendezvous below is what keeps VO from
+            slipping past that margin. Depths up to 8 are nearly
             free in smem; only at 16 does the ring cost a KV stage.
         p_stages
             smem P (BMM2 B) ring depth. Default 4. Also caps the S depth through
             ``s_stages = min(max_s_stages, p_stages)``, and it is the binding
             side of that min at the shipped tiling, so raising it deepens two
             rings at once at the cost of smem the KV ring would otherwise get.
-            5 measures slightly faster than 4 and the default has been left at 4
-            deliberately; the reasoning is in docs/kernel/int_fold_decode.md.
+            5 measures slightly faster than 4; the default stays 4
+            deliberately.
         o_stages
             tmem O (BMM2 C) ring depth (2 or 3). ``None`` resolves through
             ``resolve_tiling``, which is 3 at every quant config except
@@ -705,13 +695,13 @@ class IntDecodeSm100(GQAPagedDecode):
             (token-major). Callers must key the pool build
             off the same resolver the ctor uses.
 
-            CP1 (K, BMM1): the dequant WG's int2 K map becomes a 2->4-bit nibble
+            K feed (BMM1): the dequant WG's int2 K map becomes a 2->4-bit nibble
             deposit into the canonical b4x16_p64 panel image (16B chunks: 8 data
             plus 8 pad bytes per 16 elements, the same byte footprint as the e4m3
             stage), and ``tiled_mma_kq`` is built with
             ``a_dtype = Float4E2M1FN`` (K-major, unchanged).
 
-            CP2 (V, BMM2): MN-major f4 SMEM descriptors are DSL-illegal, so the V
+            V feed (BMM2): MN-major f4 SMEM descriptors are DSL-illegal, so the V
             operand flips to K-MAJOR (token-contiguous): the same packed_p64
             panel image with roles swapped, rows = head dims and panels = token
             groups. With the dim-major pool the V deposit is LINEAR, a contiguous
@@ -749,8 +739,7 @@ class IntDecodeSm100(GQAPagedDecode):
         code and operand rings would need skip-aware advancing.
         ``__call__`` and ``can_implement`` assert it is None.
 
-        The measurements behind these defaults, and the rounds that produced
-        them, are in docs/kernel/int_fold_decode.md.
+        The measurements behind these defaults are in
         """
         # Resolve the quant-config-dependent tiling BEFORE anything reads either
         # name. Both LOCALS are rebound, not just the self.* copies: the
@@ -758,8 +747,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # `% v_group` / `% k_group` legality asserts all read the LOCAL
         # `sequence_tile`, and `self._o_stages` is assigned from the LOCAL
         # `o_stages`. Setting only self.sequence_tile would leave those asserts
-        # validating 256 while the kernel ran 128 -- an assert that no longer
-        # guards anything. `k_quant`/`v_quant` are still the RAW ctor args here
+        # validating 256 while the kernel runs 128 -- an assert that
+        # guards nothing. `k_quant`/`v_quant` are still the RAW ctor args here
         # (validate_quant_flex has not run yet), so the resolver normalizes them.
         sequence_tile, o_stages = self.resolve_tiling(
             k_quant, v_quant,
@@ -773,7 +762,7 @@ class IntDecodeSm100(GQAPagedDecode):
         self.do_none_red = reduction_mode == "none" or reduction_mode is None
         self.tma_mask = tma_mask
         self.bits = bits
-        # C8 persistent scope resolution: requested persistence silently
+        # Persistent scope resolution: requested persistence silently
         # downgrades on incompatible configs (split-K reductions and the
         # debug tap) so harnesses may force the kwarg globally — the pattern
         # the e2e/matrix gates rely on (splits-4 cells keep the per-item
@@ -792,7 +781,7 @@ class IntDecodeSm100(GQAPagedDecode):
         # kv_stages is known. The K code ring's depth is resolved with the
         # code-ring split further down.
         self.k_op_stages = None if k_op_stages is None else int(k_op_stages)
-        # CP1: int2 K feed as packed e2m1 straight from SMEM (variant B). An ABSENT
+        # int2 K feed as packed e2m1 straight from SMEM. An ABSENT
         # kwarg resolves via the classmethod (bits==2 => on unless an incompatible
         # knob is set); an explicit 0 is the bit-identical flag-off state.
         # `fold_scale_zero=False` selects the classic-dequant ablation arm; see the
@@ -801,7 +790,7 @@ class IntDecodeSm100(GQAPagedDecode):
         self.dequant_int2_to_f4 = self.resolve_dequant_int2_to_f4(
             bits, dequant_int2_to_f4,
             fold_scale_zero=self.fold_scale_zero)
-        # K POOL ORDER, DERIVED. When this is true the pool's 2-bit codes were
+        # K POOL ORDER, DERIVED. When this is true the pool's 2-bit codes are
         # permuted at store time by `repack_sm100.k_store_perm_sm100_f4`, and the
         # K deposit reads two masks instead of the two-part gather. There is no
         # kwarg for it: `k_pool_is_permuted` states why, and whoever builds the
@@ -815,10 +804,9 @@ class IntDecodeSm100(GQAPagedDecode):
         # therefore reads the two-mask deposit at 3 ALU operations per 16 codes
         # rather than 7.
         #
-        # KEPT THOUGH THE KERNEL NO LONGER READS IT. `kernel` stopped consuming this
-        # when the deposit's branch was deleted, so it is now the object's answer
-        # about its own pool contract rather than a trace-time selector. Retained
-        # because a caller holding the object can ask, and because
+        # This is the object's answer about its own pool contract rather than a
+        # trace-time selector: `kernel` does not read it to choose a deposit.
+        # Retained because a caller holding the object can ask, and because
         # `tests/test_kperm_sm100_cpu.py` asserts it.
         self.k_pool_permuted = self.k_pool_is_permuted(
             bits, dequant_int2_to_f4=dequant_int2_to_f4,
@@ -867,8 +855,8 @@ class IntDecodeSm100(GQAPagedDecode):
                             else 2 * (sequence_tile // page_size))
         self.scale_stages = scale_stages
         # The page-table and P ring depths are knobs so that a claim about them can be
-        # measured instead of argued; both were literals inside `__call__`, reachable
-        # from no caller.
+        # measured instead of argued; as literals inside `__call__` they would be
+        # reachable from no caller.
         #
         # `pt_stages` (smem page table): 4 is the MINIMUM the protocol allows, not a
         # preference. `prefetch_iters = min(2, s_stages - 1)` is 2 at the shipped depths
@@ -876,8 +864,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # carries exactly one tile of margin over the lag TMA-VO runs at. A stage costs
         # `pages_s` int32, which is 16 bytes at sequence_tile=256/page_size=64, so a deeper
         # ring is close to free in smem; whether it is worth anything is a question about
-        # how far VO can slip, and the note at the sPT publish rendezvous records what
-        # happened the last time it slipped past the margin.
+        # how far VO can slip, and the note at the sPT publish rendezvous states what
+        # VO slipping past the margin would do.
         #
         # `p_stages` (smem P, the BMM2 B operand) also sets the S depth, through
         # `s_stages = min(max_s_stages, p_stages)`. It is the BINDING side of that min at
@@ -909,17 +897,15 @@ class IntDecodeSm100(GQAPagedDecode):
         self.threads_per_cta = 4 * warpgroup_threads
 
         # The four shape arguments both kernels take are checked in ONE place, so the
-        # two constructors cannot drift apart on them. `page_size` and `bits` were
-        # asserted here too, with a different message from SM90's for the same rule.
+        # two constructors cannot drift apart on them.
         # FIRST, BEFORE THE SHARED SHAPE CHECK, because `_validate_shape` asserts and
         # `python -O` drops asserts. The three head_dim asserts further down sit inside
-        # the non-legacy branch, so the legacy arm was unguarded entirely. THE SM100 CONSTRAINT IS 128-TILING, NOT D==128:
+        # the non-legacy branch, so the legacy arm needs this guard here. THE SM100 CONSTRAINT IS 128-TILING, NOT D==128:
         # `tiles_dm` and `tiles_dk` are ceil(D/128) and every tile is partitioned and
         # stored whole, so a D that is not a multiple of 128 runs past the last full tile.
-        # An earlier version of this guard demanded D == 128, which would have rejected
-        # the D=256 the legacy token-D path is tiled for. Whether D=256 actually WORKS is
-        # untested; the wrapper is what refuses it, on the ground that nothing measures it.
-        # (codex, 2026-09-04)
+        # The legacy token-D path is tiled for D=256, but whether D=256 works is
+        # untested, and the wrapper is what refuses it, on the ground that nothing
+        # measures it.
         if head_dim <= 0 or head_dim % 128 != 0:
             # NOT an assert: python -O would drop this guard.
             raise ValueError(
@@ -937,12 +923,12 @@ class IntDecodeSm100(GQAPagedDecode):
         # configuration that caused it.
         #
         # `blk_tile_n_of` maps BOTH GQA ratio 1 and ratio 2 to `q_head_tile=2`, so
-        # neither compiles today. The refusal is unconditional, and it is a
-        # retained restriction rather than a requirement of every surviving
-        # path: the fold-off arm runs with `fold_p == False` and takes the
-        # single-row P store, so the hi/lo justification below scopes to the
-        # fold-enabled configurations. The bound stays unconditional because
-        # nothing needs `q_head_tile < 4` and no arm is tested at it.
+        # neither compiles. The refusal is unconditional, and it is a restriction
+        # of this path rather than a requirement of every path: the fold-off arm
+        # runs with `fold_p == False` and takes the single-row P store, so the
+        # hi/lo justification below scopes to the fold-enabled configurations.
+        # The bound stays unconditional because nothing needs `q_head_tile < 4`
+        # and no arm is tested at it.
         assert q_head_tile >= 4, (
             f"q_head_tile >= 4 is required: the P hi/lo quantize truncates "
             f"{q_head_tile} e4m3 values as one vector and nvgpu.cvt_fptrunc "
@@ -1025,10 +1011,10 @@ class IntDecodeSm100(GQAPagedDecode):
         # same smem block. Per ring, every stage is produced by one warp and
         # consumed and released by one stream, so no cross-stream walk exists
         # and no walker can be lapped by a stage its own releases do not gate.
-        # The shared-ring form this replaced deadlocked: one stage of the first
-        # V group stayed produced-once-never-released with the two V-stream
-        # sibling walkers desynced across a ring revolution, which is an
-        # ownership misclassification the skip-walk tokens could not close.
+        # A single shared ring would deadlock: one stage of the first V group can
+        # stay produced-once-never-released while the two V-stream sibling walkers
+        # desync across a ring revolution, an ownership misclassification the
+        # skip-walk tokens cannot close.
         codes_per_tile_k = (
             (sequence_tile // 128) * math.ceil(head_dim / 128) * 2
         )
@@ -1144,10 +1130,9 @@ class IntDecodeSm100(GQAPagedDecode):
             packed in ``pack_rows_lut`` order, EXCEPT that INT4 and INT2 with
             the f4 feed at either K axis require ``k_store_perm_sm100_f4(bits)``
             applied to the codes first: ask ``k_pool_is_permuted``, which is the
-            same classmethod this class answers, though the kernel no longer asks
-            it to select a deposit, because a pool written in
-            one order and read in the other is wrong at every K channel and
-            raises nothing):
+            same classmethod this class answers. The kernel does not ask it to
+            select a deposit, because a pool written in one order and read in the
+            other is wrong at every K channel and raises nothing):
             ``mKq`` uint8 [NP,HKV,64,D*bits//8], ``mVq`` uint8
             [NP,HKV,D,64*bits//8]. ``mScale`` has TWO layouts and this asserts
             whichever the configuration resolved: legacy
@@ -1209,7 +1194,7 @@ class IntDecodeSm100(GQAPagedDecode):
         blk_tile_shpd = (blk_tile_s, blk_tile_h, blk_tile_p, blk_tile_d)
 
         # MMA tile sets the granularity at which TMAs + MMAs are staged
-        # NOTE (CP1): mma_tile_k is computed from the CONTAINER width 8 —
+        # NOTE: mma_tile_k is computed from the CONTAINER width 8 —
         # under dequant_int2_to_f4 the K elements are e2m1 but each still
         # occupies one byte of the ring stage (8 data + 8 pad bytes per 16
         # nibbles), so the byte/stage accounting is dtype-role-independent.
@@ -1250,13 +1235,14 @@ class IntDecodeSm100(GQAPagedDecode):
 
         # GEMM1: (S_K, H_R, D, (H_K, B))
         # With dequant_int2_to_f4, A is packed e2m1 read directly from SMEM
-        # (silicon-exact, probe_sm100_f4_umma arm B1 packed_p64); B stays e4m3.
+        # (exact on silicon; see probe_sm100_f4_umma's packed_p64 arm); B stays
+        # e4m3.
         tiled_mma_kq = self._tiled_mma_kq(mma_dtype, acc_dtype, mma_tile_mnk)
 
         # GEMM2: (D, H_R, S_K, (H_K, B))
-        # CP2 (dequant_int2_to_f4): A = V as packed e2m1, K-MAJOR (token-
-        # contiguous) — the same probe-B1 packed_p64 recipe as the QK feed.
-        # MN-major f4 SMEM descriptors are DSL-illegal (probe arm C1), so
+        # V feed (dequant_int2_to_f4): A = V as packed e2m1, K-MAJOR (token-
+        # contiguous) — the same packed_p64 recipe as the QK feed.
+        # MN-major f4 SMEM descriptors are DSL-illegal, so
         # the V operand image flips from the e4m3 MN-major stage to the
         # K-major f4 panel image (dequant WG deposits token-contiguous
         # chunks). B (P) stays e4m3 MN-major — the P store path is
@@ -1344,12 +1330,11 @@ class IntDecodeSm100(GQAPagedDecode):
         # fold stats: c_h per-warp reduction slots (the sVmax cell is not
         # needed — the pscale is launch-global). Charged unconditionally.
         # The device allocates `sC` under `fold_p`, which is
-        # `self.fold_scale_zero` now that the identity relay is retired, so the
-        # fold-off arm is charged for a ring it never allocates. That
-        # over-charge is PRE-EXISTING (this predicate and `fold_p` already
-        # disagreed for that arm) and is kept deliberately: narrowing it is the
-        # one edit here that could move `kv_stages`, and over-charging can only
-        # cost a ring stage, never overflow shared memory.
+        # `self.fold_scale_zero`, so the fold-off arm is charged for a ring it
+        # never allocates. That over-charge is deliberate: this predicate and
+        # `fold_p` disagree for that arm, and narrowing it is the one edit here
+        # that could move `kv_stages`, while over-charging can only cost a ring
+        # stage, never overflow shared memory.
         smem_alloc_bits += (
             blk_tile_n * warpgroup_warps
         ) * acc_dtype.width
@@ -1382,9 +1367,9 @@ class IntDecodeSm100(GQAPagedDecode):
             )
         if cutlass.const_expr(self.k_axis == "channel"):
             # channel-K: Q'-plane ring (B-operand-sized e4m3 stages) + bias
-            # ring ([lift[g] | bias[g]] f32 entries). The `warpgroup_warps * 2`
-            # amax slots and the round mbarrier that used to be added here are
-            # gone with the cross-warp rendezvous (per-row lift).
+            # ring ([lift[g] | bias[g]] f32 entries). The per-row lift needs no
+            # `warpgroup_warps * 2` amax slots and no round mbarrier, so neither
+            # is allocated here.
             k_parts_c = max(self.sequence_tile // self.k_group, 1)
             qp_st_c = (self._o_stages + 2) * k_parts_c
             qp_stages_bits = qp_st_c * (
@@ -1410,10 +1395,9 @@ class IntDecodeSm100(GQAPagedDecode):
             # kernel rather than from whichever harness thinks it configured it.
             #
             # This exists because a tiling A/B can silently compare a kernel with
-            # itself. It has happened three times: an override added at one
-            # constructor site while the benchmark went through a different one,
-            # twice over, and the same false null from per-bits tuning. So the
-            # effective value now reports itself.
+            # itself: an override added at one constructor site while the
+            # benchmark goes through a different one, or a per-bits tuning sweep
+            # that reads a false null. So the effective value reports itself.
             #
             # `kv_stages` is the reason this sits AFTER the smem budget rather
             # than beside the other stage counts: it is the RESIDUAL of that
@@ -1464,7 +1448,7 @@ class IntDecodeSm100(GQAPagedDecode):
         )
 
         # ((MMA_M, MMA_K), #MMA_M, #MMA_K, kv_stages)
-        # CP1: the K ring keeps its BYTE footprint and e4m3/SW128 allocation
+        # The K ring keeps its BYTE footprint and e4m3/SW128 allocation
         # layout under dequant_int2_to_f4 (16B chunks = 8 data + 8 pad bytes
         # per 16 f4 elements == 1B per element, exactly the e4m3 stage), so
         # the smem layout is always built from an e4m3 K-major atom — a
@@ -1486,7 +1470,7 @@ class IntDecodeSm100(GQAPagedDecode):
         smem_layout_k_mma = sm100_utils.make_smem_layout_a(
             tiled_mma_kq_smem, mma_tile_mnk, mma_dtype, kv_stages
         )
-        # CP2: same layout-only twin trick for the V side — the ring alloc
+        # Same layout-only twin trick for the V side — the ring alloc
         # keeps the e4m3 MN_SW128 stage layout (byte footprint identical:
         # the f4 stage is 16B chunks = 8 data + 8 pad bytes per 16 nibbles
         # == 1 B/elem), and the MMA-side f4 K-major packed_p64 view is
@@ -1722,7 +1706,7 @@ class IntDecodeSm100(GQAPagedDecode):
         grid_z = cute.size(mQ_nkl.shape[2])  # l tiles
         grid_x = 1 if self.do_none_red else kv_splits
         if cutlass.const_expr(self.persistent):
-            # C8: static round-robin persistence — one resident CTA per SM
+            # Static round-robin persistence — one resident CTA per SM
             # (216KB smem => 1 CTA/SM) loops items bid_z, bid_z+grid_z, ...
             # (grid_y > 1 stays correct — the item loop strides z only, so
             # each (y, z-chain) pair is still covered by exactly one CTA.)
@@ -1810,7 +1794,8 @@ class IntDecodeSm100(GQAPagedDecode):
         the marshalled atom as a parameter, mutates that, and returns it.
 
         With `dequant_int2_to_f4`, A is packed e2m1 read directly from SMEM
-        (silicon-exact, probe_sm100_f4_umma arm B1 packed_p64); B stays e4m3.
+        (exact on silicon; see probe_sm100_f4_umma's packed_p64 arm); B stays
+        e4m3.
         """
         a_dtype_kq = Float4E2M1FN if self.dequant_int2_to_f4 else mma_dtype
         return sm100_utils.make_trivial_tiled_mma(
@@ -1838,10 +1823,8 @@ class IntDecodeSm100(GQAPagedDecode):
         first tile accumulates into the previous item's leftover tmem, and the kernel
         returns nondeterministic garbage in a narrow set of shapes.
 
-        That is not hypothetical: both MMA roles once constructed their own atom, and
-        an earlier version of this docstring told them to. The account is in
-        `docs/kernel/int_fold_decode.md`, and `scripts/_check_roles.py` CHECK 4 fails
-        any role that rebuilds a marshalled parameter.
+        `scripts/_check_roles.py` CHECK 4 fails any role that rebuilds a
+        marshalled parameter.
 
         The DSL constraint that made in-callee construction look correct is real but
         has a different fix: a value the enclosing `cutlass.range` item loop carries
@@ -1852,8 +1835,8 @@ class IntDecodeSm100(GQAPagedDecode):
         `_mma_kq_warp` and `_mma_vp_warp` do.
 
         With `dequant_int2_to_f4`: A = V as packed e2m1, K-MAJOR (token-
-        contiguous) -- the same probe-B1 packed_p64 recipe as the QK feed.
-        MN-major f4 SMEM descriptors are DSL-illegal (probe arm C1), so the V
+        contiguous) -- the same packed_p64 recipe as the QK feed.
+        MN-major f4 SMEM descriptors are DSL-illegal, so the V
         operand image flips from the e4m3 MN-major stage to the K-major f4 panel
         image (the dequant WG deposits token-contiguous chunks). B (P) stays
         e4m3 MN-major -- the P store path is untouched.
@@ -1915,13 +1898,13 @@ class IntDecodeSm100(GQAPagedDecode):
         It owns its own tile loop and walks the k/kv/qp/s/sp rings. It does NOT
         own its MMA atom: `tiled_mma_kq` arrives as a parameter, this role mutates
         that one and returns it, and building one here instead is the bug
-        `_tiled_mma_vp`'s docstring records. The participant objects likewise come
+        `_tiled_mma_vp`'s docstring describes. The participant objects likewise come
         in as parameters, because `kernel` builds them once per item.
         """
         # Free registers
-        # Read straight off `self` instead of taking 21 parameters that were
-        # only ever `X = self.X` in the caller. Same expression, same object,
-        # and the body below is untouched -- these are the names it uses.
+        # Read straight off `self` rather than taking 21 parameters that would
+        # only be `X = self.X` in the caller: same expression, same object, and
+        # these are the names the body uses.
         f4_feed = self.dequant_int2_to_f4
         if cutlass.const_expr(use_reg_reconfig):
             cute.arch.setmaxregister_decrease(mma_tma_regs)
@@ -1931,8 +1914,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # its own. `_tiled_mma_vp`'s docstring has the full reason and the bug.
         # Setup mma descriptors.
         if cutlass.const_expr(f4_feed):
-            # CP1: A = packed e2m1 straight from SMEM (probe B1
-            # packed_p64 — silicon-exact). The ring stage holds the
+            # A = packed e2m1 straight from SMEM (exact on silicon; see the
+            # packed_p64 arm of probe_sm100_f4_umma). The ring stage holds the
             # canonical K-major b4x16_p64 panel image: panel p (2048B) =
             # the 16B chunks of all 128 token rows covering dims
             # [16p, 16p+16), row r's chunk at byte r*16; nibbles
@@ -1945,7 +1928,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # 4096 slots (2048B), rows stride 32 slots (16B), atoms
             # stride 8192 slots, stages stride 2*kv_stage_bytes slots.
             # make_umma_smem_desc derives LBO/SBO correctly on this
-            # path (probe finding 3 — no manual desc patch needed).
+            # path, so no manual desc patch is needed.
             # Split operand rings: the K ring is the FIRST k_stages
             # stages of the physical ring — same base, same strides,
             # shallower stage mode; kq_ring walks the K pipeline only.
@@ -2173,9 +2156,9 @@ class IntDecodeSm100(GQAPagedDecode):
         objects come in as parameters because `kernel` builds them once per item.
         """
         # Free registers
-        # Read straight off `self` instead of taking 21 parameters that were
-        # only ever `X = self.X` in the caller. Same expression, same object,
-        # and the body below is untouched -- these are the names it uses.
+        # Read straight off `self` rather than taking 21 parameters that would
+        # only be `X = self.X` in the caller: same expression, same object, and
+        # these are the names the body uses.
         f4_feed = self.dequant_int2_to_f4
         o_stages = self.o_stages
         persistent = self.persistent
@@ -2191,7 +2174,7 @@ class IntDecodeSm100(GQAPagedDecode):
         # back to the caller through the return below.
         tiled_mma_vp.set(tcgen05.Field.ACCUMULATE, True)
         if cutlass.const_expr(f4_feed):
-            # CP2: A = V as packed e2m1 K-major straight from SMEM —
+            # A = V as packed e2m1 K-major straight from SMEM —
             # the SAME canonical b4x16_p64 panel image (and therefore
             # numerically the same fragment layout over the shared
             # ring bytes) as the KQ arm above, with roles swapped:
@@ -2199,7 +2182,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # (panel p = tokens [16p, 16p+16), dim row r's 16B chunk
             # at byte p*2048 + r*16, nibbles LSB-first in bytes 0-7,
             # bytes 8-15 pad). Swizzle-free recast of the ring;
-            # make_umma_smem_desc derives LBO/SBO (probe finding 3).
+            # make_umma_smem_desc derives LBO/SBO.
             # Split operand rings: the V ring is the LAST v_stages
             # stages of the physical ring — base advanced past the K
             # ring (nibble units: 2 slots per byte); v_handle.index is
@@ -2240,7 +2223,7 @@ class IntDecodeSm100(GQAPagedDecode):
         tBsP_desc = thrblk_mma_vp.make_fragment_B(tBsP_nk)
 
         # Prefetch loop.
-        # C8 persistence: one-shot prime on item 0 only (same dangling-arrive
+        # Persistence: one-shot prime on item 0 only (same dangling-arrive
         # roll-over argument as the TMA-VO prime).
         if cutlass.const_expr(persistent):
             if _item == 0:
@@ -2350,7 +2333,7 @@ class IntDecodeSm100(GQAPagedDecode):
                 o_producer.commit()
                 o_producer.advance()
         o_producer.tail()
-        # C8 persistent: tmem stays allocated across items; the
+        # Persistent: tmem stays allocated across items; the
         # after-loop tail owns the single relinquish + dealloc.
         if cutlass.const_expr(not persistent):
             cute.arch.relinquish_tmem_alloc_permit()
@@ -2405,9 +2388,9 @@ class IntDecodeSm100(GQAPagedDecode):
         the item, copies the assembled O tile out to gmem.
         """
         # Free registers
-        # Read straight off `self` instead of taking 21 parameters that were
-        # only ever `X = self.X` in the caller. Same expression, same object,
-        # and the body below is untouched -- these are the names it uses.
+        # Read straight off `self` rather than taking 21 parameters that would
+        # only be `X = self.X` in the caller: same expression, same object, and
+        # these are the names the body uses.
         bits = self.bits
         do_kernel_red = self.do_kernel_red
         page_size = self.page_size
@@ -2442,7 +2425,7 @@ class IntDecodeSm100(GQAPagedDecode):
             gmem_tensor=cute.group_modes(gVC, 0, 2),
         )  # (TMA, Rest...)
 
-        # Prefetch K loop. C8 persistence: this one-shot prime fires
+        # Prefetch K loop. Persistence: this one-shot prime fires
         # on item 0 only — the protocol's +1 arrive asymmetry leaves
         # exactly one dangling VO arrive at each item's end, which
         # rolls over as the next item's prime (re-priming per item
@@ -2589,9 +2572,9 @@ class IntDecodeSm100(GQAPagedDecode):
         the code TMA, so an OOB page reads s = z = 0 and the K-fold self-masks it.
         """
         # Free registers
-        # Read straight off `self` instead of taking 21 parameters that were
-        # only ever `X = self.X` in the caller. Same expression, same object,
-        # and the body below is untouched -- these are the names it uses.
+        # Read straight off `self` rather than taking 21 parameters that would
+        # only be `X = self.X` in the caller: same expression, same object, and
+        # these are the names the body uses.
         bits = self.bits
         page_size = self.page_size
         pt_stages = self.pt_stages
@@ -2722,8 +2705,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # cp.async below that overwrites sPT[pt_index_next]: TMA-VO
             # reads its sPT stage with an ordinary LDS and only arrives
             # here AFTERWARDS, so with the wait placed after the write
-            # (where it used to sit, under "Load K") the ordering edge
-            # existed but did not guard the write.
+            # the ordering edge exists but does not guard the write.
             #
             # pt_stages == 4 and TMA-VO trails by prefetch_iters, so QK
             # writing (s+1) % 4 while VO reads (s-p) % 4 collides only at
@@ -2731,10 +2713,10 @@ class IntDecodeSm100(GQAPagedDecode):
             # `assert pt_stages > prefetch_iters + 1` caps at 2. The ring
             # therefore carries exactly ONE tile of margin, and channel-K's
             # Q'-plane builder occupying the correction WG backpressures
-            # MMA-VP -> V dequant -> TMA-VO until VO slips to lag 3. When
-            # the overwrite won, VO issued its V TMA from the WRONG PHYSICAL
-            # PAGES: one (batch, kv_head) item's O was computed from wrong
-            # V-hat while K/S/P/m/l stayed exactly right, at ~1 launch in
+            # MMA-VP -> V dequant -> TMA-VO until VO slips to lag 3. An
+            # overwrite that wins makes VO issue its V TMA from the WRONG
+            # PHYSICAL PAGES: one (batch, kv_head) item's O is computed from
+            # wrong V-hat while K/S/P/m/l stay exactly right, at ~1 launch in
             # 20..500 depending on builder duration.
             #
             # Hoisted, QK cannot publish (s+1) % 4 until VO has finished
@@ -2879,9 +2861,9 @@ class IntDecodeSm100(GQAPagedDecode):
         words_pt)`).
         """
         # Free registers
-        # Read straight off `self` instead of taking 21 parameters that were
-        # only ever `X = self.X` in the caller. Same expression, same object,
-        # and the body below is untouched -- these are the names it uses.
+        # Read straight off `self` rather than taking 21 parameters that would
+        # only be `X = self.X` in the caller: same expression, same object, and
+        # these are the names the body uses.
         bits = self.bits
         code_stages = self.code_stages
         f4_feed = self.dequant_int2_to_f4
@@ -2912,8 +2894,7 @@ class IntDecodeSm100(GQAPagedDecode):
         #      atom column per page; see the host V layout), deposited
         #      through `deposit_lane_offsets`. Every quarter warp's loads
         #      and deposits are then conflict-free at every operand-ring
-        #      start row (docs/kernel/int_fold_decode.md, "Shared-memory
-        #      bank conflicts in the dequant streams").
+        #      start row.
         #      INT2/FP4 expands full token rows into packed panels instead.
         #      Only INT2/E4M3 reads a token
         #      column across dim-halves and deposits into MN_SW128.
@@ -2924,8 +2905,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # dim-major for INT4 and INT2/FP4 — repack_sm100).
         words = mma_tile_k * bits // 64  # src u32/(tok, dim-half)
         # src u32 per thread slot per stage; equal to `words` by construction
-        # since one dequant warpgroup is hardcoded (2026-09-14), kept as the
-        # per-slot name the staging shapes and `load_src` read.
+        # since one dequant warpgroup is hardcoded, kept as the per-slot name
+        # the staging shapes and `load_src` read.
         words_pt = words
         out_bytes = mma_tile_k // 2  # e4m3 out bytes per thread slot
         stage_words = code_stage_bytes // 4
@@ -2973,8 +2954,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # == 16*words_pt here, so the register image halves to 8*words_pt.
         #
         # The saving is INSTRUCTION COUNT, not bandwidth: the two 0xEEEEEEEE
-        # pad materializations per source word were real per-chunk work the
-        # compiler did not hoist. Registers are unchanged, so this is not a
+        # pad materializations per source word are real per-chunk work the
+        # compiler does not hoist. Registers are unchanged, so this is not a
         # pressure lever either.
         #
         # It is emphatically NOT an SMEM-bandwidth lever, and no narrower store
@@ -2983,10 +2964,9 @@ class IntDecodeSm100(GQAPagedDecode):
         # exactly 16 of the 32 SMEM banks FOREVER. An 8B/lane store at 16B
         # stride fits only 8 lanes per bank cycle (lane 8 collides with lane 0),
         # the same 4 wavefronts a 16B store takes; both forms move 8 chunks per
-        # cycle. Confirmed on both sides: tc-pipe wavefronts are bit-for-bit
-        # identical across the change, and every deposit STS was already at
-        # ideal wavefronts. Do not re-propose store width as an SMEM-bandwidth
-        # fix.
+        # cycle. tc-pipe wavefronts are bit-for-bit identical between the two
+        # forms, and every deposit STS is already at ideal wavefronts, so store
+        # width is not an SMEM-bandwidth fix.
         dep_bytes = 8 if f4_feed else 16
         rout_bytes = out_bytes // 2 if f4_feed else out_bytes
         # The e4m3 K stream's out bytes leave as kf_runs contiguous operand
@@ -3010,7 +2990,7 @@ class IntDecodeSm100(GQAPagedDecode):
             rTabK = cute.make_rmem_tensor((pages_s, 2 * kf_runs, 2), Int32)
             rTabV = cute.make_rmem_tensor((pages_s, 2), Int32)
 
-        # CP1 (f4_feed) deposit views. The f4 K stage is the
+        # f4_feed deposit views. The f4 K stage is the
         # canonical b4x16_p64 panel image (MMA descriptor comment at
         # the KQ dispatch): 16B chunk of (token row, dim-panel p) at
         # byte p*2048 + row*16; one source u32 (16 codes = 16 dims =
@@ -3041,8 +3021,8 @@ class IntDecodeSm100(GQAPagedDecode):
                 ),
             )  # (byte-in-chunk, dim row, token-panel, stage)
 
-            # CP2 (f4_feed) V deposit — LINEAR since the pool V
-            # stream went DIM-major (v_store_perm_sm100_f4). The f4
+            # V deposit (f4_feed) — LINEAR because the pool V
+            # stream is DIM-major (v_store_perm_sm100_f4). The f4
             # V stage is the SAME canonical panel image with the
             # roles swapped: 16B chunk of (dim row r, TOKEN-panel p)
             # at byte p*2048 + r*16; data byte b holds tokens 16p+2b
@@ -3050,13 +3030,11 @@ class IntDecodeSm100(GQAPagedDecode):
             # == 2-bit code (q/2 exact). Pool row d = 16 contiguous
             # bytes = dim d's 64 tokens, pre-interleaved so source
             # u32 w (tokens [16w, 16w+16)) expands by the two-mask
-            # G1f4 contract (repack_sm100, the enforcing oracle):
+            # contract (repack_sm100, the enforcing oracle):
             # lo = w & 0x33333333 (nibble j = token 16w+j), hi =
             # (w >> 2) & 0x33333333 (nibble j = token 16w+8+j) —
-            # LSB-first nibbles = the chunk's 8 data bytes. The old
-            # (token x dim) transpose gather (16 LDS.32 + ~64 ALU
-            # per chunk plus the second-level rVW2 prefetch) is DELETED: the
-            # V arm now mirrors the K arm — rSrcS double-buffered
+            # LSB-first nibbles = the chunk's 8 data bytes. The
+            # V arm mirrors the K arm — rSrcS double-buffered
             # contiguous LDS (the thread's chunks_ptv panel words of
             # dim row v_dim), map_int2_f4v two-mask expand, one 16B
             # STS per chunk. Thread map: v_dim = t%128 (dim row),
@@ -3195,7 +3173,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # normal binade share one ulp), so the fold rescales
             # s' = 512 * s and nothing else changes — see
             # ALPHA_INV_INT4. A-role subnormal handling is
-            # silicon-verified (probe_sm100_e4m3a_subnormal).
+            # exact on silicon (probe_sm100_e4m3a_subnormal).
             # ONE LAYOUT, NO BRANCH: the pool always carries the
             # 8-slot store shuffle on this width (`_T8_I4`,
             # `k_pool_is_permuted`), which pre-interleaves the
@@ -3205,8 +3183,8 @@ class IntDecodeSm100(GQAPagedDecode):
             # codes = 0.375 per element.
             # `check_k_store_perm_i4` proves the shuffled pool read
             # with these masks emits operand words byte-identical
-            # to the unshuffled pool read with the PRMT form; G1i4
-            # is the V twin.
+            # to the unshuffled pool read with the PRMT form; the V map
+            # is its twin.
             for wl in cutlass.range_constexpr(words):
                 rOutU[2 * wl] = rS[wl] & Int32(0x0F0F0F0F)
                 rOutU[2 * wl + 1] = (rS[wl] >> 4) & Int32(0x0F0F0F0F)
@@ -3215,7 +3193,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # PRMT gather with table e4m3(8+q) (0x50..0x53): pack_lut
             # puts codes 4a..4a+3 one per selector nibble at shift
             # 16*(a//2)+2*(a%2). (Straight OR-magic is impossible on
-            # K: the G1-locked mKq bit layout is nibble-spaced.)
+            # K: the locked mKq bit layout is nibble-spaced.)
             for wl in cutlass.range_constexpr(words):
                 for aa in cutlass.range_constexpr(4):
                     sh = 16 * (aa // 2) + 2 * (aa % 2)
@@ -3226,11 +3204,11 @@ class IntDecodeSm100(GQAPagedDecode):
                     )
 
         def map_int2_f4(rS, rOutU, words):
-            # CP1 2->4-bit nibble deposit: the e2m1 nibble IS the
+            # 2->4-bit nibble deposit: the e2m1 nibble IS the
             # 2-bit code (q/2 exact: nibbles 0/1/2/3 decode to
             # 0/.5/1/1.5). pack_rows_lut puts code i of a u32 at bit
             # 16*(i//8) + 4*(i%4) + 2*((i%8)//4) (repack_sm100,
-            # VERIFIED): per 16-bit half, codes 0-3 sit at nibble
+            # the enforcing oracle): per 16-bit half, codes 0-3 sit at nibble
             # bits [1:0] and codes 4-7 at nibble bits [3:2].
             # Gathering LSB-first nibble words (out0 nibble j = code
             # j, out1 nibble j = code 8+j) is therefore 2 LOP3+SHF
@@ -3255,12 +3233,12 @@ class IntDecodeSm100(GQAPagedDecode):
                 rOutU[2 * wl + 1] = (w >> 2) & Int32(0x33333333)
 
         def map_int2_f4v(rS, rOutU, words):
-            # CP2 linear V expand (dim-major pool,
+            # Linear V expand (dim-major pool,
             # v_store_perm_sm100_f4): source u32 wl = tokens
             # [16*pl, +16) of dim row v_dim (pl = the thread's
             # wl-th token panel). The perm pre-interleaved the
             # codes so the chunk's two data words are just the
-            # G1f4 two masks: lo nibble j = token 16pl+j, hi
+            # two masks: lo nibble j = token 16pl+j, hi
             # nibble j = token 16pl+8+j (sign bits of the
             # arithmetic >> land in mask-zeroed lanes). Bytes
             # 8-15 of each 16B chunk are the pad and are NOT
@@ -3286,7 +3264,7 @@ class IntDecodeSm100(GQAPagedDecode):
         # convert to the e4m3 operand: the ablation baseline pays
         # what element-wise affine dequantization costs (see the
         # `_fma2_bf16` header for why this is deliberately not the
-        # cheaper per-token table it replaced). ~15 ops per 4
+        # cheaper per-token table). ~15 ops per 4
         # elements against the fold feed's 1-2, which IS the
         # quantity the ablation exists to expose.
         #
@@ -3322,10 +3300,9 @@ class IntDecodeSm100(GQAPagedDecode):
             # this one at 22+9, `map_int2_k` at 13+18 (mask
             # 0x33333333, shift <= 18), `map_int2_v` at 25+6 (mask
             # 0x03030303, shift <= 6). There is no slack ANYWHERE,
-            # which is why the check belongs in code. It is asserted
-            # only here because this is the arm being changed;
-            # routing the shipped fold maps through a checked helper
-            # would be a robustness-only edit to a byte-gated feed
+            # which is why the check belongs in code. The check sits
+            # only here: routing the shipped fold maps through a checked
+            # helper would be a robustness-only edit to a byte-gated feed
             # path.
             assert sh_lo >= 0 or -sh_lo <= 25, (
                 f"low-lane right shift {-sh_lo} > 25 would put "
@@ -3394,9 +3371,9 @@ class IntDecodeSm100(GQAPagedDecode):
         # issues BEFORE the j-th stage's map+STS (double-buffered source
         # staging), hiding the LDS latency that dominates the unpipelined
         # loop. A code stage is NOT released after its map: nothing orders
-        # the map before the arrive, and ptxas has issued the arrive with
-        # the stage's LDS still in flight, so the TMA refill overwrote the
-        # stage under them (2026-10-08). Each stage is released behind the
+        # the map before the arrive, and ptxas can issue the arrive with
+        # the stage's LDS still in flight, so the TMA refill overwrites the
+        # stage under them. Each stage is released behind the
         # first operand-commit fence after its LDS (CROSS-PROXY ORDERING).
         nkc = tiles_sm * tiles_dk * pages_m
         nvc = tiles_sk * tiles_dm * pages_k
@@ -3436,10 +3413,10 @@ class IntDecodeSm100(GQAPagedDecode):
             # tma_order_k_nbar arrival precedes its acquire of the last
             # page's scale stage, and scale depth has no tile-multiple
             # restriction; no depth below the bound is validated, and the
-            # anchor cell at eight sits on it. The commit that removed
-            # K3's assert argued the V stream depended on nothing in the K
-            # stream's current tile, which is true of the stream and false
-            # of the TMA warp that feeds it.
+            # anchor configuration at eight sits on it. An argument that
+            # the V stream depends on nothing in the K stream's current
+            # tile is true of the stream and false of the TMA warp that
+            # feeds it.
             assert scale_stages >= prefetch_iters * pages_s, (
                 "fold-off on the concurrent streams needs scale_stages >= "
                 f"prefetch_iters * pages_s = {prefetch_iters} * {pages_s}; "
@@ -3458,7 +3435,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # Above that bound and below (prefetch_iters + 2) * pages_s
             # the K stream is throttled to the V stream's progress, which
             # costs time and nothing else. The fold ablation's arms
-            # (baselines/sweeps/fold_ab_sm100.yaml) take scale_stages=16
+            # take scale_stages=16
             # from BITS_TUNING, which is (prefetch_iters + 2) * pages_s at
             # the shipped shape, so a measured arm never runs throttled;
             # the anchor cell with code_stages=8, scale_stages=8 sits on
@@ -3466,8 +3443,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # INT2: merge the per-tile deposit drains, on both feeds, except
         # the FP4 K stream (see merge_k_drain below).
         # Each fence_view_async_shared is a full async-proxy drain
-        # (~490 long_sb samples on the 4 per-tile drains in the
-        # headroom audit); one fence AFTER the whole tile burst
+        # (~490 long_sb samples on the 4 per-tile drains); one fence
+        # AFTER the whole tile burst
         # covers every prior STS of that burst, then the per-stage
         # commits arrive back-to-back (fence-then-arrive order
         # preserved; arrive counts per stage UNCHANGED — still one
@@ -3480,9 +3457,9 @@ class IntDecodeSm100(GQAPagedDecode):
         v_deposit_blocks = tiles_sk * tiles_dm
         # Merged drains are the INT2 design (the fold A/B's two arms run on
         # the e4m3 feed), except the f4 K stream: its code stages are released
-        # behind the drain fences, and a K code release at the tile's end held
+        # behind the drain fences, and a K code release at the tile's end holds
         # back the TMA-QK warp, which TMA-VO trails through tma_order_k_nbar,
-        # by a whole tile (2026-10-08). INT4 keeps per-block fence-and-commit.
+        # by a whole tile. INT4 keeps per-block fence-and-commit.
         merge_k_drain = (bits == 2) and k_deposit_blocks <= k_stages and not f4_feed
         merge_v_drain = (bits == 2) and v_deposit_blocks <= v_stages
         if cutlass.const_expr(bits == 2 and not f4_feed):
@@ -3498,7 +3475,7 @@ class IntDecodeSm100(GQAPagedDecode):
             )
         # CONCURRENT K / V dequant streams. A serialized single-stream
         # loop puts both deposit latencies on the pacer chain
-        # back-to-back, and every deeper-K-lead reorder of it regressed
+        # back-to-back, and a deeper-K-lead reorder of it regresses
         # because delaying V deposits delays mma_order_vp -> KQ issue.
         # Here the first half of the dequant warps deposits ALL K blocks
         # while the second half deposits ALL V blocks in parallel.
@@ -3595,7 +3572,7 @@ class IntDecodeSm100(GQAPagedDecode):
                                     k_producer.acquire_and_advance()
                                 )
                     if cutlass.const_expr(merge_k_drain):
-                        # CP2: ONE async-proxy fence covers ALL the
+                        # ONE async-proxy fence covers ALL the
                         # tile's K-panel STS, then the per-stage
                         # commits arrive back-to-back.
                         cute.arch.fence_view_async_shared()
@@ -3686,7 +3663,7 @@ class IntDecodeSm100(GQAPagedDecode):
                                     v_producer.acquire_and_advance()
                                 )
                     if cutlass.const_expr(merge_v_drain):
-                        # CP2: ONE async-proxy fence covers ALL the
+                        # ONE async-proxy fence covers ALL the
                         # tile's V-panel STS, then the per-stage
                         # commits arrive back-to-back.
                         cute.arch.fence_view_async_shared()
@@ -3715,7 +3692,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # kfs_rows of its 2*kf_runs flat chunks; V: its token column),
             # fences the generic-proxy quad reads before releasing to the
             # TMA producer (the ordering the softmax's scale release
-            # carries since 2026-09-11), and releases. Both streams walk
+            # carries), and releases. Both streams walk
             # every stage, so the ring's consumer group in `kernel` is
             # the full dequant warp count.
             if dq_tidx < i4s_threads:
@@ -3811,8 +3788,8 @@ class IntDecodeSm100(GQAPagedDecode):
                         # generic-proxy LDS -> async-proxy fence ->
                         # release: the TMA producer refills the stage
                         # through the async proxy, and without the
-                        # bridge the refill may land before these reads
-                        # (the 2026-09-11 softmax finding). The release
+                        # bridge the refill can land before these reads.
+                        # The release
                         # arrives from lane 0 only, so the warp barrier
                         # orders every lane's fence before lane 0's
                         # `mbarrier.arrive` (CROSS-PROXY ORDERING).
@@ -3945,8 +3922,7 @@ class IntDecodeSm100(GQAPagedDecode):
                 # quarter warp then loads 128 contiguous code bytes, and with
                 # the 64-byte-swizzled V stage its deposits reach 8 distinct
                 # 16-byte bank groups, at every operand-ring start row
-                # (docs/kernel/int_fold_decode.md, "Shared-memory bank
-                # conflicts in the dequant streams").
+
                 # The INT2/E4M3 ablation keeps its token-major pool.
                 i4vt = dq_tidx - i4s_threads
                 i4v_unit = i4vt % page_size
@@ -4222,9 +4198,9 @@ class IntDecodeSm100(GQAPagedDecode):
         V-fold epilogue, which combines the hi and lo P rows, divides by the final
         pscale, adds the cross-warp-reduced `c_h`, and stores O.
         """
-        # Read straight off `self` instead of taking 21 parameters that were
-        # only ever `X = self.X` in the caller. Same expression, same object,
-        # and the body below is untouched -- these are the names it uses.
+        # Read straight off `self` rather than taking 21 parameters that would
+        # only be `X = self.X` in the caller: same expression, same object, and
+        # these are the names the body uses.
         do_atomic_red = self.do_atomic_red
         do_none_red = self.do_none_red
         o_stages = self.o_stages
@@ -4316,7 +4292,7 @@ class IntDecodeSm100(GQAPagedDecode):
                 )
         cute.arch.fence_view_async_tmem_store()
 
-        # Initialize consumer barriers. C8 persistence: one-shot
+        # Initialize consumer barriers. Persistence: one-shot
         # credits prime on item 0 only — each item ends with the
         # same +1 dangling credit per barrier (the compensation
         # arrivals enforce per-item closure), so the end-of-item
@@ -4349,7 +4325,7 @@ class IntDecodeSm100(GQAPagedDecode):
 
         # ---- channel-K Q'-plane builder ----
         # Deliberately NOT on the TMA-issue warp: building it there
-        # serialized the producer chain, halving issue_active for
+        # serializes the producer chain, halving issue_active for
         # +17% instructions. This WG has 4x the threads and measured
         # slack, and builds run kb_ahead+1 tiles ahead of every
         # consumer (the preamble seeds the window), so the inline
@@ -4362,17 +4338,17 @@ class IntDecodeSm100(GQAPagedDecode):
         # per-lane |Q| is item-constant.
         #
         # THE LIFT IS PER ROW, and that is what keeps the amax
-        # reduction warp-local. A plane-wide scalar lift needed an
+        # reduction warp-local. A plane-wide scalar lift needs an
         # smem round through `sKam` and a 128-arrive `kam_mbar` in
         # the middle of the build's dependency chain, because row n
         # lives in warp n % 4. Per row the reduction is exactly
         # `warp_fmax` over the lane's d-run: no named barrier, no
-        # smem, and at g <= 4 each warp owns one row, so the
-        # rendezvous was purely DISCARDING the per-row answer to make
+        # smem, and at g <= 4 each warp owns one row, so a rendezvous
+        # would only DISCARD the per-row answer to make
         # a coarser one. Per row is also strictly TIGHTER
         # quantization, since each row gets its own lift instead of
         # sharing the max over all rows, and the host reference
-        # mirrors it row-wise. Bias was already warp-local.
+        # mirrors it row-wise. Bias is warp-local too.
         if cutlass.const_expr(k_channel):
             cute.arch.mbarrier_wait(q_load_mbar, phase=0)
             sQP_nk = cute.composition(
@@ -4394,10 +4370,8 @@ class IntDecodeSm100(GQAPagedDecode):
             rQh.fill(Float32(0))
             # PER-ROW |Q|: rMaxq[rr, j] is row (rr*4 + widx)'s own
             # |Q[.., 4*lane + j]|, NOT maxed across the warp's rows.
-            # At g == 8 (kb_rows == 2) a warp owns two rows and the
-            # old single-row-slot version deliberately collapsed
-            # them; keeping them separate is what makes the lift
-            # per row.
+            # At g == 8 (kb_rows == 2) a warp owns two rows; keeping
+            # them separate is what makes the lift per row.
             rMaxq = cute.make_rmem_tensor((kb_rows, 4), acc_dtype)
             rMaxq.fill(Float32(0))
             rq4b = cute.make_rmem_tensor((1, 4), mma_dtype)
@@ -4542,12 +4516,10 @@ class IntDecodeSm100(GQAPagedDecode):
                 # FENCE COALESCING: the bias is computed and stored
                 # BEFORE the fence, so ONE `fence_view_async_shared`
                 # orders both payloads and both handles commit after
-                # it. There used to be a fence per payload — QP
-                # published first, then the bias reduction ran, then a
-                # second fence. Moving QP's publication after the bias
-                # butterfly is free here because the builder runs
-                # `kb_ahead + 1` tiles ahead of every consumer, so the
-                # plane is not awaited when it is produced.
+                # it. Publishing QP after the bias butterfly is free
+                # here because the builder runs `kb_ahead + 1` tiles
+                # ahead of every consumer, so the plane is not awaited
+                # when it is produced.
                 for rr in cutlass.range_constexpr(kb_rows):
                     n_b = rr * warpgroup_warps + warpgroup_widx
                     bp = Float32(0)
@@ -4575,11 +4547,12 @@ class IntDecodeSm100(GQAPagedDecode):
             # set serialize on a write-after-read however the acquires are
             # ordered, so per-part slots are what make the k_parts bodies
             # genuinely independent.
-            # Part-major (row-major) slots: each part's 4-channel run is contiguous, so
-            # the f32 pairs a DSL >= 4.6 register tensor is packed into are (j, j+1) of
-            # ONE part and match the halves of that part's 128-bit scale load. Column-major
-            # slots paired two parts' channels, and under DSL 4.8.0 the repacking stalled
-            # on each load and cost INT2 channel-wise-K builds 25-32% on B200 (2026-10-07).
+            # Part-major (row-major) slots: each part's 4-channel pair run is
+            # contiguous, so the f32 pairs a register tensor is packed into are
+            # (j, j+1) of one part and match the halves of that part's 16-byte
+            # scale load. Column-major slots pair two parts' channels, and the
+            # repacking stalls on each load, which costs INT2 channel-wise-K
+            # builds 25-32% on B200.
             rSKB_pf = cute.make_rmem_tensor(
                 cute.make_layout((k_parts, 4), stride=(4, 1)), acc_dtype)
             rZKB_pf = cute.make_rmem_tensor(
@@ -4618,10 +4591,9 @@ class IntDecodeSm100(GQAPagedDecode):
         # o_stages) act as EMPTY tiles at the last real running max:
         # the first real read initializes ALL slots and skipped reads
         # shift nothing, so tail weights land on the right slots.
-        # (the pscale exponent is LAUNCH-GLOBAL, so the
-        # old lp shift register / windowed sVmax reads / O pscale
-        # re-basing are gone — corrections are pscale-free by
-        # construction, exactly as in the baseline.)
+        # (the pscale exponent is LAUNCH-GLOBAL, so no lp shift register,
+        # windowed sVmax read or O pscale re-basing is needed — corrections
+        # are pscale-free by construction, exactly as in the baseline.)
         sM_hist = cute.make_rmem_tensor(o_stages, Float32)
         sM_hist.fill(Float32(0))
         for s in cutlass.range_constexpr(o_stages):
@@ -4727,12 +4699,11 @@ class IntDecodeSm100(GQAPagedDecode):
                         # per-part acquire happens FIRST, then the build
                         # bodies run back to back with nothing between
                         # them, then ONE fence publishes every payload.
-                        # Previously each part was
-                        # acquire -> build -> fence -> commit, and BOTH
-                        # the mbarrier acquire and the fence are barriers
-                        # ptxas cannot schedule across, so the builds ran
-                        # strictly serially however independent their
-                        # arithmetic was. The bodies read DISJOINT slots
+                        # A per-part acquire -> build -> fence -> commit
+                        # would make both the mbarrier acquire and the fence
+                        # barriers ptxas cannot schedule across, so the builds
+                        # would run strictly serially however independent
+                        # their arithmetic is. The bodies read DISJOINT slots
                         # of rSKB_pf/rZKB_pf, so no register aliasing
                         # serializes them either.
                         #
@@ -4740,7 +4711,7 @@ class IntDecodeSm100(GQAPagedDecode):
                         # `acquire()` returns an ImmutableResourceHandle
                         # built from `self.__state.clone()`, i.e. a value
                         # SNAPSHOT, not an alias of the producer's live
-                        # state (cutlass/pipeline/sm90.py, 4.5.2).
+                        # state.
                         qp_hn, qb_hn = [], []
                         for kp_n in cutlass.range_constexpr(k_parts):
                             qp_hn.append(
@@ -4805,7 +4776,7 @@ class IntDecodeSm100(GQAPagedDecode):
                 # Compute correction of s-2. Fold mode: the vector is nL
                 # wide (columns [g, 2g) are the lo rows / c partials of
                 # head n - g -> factor of head n % g); O additionally
-                # re-bases the running pscale (P of tile s was quantized
+                # re-bases the running pscale (P of tile s is quantized
                 # at lp_s), l/c stay in true units.
                 correction_lane = exp2(sM_hist[0] - sM_lane)
                 correction_r = cute.make_rmem_tensor(nL, acc_dtype)
@@ -5053,14 +5024,13 @@ class IntDecodeSm100(GQAPagedDecode):
         zeros_nL.fill(Float32(0))
         colsum_final = zeros_nL.load()
         # Read every colsum_p slot HERE, unconditionally, and let the tail branches
-        # below only select among these values. nvidia-cutlass-dsl 4.6.1 and 4.8.0
-        # miscompile a colsum_p slot read placed inside the `== phase` branches: they
-        # sink the add out of the branches and give every branch ONE slot's registers,
-        # so the tail merges the wrong partial sums whenever the main loop ran
-        # (iters_s > o_stages); with one main-loop tile, the slot it accumulated is
-        # replaced by an untouched one. Token-wise V read rel_l2 ~8 (B200, 2026-10-07;
-        # the PTX shows one `add.f32x2` operand shared by all three ring branches).
-        # 4.5.2 computes the same values either way.
+        # below only select among these values. A colsum_p slot read placed inside
+        # the `== phase` branches is miscompiled: the compiler sinks the add out of
+        # the branches and gives every branch ONE slot's registers, so the tail
+        # merges the wrong partial sums whenever the main loop ran (iters_s >
+        # o_stages); with one main-loop tile, the slot it accumulated is replaced
+        # by an untouched one. Token-wise V then reads rel_l2 ~8 on B200, and the
+        # PTX shows one `add.f32x2` operand shared by all three ring branches.
         colsum_p_slots = []
         if cutlass.const_expr(not v_channel):
             for p in cutlass.range_constexpr(o_stages):
@@ -5487,9 +5457,9 @@ class IntDecodeSm100(GQAPagedDecode):
         `warpgroup_tidx` of every 128-token mma tile, across all `blk_tile_n` columns.
         """
         # Free registers
-        # Read straight off `self` instead of taking 21 parameters that were
-        # only ever `X = self.X` in the caller. Same expression, same object,
-        # and the body below is untouched -- these are the names it uses.
+        # Read straight off `self` rather than taking 21 parameters that would
+        # only be `X = self.X` in the caller: same expression, same object, and
+        # these are the names the body uses.
         bits = self.bits
         debug_s = self.debug_s
         do_atomic_red = self.do_atomic_red
@@ -5509,10 +5479,9 @@ class IntDecodeSm100(GQAPagedDecode):
         # channel onto the sLC smem ring, so `colsum_load` NEVER runs
         # (its channel-V arm raises). These are COMPENSATION arrives for
         # a tail read that therefore does not exist, and a stray arrival
-        # on a live named-barrier id makes a LATER wait release early --
-        # the exact failure class under investigation. Unreachable at the
-        # shipped iters_s (the guards need iters_s <= 2), which is why it
-        # has never fired, but wrong at short sequences.
+        # on a live named-barrier id makes a LATER wait release early.
+        # No shipped iters_s reaches this (the guards need iters_s <= 2),
+        # but the sequence tail is wrong at short sequences.
         if cutlass.const_expr(not v_channel):
             if cutlass.const_expr(o_stages == 2):
                 if iters_s == 1:
@@ -5699,9 +5668,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # NOTE: scale_consumer is referenced through this single name only,
         # and every walk is a wait_and_advance with a real release — no
         # state-only advance.
-        # This is the only scale path of the fold (since 2026-09-14): the
-        # in-loop acquire it replaced measured slower at INT4 and was the
-        # dual softmax's last host. The staging is feed-independent; only
+        # This is the only scale path of the fold: an in-loop acquire
+        # measures slower at INT4. The staging is feed-independent; only
         # the coefficient algebra is keyed on the width and the feed, and
         # the expansion at the top of the iteration carries every arm
         # (bits == 4, the f4 feed, the e4m3 int2 feed). It runs whenever
@@ -5764,25 +5732,18 @@ class IntDecodeSm100(GQAPagedDecode):
                             )
                             for e in cutlass.range_constexpr(2):
                                 rSZ2[k_ring_w + e, smi] = sVZ[e]
-                # ASYNC-PROXY ORDERING before the scale release (root cause of the INT4
-                # concurrent-streams nondeterminism, codex 2026-09-11, captured directly:
-                # 9/31 launches read the quad of the token 512 later = one full scale-
-                # ring turn). The quad LDS above is a GENERIC-proxy read and the release
-                # is the ordinary mbarrier release/acquire handoff, which lacks the
-                # generic->async proxy bridge, so TMA-QK's ASYNC-proxy overwrite of the
-                # reacquired stage need not be ordered after these reads and can land
-                # first. fence.proxy.async is the documented bridge; it is executed by
-                # EVERY softmax thread (no elect predicate). Latent while the dequant
-                # warpgroup ran as a whole-warpgroup interleave, whose slower K progress
-                # made the window rare enough never to be observed; the concurrent
-                # streams that replaced it hit it. Evidence, for the tested
-                # non-prefetch INT4 configuration: 0/500
-                # differing with this fence vs 14/100 without, bitwise-equal to the
-                # collective arm. The two scale-PREFETCH sites carry the same ordering
-                # argument, not that experiment. A proxy fence acts only within its own
-                # thread and the release arrives from lane 0 of each warp, so the warp
-                # barrier orders all 32 lanes' fences before lane 0's `mbarrier.arrive`
-                # (CROSS-PROXY ORDERING).
+                # ASYNC-PROXY ORDERING before the scale release. The quad LDS above
+                # is a GENERIC-proxy read and the release is the ordinary mbarrier
+                # release/acquire handoff, which lacks the generic->async proxy
+                # bridge, so TMA-QK's ASYNC-proxy overwrite of the reacquired stage
+                # need not be ordered after these reads and can land first: the
+                # softmax then reads the quad of a token one full scale-ring turn
+                # later. fence.proxy.async is the documented bridge, and it is
+                # executed by EVERY softmax thread (no elect predicate). The
+                # concurrent K/V dequant streams make that window routine. A proxy
+                # fence acts only within its own thread and the release arrives from
+                # lane 0 of each warp, so the warp barrier orders all 32 lanes'
+                # fences before lane 0's `mbarrier.arrive` (CROSS-PROXY ORDERING).
                 cute.arch.fence_view_async_shared()
                 cute.arch.sync_warp()
                 for sh in scale_handles:
@@ -5849,9 +5810,8 @@ class IntDecodeSm100(GQAPagedDecode):
                         # Coefficients from the quad buffer fetched one
                         # tile ago (prologue, or the previous
                         # iteration). The fold algebra is keyed on the
-                        # width and the feed, and every arm is the one
-                        # the in-loop acquire certified before it was
-                        # retired on 2026-09-14:
+                        # width and the feed, and every arm is certified
+                        # against the e4m3 feed:
                         #   bits == 4: the raw-code feed is q * 2**-9,
                         #     exact in e4m3 (the subnormal band and the
                         #     first binade share the 2**-9 ulp), so
@@ -5865,9 +5825,8 @@ class IntDecodeSm100(GQAPagedDecode):
                         #   f4 feed: q/2, exact in e2m1, so s' = 2*s_t
                         #     and z' = z_t (BETA_FOLD_F4 = 0; e2m1 cannot
                         #     carry the +8 recentering). s'_v = 2*s_v,
-                        #     paired with the lp-1 shift. Pinned by the
-                        #     f4feed-* sim rows (probe_mxf4_fold_
-                        #     numerics.py).
+                        #     paired with the lp-1 shift (probe_mxf4_fold_
+                        #     numerics.py's f4feed rows).
                         #   e4m3 int2 feed: e4m3(q + BETA_FOLD[2]), so
                         #     s' = s_t and z' = z_t - BETA_FOLD*s_t, with
                         #     the V twin s'_v = s_v and
@@ -6014,23 +5973,16 @@ class IntDecodeSm100(GQAPagedDecode):
                             # Early release: everything downstream (the
                             # K-fold, the P-quant s_v, c_h) reads only
                             # the register quads.
-                            # ASYNC-PROXY ORDERING before the scale release (root cause of the INT4
-                            # concurrent-streams nondeterminism, codex 2026-09-11, captured directly:
-                            # 9/31 launches read the quad of the token 512 later = one full scale-
-                            # ring turn). The quad LDS above is a GENERIC-proxy read and the release
-                            # is the ordinary mbarrier release/acquire handoff, which lacks the
-                            # generic->async proxy bridge, so TMA-QK's ASYNC-proxy overwrite of the
-                            # reacquired stage need not be ordered after these reads and can land
-                            # first. fence.proxy.async is the documented bridge; it is executed by
-                            # EVERY softmax thread (no elect predicate). Latent while the dequant
-                            # warpgroup ran as a whole-warpgroup interleave, whose slower K progress
-                            # made the window rare enough never to be observed; the concurrent
-                            # streams that replaced it hit it. Evidence, for the tested
-                            # non-prefetch INT4 configuration: 0/500
-                            # differing with this fence vs 14/100 without, bitwise-equal to the
-                            # collective arm. The two scale-PREFETCH sites carry the same ordering
-                            # argument, not that experiment. The warp barrier orders all 32 lanes'
-                            # fences before lane 0's `mbarrier.arrive`, as at the prologue fetch.
+                            # ASYNC-PROXY ORDERING before the scale release. The quad LDS
+                            # above is a GENERIC-proxy read and the release is the ordinary
+                            # mbarrier release/acquire handoff, which lacks the
+                            # generic->async proxy bridge, so TMA-QK's ASYNC-proxy overwrite
+                            # of the reacquired stage need not be ordered after these reads
+                            # and can land first: the softmax then reads the quad of a token
+                            # one full scale-ring turn later. fence.proxy.async is the
+                            # documented bridge, executed by EVERY softmax thread (no elect
+                            # predicate). The warp barrier orders all 32 lanes' fences
+                            # before lane 0's `mbarrier.arrive`, as at the prologue fetch.
                             cute.arch.fence_view_async_shared()
                             cute.arch.sync_warp()
                             for sh in scale_handles:
@@ -6042,8 +5994,9 @@ class IntDecodeSm100(GQAPagedDecode):
                     # constants; the per-token machinery above is
                     # inert since k_ring_w == 0). Ring rows: the lift
                     # 2^m_G[h] at [0, g), bias_G[h] at [g, 2g). The lift
-                    # is read PER ROW — it used to be one plane-wide
-                    # scalar at row 0, broadcast into every rSK[n].
+                    # is read PER ROW; a plane-wide scalar at row 0
+                    # broadcast into every rSK[n] would give up the
+                    # per-row lift.
                     if cutlass.const_expr(k_channel):
                         qb_handles = []
                         for _kp in cutlass.range_constexpr(k_parts):
@@ -6063,8 +6016,8 @@ class IntDecodeSm100(GQAPagedDecode):
                         if cutlass.const_expr(k_parts == 1):
                             # Gt=256: ONE plane serves every M-tile, so
                             # read the coefficient vectors ONCE and reuse
-                            # the registers. Previously each M-tile
-                            # re-read the identical sQB slot.
+                            # the registers instead of re-reading the
+                            # identical sQB slot per M-tile.
                             qb_read(qb_handles[0].index, rQBs, rQBz)
                         for smi in cutlass.range_constexpr(tiles_sm):
                             if cutlass.const_expr(
@@ -6140,9 +6093,9 @@ class IntDecodeSm100(GQAPagedDecode):
                     # moves by one bf16 ulp on head%4==0 columns whenever
                     # the code around the precompute changes shape, and
                     # why a packed-f32x2 form of this site (fma2, and
-                    # mul2+add2, which ptxas re-fuses to FFMA2) drifted the
-                    # folded-S tap on a third of the lanes by 1-2 ulp when
-                    # it was tried. It stays scalar.
+                    # mul2+add2, which ptxas re-fuses to FFMA2) drifts the
+                    # folded-S tap on a third of the lanes by 1-2 ulp. It
+                    # stays scalar.
                     if cutlass.const_expr(k_tok64):
                         # S = s'_lo * S_lo + s'_hi * S_hi + (z'_lo *
                         # QSum_lo + z'_hi * QSum_hi)  [rZQ holds the
@@ -6385,7 +6338,7 @@ class IntDecodeSm100(GQAPagedDecode):
                     p_handle.commit()
 
                     # Correction bookkeeping, AFTER the P commit
-                    # (fix iteration 2 — see the pre-commit comment).
+                    # (see the pre-commit comment).
 
                     # Accumulate per-thread colsum (true f32 P — the
                     # sim's cheap l_mode='f32P'); fold mode also carries
@@ -6581,10 +6534,9 @@ class IntDecodeSm100(GQAPagedDecode):
         # fold_k gates the K-SIDE fold machinery (K-fold FMAs, QSum, the
         # scale ring) and fold_p the P-SIDE machinery (sVmax/pscale, P hi/lo
         # rows, c_h, widened L/O tmem, V-fold epilogue). The two are always
-        # equal today, because the only configuration that ever separated
-        # them was a pair of attribution probes that have since been
-        # retired. They stay as two names because 48 sites read one or the
-        # other, and collapsing them is a rename to make on its own.
+        # equal, because no configuration separates them. They stay as two
+        # names because 48 sites read one or the other, and collapsing them
+        # is a rename to make on its own.
         # `fold_scale_zero=False` (ctor-scoped to int2 + e4m3 feed + legacy
         # quant) is the classic-dequant ablation: the dequant WG applies
         # (s, z) to the codes and publishes REAL dequantized e4m3 operands,
@@ -6595,8 +6547,8 @@ class IntDecodeSm100(GQAPagedDecode):
         fold_k = not nofold
         fold_p = fold_k
         bits = self.bits
-        # CP1/CP2: int2 K AND V feeds as packed e2m1 direct-SMEM (variant
-        # B). The ctor asserts bits == 2.
+        # int2 K AND V feeds as packed e2m1 direct-SMEM. The ctor asserts
+        # bits == 2.
         f4_feed = self.dequant_int2_to_f4
         persistent = self.persistent
         # Quant-granularity flex consts. Legacy compiles with all of these
@@ -6663,8 +6615,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # (e4m3(s'_d * Q * 2^-m_G), the B operand of the QK MMA) + a bias
         # ring entry (2^m_G, bias_G[h] = sum_d z'_d * Q[h, d]) — the hot
         # softmax K-fold becomes S = 2^m * S_raw + bias[h]. Groups per tile:
-        # Gt=256 -> 1 plane / tile, Gt=128 -> 1 per M-tile (K channel-64 is
-        # stage e: dual planes + dual S accumulators).
+        # Gt=256 -> 1 plane / tile, Gt=128 -> 1 per M-tile (K channel-64
+        # takes dual planes + dual S accumulators).
         k_channel = self.k_axis == "channel"
         k_parts = ((self.sequence_tile // self.k_group) if k_channel else 1)
         k_parts = max(k_parts, 1)
@@ -6703,7 +6655,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # host lp is used as-is.
             pscale_lp = pscale_lp - Float32(9.0)
         if cutlass.const_expr(f4_feed):
-            # CP2 pscale re-anchor: the V feed is q/2, so s_v rides DOUBLED
+            # pscale re-anchor: the V feed is q/2, so s_v rides DOUBLED
             # inside the P operand (w = P * (2*s_v), one FMUL at the
             # scale-quad copy). Decrementing the launch-global pscale
             # exponent ONCE here (pscale itself halves) keeps
@@ -6713,10 +6665,8 @@ class IntDecodeSm100(GQAPagedDecode):
             # consistent units. The host-side anchor
             # (lp = floor(log2(448 / max s_v))) is unchanged. CONTRACT:
             # pscale_lp passed in MUST remain that flag-off anchor — a
-            # future caller that computes lp differently or pre-compensates
-            # the s_v doubling host-side would double-compensate here
-            # (T4/T5 concern, kept with the code since the task reports
-            # are not committed).
+            # caller that computes lp differently or pre-compensates
+            # the s_v doubling host-side would double-compensate here.
             # channel-V exception: s_v never rides inside P (w = P * pscale;
             # the f4 V-feed's /2 is compensated in the drain's s'_d = 2*s_d
             # instead), so there is no doubling to re-anchor — the host lp
@@ -6771,7 +6721,7 @@ class IntDecodeSm100(GQAPagedDecode):
         # Read thread indices
         kv_splits, tiles_hp, tiles_hb = cute.arch.grid_dim()
         kv_split_idx, coord_hp, coord_hb = cute.arch.block_idx()
-        # C8 persistent: capture the LAUNCHED z extent and this CTA's linear
+        # Persistent: capture the LAUNCHED z extent and this CTA's linear
         # z id before both names are rebound below (grid_z < items when
         # persistent; the item loop walks bidz, bidz + grid_z_rt, ...).
         grid_z_rt = tiles_hb
@@ -6815,7 +6765,7 @@ class IntDecodeSm100(GQAPagedDecode):
             scalar_layout = cute.make_layout(1)
             seqlen_smem = smem.allocate_tensor(Int32, scalar_layout)
             table_offset_smem = smem.allocate_tensor(Int32, scalar_layout)
-            # C8 persistent: coord_b changes per item, so this staging runs
+            # Persistent: coord_b changes per item, so this staging runs
             # inside the item loop instead (same protocol, same warp).
             if cutlass.const_expr(not persistent):
                 if warp_idx == init_warp:
@@ -6857,14 +6807,14 @@ class IntDecodeSm100(GQAPagedDecode):
         init_warp += 1
 
         ##############################
-        # C8 smem carve-out
+        # smem carve-out
         ##############################
         # ALL SmemAllocator calls live here, above the item loop: the DSL
         # flattener cannot carry the stateful allocator object through a
         # dynamic `for`, and the loop body only needs the resulting
         # pointers/tensors (loop-invariant). Allocation ORDER and alignment
-        # exactly mirror the original inline sequence, so every smem
-        # address is byte-identical for all modes (flag-off bit gates).
+        # are fixed, so every smem address is byte-identical for all modes
+        # (flag-off bit gates).
         if cutlass.const_expr(do_atomic_red):
             reduction_mbars_ptr = smem.allocate_array(
                 Int64, max_reduction_iters * 2
@@ -6983,9 +6933,9 @@ class IntDecodeSm100(GQAPagedDecode):
         # bias ring x qp_stages. The bias-ring row layout is
         #   rows [0, g)   : the PER-ROW lift 2^m_G[h]
         #   rows [g, 2g)  : bias_G[h]
-        # It was (1 + g) with a single shared lift at row 0; per-row lifts are
-        # what let the amax reduction stay warp-local. Consumers must index the
-        # lift by h, not read row 0 -- see the K-fold in the softmax WG.
+        # The row layout is 2g rows, not 1 + g: per-row lifts are what let the
+        # amax reduction stay warp-local. Consumers must index the lift by h,
+        # not read row 0 -- see the K-fold in the softmax WG.
         sQP = None
         sQB = None
         if cutlass.const_expr(k_channel):
@@ -7009,7 +6959,7 @@ class IntDecodeSm100(GQAPagedDecode):
             )
 
         ##############################
-        # C8 persistent item loop
+        # Persistent item loop
         ##############################
         # Static round-robin over items bidz, bidz + grid_z_rt, ...: the
         # ENTIRE per-item flow below, INCLUDING the mbarrier/pipeline init
@@ -7031,7 +6981,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # breaks the trace-time warp-budget assert below.
             init_warp_l = init_warp
             # A persistent build chooses the warp roles afresh for every item, at both widths
-            # (docs/kernel/int_fold_decode.md, "The warp role is re-read for every work item"):
+            # by reading the role indices again at the top of each item:
             # - One fresh read of %tid.x per item gives the warp index and the warpgroup index
             #   that every role choice and init-warp test in the item reads, the reduction warp's
             #   included, so no role index lives across the item loop's back edge
@@ -7042,9 +6992,9 @@ class IntDecodeSm100(GQAPagedDecode):
             #   copy of the warp index (`_opaque_i32` says why).
             # The warp's place in its warpgroup (`warpgroup_widx`), which the softmax and
             # correction roles receive, and the warp index the epilogue compares after the loop
-            # still come from the kernel-entry read: making them fresh too made some persistent
-            # INT4 builds slower. A non-persistent build runs the loop once and keeps the
-            # kernel-entry values, so its binary is unchanged.
+            # still come from the kernel-entry read: making them fresh too makes some
+            # persistent INT4 builds slower. A non-persistent build runs the loop once and
+            # keeps the kernel-entry values, so its binary is unaffected.
             if cutlass.const_expr(persistent):
                 tid_fresh = _tid_x_fresh() & 1023
                 warp_idx_l = cute.arch.make_warp_uniform(tid_fresh // warp_threads)
@@ -7055,12 +7005,11 @@ class IntDecodeSm100(GQAPagedDecode):
                 _role_w = (lambda w: w)
             # Names bound ONLY inside a `cutlass.const_expr` guard below, declared
             # here so they can be PASSED to a warp-role method. Inside one function
-            # this was unnecessary: every read sat behind the same guard, so the DSL
-            # pruned the branch and never evaluated the name. A call argument is
-            # evaluated unconditionally, so an unbound name raises "free variable
-            # referenced before assignment in enclosing scope" instead. Same idiom
-            # the file already uses for `codek_producer`, and the same reason
-            # `sSP_i32` and `sp_consumer` carry it.
+            # this is unnecessary: every read sits behind the same guard, so the DSL
+            # prunes the branch and never evaluates the name. A call argument is
+            # evaluated unconditionally, so an undeclared name raises "free variable
+            # referenced before assignment in enclosing scope". The same idiom
+            # covers `codek_producer`, `sSP_i32` and `sp_consumer`.
             #
             # Some of these are bound in BOTH arms of an if/else and so are always
             # live; they are listed anyway because "assigned under a conditional" is
@@ -7069,7 +7018,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # NOT LISTED, and it matters: `sCode` and `correction_regs` are bound
             # BEFORE this loop (the smem carve-out and the register split). A
             # `= None` here would SHADOW the real value rather than pre-declare it,
-            # and it did -- `'NoneType' object has no attribute 'iterator'`. Only
+            # which fails with `'NoneType' object has no attribute 'iterator'`. Only
             # names bound INSIDE the loop body belong in this block; a name bound
             # above the loop needs its pre-init above the loop, or none at all when
             # every arm of its guard assigns it, which is the case for both of these.
@@ -7224,9 +7173,9 @@ class IntDecodeSm100(GQAPagedDecode):
             # its index/phase state per name, the two walkers desync, and the
             # device deadlocks. Hence every acquire and wait below goes
             # through the one participant name.
-            # The int2 split point is swept on silicon, and it moved when the
-            # deposits became concurrent: 3/6 was best while they were
-            # serialized, and 2/7 is best now. The K stream keeps pace with
+            # The int2 split point is swept on silicon: 2/7 is best with the
+            # concurrent deposits, 3/6 with a serialized loop. The K stream
+            # keeps pace with
             # the hungry MMA-KQ on 1 tile of K buffering, and the V ring
             # wants every spare stage of slack against the VP<-P<-softmax
             # credit chain. INT4 takes 3 through `fold_runtime.BITS_TUNING`.
@@ -7273,8 +7222,8 @@ class IntDecodeSm100(GQAPagedDecode):
                 # stream's threads. Each code ring is released by its own stream
                 # only, and every wait a stream performs is on a stage its own
                 # releases gate, so the TMA producer can never lap a waiter. A
-                # cross-stream release was tried: correct, but it re-coupled the
-                # stage refills to the slower stream and cost measurably more.
+                # cross-stream release is correct, but it re-couples the stage
+                # refills to the slower stream and costs measurably more.
                 consumer_group=dequant_stream_group,
                 tx_count=code_stage_bytes,
                 barrier_storage=codek_pipeline_ptr,
@@ -7415,7 +7364,7 @@ class IntDecodeSm100(GQAPagedDecode):
             thrblk_mma_kq = tiled_mma_kq.get_slice(0)
             thrblk_mma_vp = tiled_mma_vp.get_slice(0)
 
-            # Q, K, V (rings allocated in the C8 carve-out above)
+            # Q, K, V (rings allocated in the smem carve-out above)
             tAsV = cute.make_tensor(
                 tAsK.iterator, smem_layout_v_mma.outer
             )  # (MMA, #MMA_M, #MMA_K, kv_stages)
@@ -7493,7 +7442,8 @@ class IntDecodeSm100(GQAPagedDecode):
 
             # `sM`'s producer/consumer window is what serves the correction
             # warpgroup; there is deliberately no separate tile-parity colmax
-            # buffer, which existed only for the retired fused epilogue.
+            # buffer, because the fused epilogue that would need one is not
+            # built.
             # L - colsum
             sL_layout = cute.make_layout((blk_tile_n, warpgroup_warps))
             if warp_idx_l == init_warp_l:
@@ -7510,7 +7460,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # written with plain stores and summed in fixed warp order after the
             # sL_final nbar. DETERMINISM INVARIANT (kernel-reduction mode is the
             # deterministic path by design): relaxed f32 atomic adds into a
-            # g-wide strip flipped roughly 5-16 of 4096 output words by 1 ulp per
+            # g-wide strip flip roughly 5-16 of 4096 output words by 1 ulp per
             # launch, from warp-order-dependent f32 rounding. Do NOT replace the
             # ordered sum with atomics.
             if cutlass.const_expr(fold_p):
@@ -7519,11 +7469,11 @@ class IntDecodeSm100(GQAPagedDecode):
                         sC[lane_idx] = Float32(0)
                 init_warp_l += 1
 
-            # NOTE: the channel-K amax-round mbarrier (128-arrive, correction
-            # WG's cross-warp max for the Q'-plane lift) was initialized here.
+            # NOTE: no channel-K amax-round mbarrier (128-arrive, correction
+            # WG's cross-warp max for the Q'-plane lift) is initialized here.
             # The lift is per row and rows are warp-private, so there is no
-            # cross-warp round left to name. `init_warp_l` is deliberately NOT
-            # advanced for it any more -- the barrier does not exist.
+            # cross-warp round to name, and `init_warp_l` is deliberately not
+            # advanced for one.
 
             # per-thread colsum
             # (MMA_MN, #MMA_M=1, #MMA_N=1, o_stages)
@@ -7536,7 +7486,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # R - cluster reduction buffers for colmax + colsum
             if cutlass.const_expr(do_atomic_red):
                 sR_layout = cute.make_layout((blk_tile_n, max_reduction_iters, 2))
-                assert sR is not None  # allocated in the C8 carve-out
+                assert sR is not None  # allocated in the smem carve-out
 
             ##############################
             # Sync
@@ -7607,7 +7557,7 @@ class IntDecodeSm100(GQAPagedDecode):
             ##############################
             if exit_early:
                 if warp_idx_l == mma_vp_warp_id:
-                    # C8 persistent: tmem stays allocated across items; the
+                    # Persistent: tmem stays allocated across items; the
                     # after-loop tail owns the single dealloc.
                     if cutlass.const_expr(not persistent):
                         cute.arch.relinquish_tmem_alloc_permit()
@@ -8039,17 +7989,17 @@ class IntDecodeSm100(GQAPagedDecode):
                         gL,
                         scale_o,
                     )
-                # C8 persistent: dependents launch once, after the item loop.
+                # Persistent: dependents launch once, after the item loop.
                 if cutlass.const_expr(not persistent):
                     cute.arch.griddepcontrol_launch_dependents()
-            # C8 item-boundary sync: all rings drained (every consumer
+            # Item-boundary sync: all rings drained (every consumer
             # released, every producer committed) and all mbarriers
             # quiesced before the next item re-initializes them.
             if cutlass.const_expr(persistent):
                 cute.arch.sync_threads()
 
         ##############################
-        # C8 persistent epilogue (once per CTA)
+        # Persistent epilogue (once per CTA)
         ##############################
         if cutlass.const_expr(persistent):
             # The kernel-entry warp index, not a fresh read; the comment at the top of the

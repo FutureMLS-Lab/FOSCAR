@@ -1,10 +1,8 @@
 """The hardcoded e4m3 code tables equal torch's float8_e4m3fn bytes.
 
 `int_fold_decode.py` carries `_E4M3_CODES`, the e4m3 byte of every raw code
-q = 0..15, hardcoded so the kernel module stays torch-free. Until
-2026-09-14 the G3 stage-dump gate (`scripts/_g3_dump_check.py`, retired together
-with `dump_stage`) pinned them to torch on the GPU box; this is that check, on the
-CPU, reading the tuple out of the SOURCE so it needs no cutlass.
+q = 0..15, hardcoded so the kernel module stays torch-free. This check runs on
+the CPU and reads the tuple out of the SOURCE, so it needs no cutlass.
 
 Run: pytest tests/test_e4m3_code_table_cpu.py
 """

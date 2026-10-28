@@ -11,7 +11,7 @@ cost 2 wavefronts each against an ideal of 1, because lanes 0-3 and 4-7 read row
 
 This file proves by lane arithmetic that every load of the copy is at its ideal, that the other
 access to the buffer (the lc writer) stays at its ideal, and that the reader and the writer
-still agree on every value. It also re-derives the per-instruction counts ncu measures at these
+agree on every value. It also re-derives the per-instruction counts ncu measures at these
 sites, so the model is anchored before it is used: for INT4 and INT2 at B=128 and KV=8192, the
 refill LDS reads 2.00/1.00 on 8 threads and the lc writer's STS.U16 reads 1.00/1.00 on 8 threads.
 
@@ -100,7 +100,7 @@ def _c_fragment(warp, lane, j):
 def _refill_a_word(lane, kt, e):
     """(plane, token pair) that A word e of refill lane `lane` (below 8) holds at step kt:
     the m64n8k16 A fragment with the planes on rows 0, 1, 8, 9 (rcp hi, zr hi, rcp lo, zr lo).
-    This is what `rLcA[4kt + e]` was loaded with at 6d4a06e, and what the lc wgmma reads."""
+    This is what `rLcA[4kt + e]` holds at step kt, and what the lc wgmma reads."""
     return lane // 4 + 2 * (e % 2), 8 * kt + lane % 4 + 4 * (e // 2)
 
 
@@ -115,7 +115,7 @@ def _cost(instructions):
 # ---------------------------------------------------------------------------------------------
 
 def _lc_elem_today(plane, token, wg):
-    """6d4a06e's allocation, make_ordered_layout((4, 64, 2), order=(1, 0, 2)): token fastest."""
+    """The token-fastest allocation, make_ordered_layout((4, 64, 2), order=(1, 0, 2))."""
     return token + PAGE * plane + PLANES * PAGE * wg
 
 
@@ -161,7 +161,7 @@ def test_each_refill_load_delivers_the_words_the_wgmma_reads(kernel):
 
 
 def _refill_today(base):
-    """16 LDS.32 per warpgroup per tile at 6d4a06e: one per (kt, e), lanes 0-7."""
+    """16 LDS.32 per warpgroup per tile: one per (kt, e), lanes 0-7."""
     out = []
     for wg in range(WARPGROUPS):
         for kt in range(PAGE // 16):
@@ -210,15 +210,15 @@ def _lc_writer(elem, base):
 @pytest.mark.parametrize("base", BASES)
 def test_the_refill_is_one_conflict_free_16_byte_load_per_step(kernel, base):
     today = _cost(_refill_today(base))
-    assert today == [(2, 1)] * (16 * WARPGROUPS)          # ncu at 6d4a06e: 2.00 / 1.00
+    assert today == [(2, 1)] * (16 * WARPGROUPS)          # ncu: 2.00 / 1.00
     whole = _cost(_refill(kernel, base))
     assert whole == [(1, 1)] * (4 * WARPGROUPS)
     # the grouped body, every lane: each half warp reads the step's one 128-byte row, so each
     # load is two wavefronts, its ideal
     grouped = _cost(_tile_copy(kernel, base))
     assert grouped == [(2, 2)] * (4 * 4 * WARPGROUPS)
-    # per warpgroup per tile: 32 wavefronts in 16 loads at 6d4a06e, 4 in 4 on the whole-D body
-    # now, and 32 in 16 on the grouped body
+    # per warpgroup per tile: 32 wavefronts in 16 loads at 4 bytes, 4 in 4 on the whole-D body,
+    # and 32 in 16 on the grouped body
     assert sum(a for a, _ in today) // WARPGROUPS == 32
     assert sum(a for a, _ in whole) // WARPGROUPS == 4
     assert sum(a for a, _ in grouped) // WARPGROUPS == 32
@@ -227,17 +227,16 @@ def test_the_refill_is_one_conflict_free_16_byte_load_per_step(kernel, base):
 @pytest.mark.parametrize("base", BASES)
 def test_the_lc_writer_stays_at_its_ideal(kernel, base):
     """No excess moves to the only other access of the buffer: each of the writer's 2-byte
-    stores touches four distinct words on four banks in both layouts (ncu at 6d4a06e:
-    1.00 / 1.00 on 8 threads)."""
+    stores touches four distinct words on four banks in both layouts (ncu: 1.00 / 1.00 on 8
+    threads)."""
     for elem in (_lc_elem_today, _lc_elem(kernel)):
         assert _cost(_lc_writer(elem, base)) == [(1, 1)] * (8 * 4 * WARPGROUPS)
 
 
 def test_the_lc_writer_address_is_one_lane_base_plus_an_immediate(kernel):
-    """The new writer needs no instruction in the tile loop: its address is a lane part that
-    does not depend on the tile plus a per-store constant, as it was at 6d4a06e. The lane part
-    is 2(i%2) + 16(i//2) + 128w bytes (i = lane // 4), and the constants are 64(p%2) + 4(p//2)
-    + 8(j//2)."""
+    """The writer needs no instruction in the tile loop: its address is a lane part that does
+    not depend on the tile plus a per-store constant. The lane part is 2(i%2) + 16(i//2) + 128w
+    bytes (i = lane // 4), and the constants are 64(p%2) + 4(p//2) + 8(j//2)."""
     elem = _lc_elem(kernel)
     for warp in range(4):
         for lane in range(0, 32, 4):
@@ -329,8 +328,8 @@ def test_the_kernel_allocates_and_reads_the_lc_strip_through_its_helpers():
     assert _only_binding(consumer, "sLcWords") == (
         "sLcWords = cute.make_tensor(cute.recast_ptr(sLcFactors.iterator, dtype=Int32), "
         "cute.make_layout(lc_words_shape, stride=lc_words_stride))")
-    # No loop-carried copy of the operand any more: the restart (`pv_tile_restart`) loads it
-    # per tile on both bodies.
+    # No loop-carried copy of the operand: the restart (`pv_tile_restart`) loads it per tile on
+    # both bodies.
     assert _assigns(consumer, "rLcA") == []
     reads = _subscripts(consumer, "sLcWords")
     assert len(reads) == 2
@@ -437,7 +436,7 @@ def test_the_lc_writer_takes_its_token_from_each_fragment():
     mj_l read from the QK coordinate of the SAME fragment inside the fragment loop. Fragments 0
     and 2 hold tokens 8 apart, so a token index computed once outside the loop and shared by
     both would write both fragments' factors to one token, and the bank arithmetic above,
-    which follows the fragment map, would no longer describe the stores."""
+    which follows the fragment map, would not describe the stores."""
     tree = ast.parse(KERNEL.read_text())
     prepare = _method(tree, "_unpack_k_and_prepare")
     stores = _subscripts(prepare, "sLcFactors")

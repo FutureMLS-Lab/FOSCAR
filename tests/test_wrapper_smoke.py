@@ -12,14 +12,10 @@ DEV = torch.device("cuda")
 # ---------------------------------------------------------------------------
 # ARGUMENT-CONTRACT tests only.
 #
-# These deliberately stop before any cute.compile: a IntDecodeSm100 trace is
-# ~40 s, which does not belong in a unit-test suite. The numerical gate is
-# `scripts/test_wrapper_quant_sm100.py` (bitwise equality against the
-# `_fold_harness` path); this file just pins the errors a caller can hit
-# without a GPU-minute.
-#
-# The dense numerics test that used to live here went with the dense decode
-# path -- `plan()` now requires bits=2 or bits=4.
+# These deliberately stop before any cute.compile, because an IntDecodeSm100
+# trace is ~40 s, which does not belong in a unit-test suite. This file pins the
+# errors a caller can hit without a GPU-minute; the numerical bitwise gate is a
+# separate run.
 # ---------------------------------------------------------------------------
 
 
@@ -52,8 +48,8 @@ def test_quant_rejects_non_64_page_size():
 
 
 def test_plan_requires_bits():
-    # The dense path is gone, so omitting `bits` is now an error rather than a
-    # silent fall-through to a bf16 kernel.
+    # Omitting `bits` is an error rather than a silent fall-through to a bf16
+    # kernel.
     indptr, indices, seq_lens = _dummy_plan_args()
     with pytest.raises(ValueError, match="bits=2 or bits=4"):
         _ws().plan(indptr, indices, seq_lens, 32, 8, 128, 64,

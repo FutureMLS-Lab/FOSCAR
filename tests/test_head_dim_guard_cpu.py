@@ -123,7 +123,7 @@ def test_the_guard_raises_rather_than_asserts(module, name):
 
 
 def _accepted_head_dims_literal():
-    """The single `accepts` rule `wrapper.py` states, read from its syntax tree."""
+    """`_ACCEPTED_HEAD_DIMS` as the one literal `wrapper.py` states, read from its syntax tree."""
     tree = ast.parse((SRC / "wrapper.py").read_text())
     found = [node.value for node in tree.body if isinstance(node, ast.Assign)
              and [getattr(t, "id", None) for t in node.targets] == ["_ACCEPTED_HEAD_DIMS"]]
@@ -290,8 +290,8 @@ def test_every_fixed_d_kernel_carries_a_guard_in_source(module, name):
 # ---------------------------------------------------------------------------------------------
 
 #: Each entry is the (file under src/, qualified name) of a function on the
-#: Hopper host path whose head-dimension default was removed or resolved from the head
-#: dimension, and the list holds every such function.
+#: Hopper host path that carries no head-dimension default and resolves the head
+#: dimension from its caller, and the list holds every such function.
 NO_HEAD_DIM_DEFAULT = (
     ("src/cutedsl_decode/_sm90/int_decode_pingpong.py", "IntPingPongDecodeSm90.__init__"),
     ("src/cutedsl_decode/_sm90/pingpong_runtime.py", "compile_pingpong"),
@@ -325,7 +325,7 @@ def _defaults(path, qualname):
 def test_no_hopper_host_function_defaults_the_head_dimension(path, qualname):
     """A default of 128 is how a D=256 caller silently gets a D=128 value, whether it is the
     head dimension itself or a ("token", 128) pair. The page size `N` is held to the same
-    rule only in `quant_block_offsets`, the one of these that lost its default."""
+    rule only in `quant_block_offsets`, the one of these that takes no default."""
     defaults, params = _defaults(path, qualname)
     guarded = {"head_dim", "D"} | ({"N"} if qualname == "quant_block_offsets" else set())
     assert (guarded | {"k_quant", "v_quant"}) & params, (
@@ -484,9 +484,8 @@ def test_every_refused_d256_mode_raises_value_error(mode, bits):
 @needs_dsl
 @pytest.mark.parametrize("bits", [2, 4])
 def test_the_hopper_default_ring_depth_is_resolved_per_head_dimension(bits):
-    """D=128 keeps the inherited bit-aware default (4 at int2, 2 at int4); D=256 resolves 2 at
-    both widths, the depth its stage comparison kept; a depth given explicitly is
-    kept at either head dimension."""
+    """D=128 keeps the bit-aware default (4 at int2, 2 at int4), and D=256 resolves 2 at both
+    widths; a depth given explicitly is kept at either head dimension."""
     cls = _cls("_sm90.int_decode_pingpong", "IntPingPongDecodeSm90")
     assert cls(128, bits=bits, heads_per_kv=4).num_stages == (4 if bits == 2 else 2)
     assert cls(256, bits=bits, heads_per_kv=4).num_stages == 2

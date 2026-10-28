@@ -9,8 +9,7 @@ stream warp, for INT2 and INT4, K and V, at head tiles 4 and 8, at all eight ope
 rows (address bits 7-9, the bits a K-major swizzle reads) and all eight code-ring placements
 modulo 1,024, and costs each one in `tests/_smem_banks.py`, the suite's measured bank model.
 
-THE RULE IT ENFORCES (`docs/kernel/int_fold_decode.md`, "Shared-memory bank conflicts in the
-dequant streams"). Every code load and every deposit is at ncu's ideal, with one documented
+THE RULE IT ENFORCES. Every code load and every deposit is at ncu's ideal, with one documented
 floor: the INT2 deposits write the padded e2m1 operand the `kind::f8f6f4` MMA reads from shared
 memory, 8 payload bytes in every 16, so their payload reaches only 16 of the 32 banks, a
 wavefront carries at most 64 payload bytes, and a warp's 256 payload bytes take 4 wavefronts
@@ -38,17 +37,17 @@ source is read instead:
   in `_dequant_warpgroup`, evaluated at the kernel's one page size (64) and head_dim 128 from
   the inputs `kernel` hands it;
 - `_dequant_warpgroup` does not read `q_head_tile`, so the maps cannot depend on the head tile.
-  Both tiles are still enumerated, because the head-tile-keyed INT4 V map (full channel rows at
-  tile 8, whose loads measured 8/4) is exactly what this rule retired.
+  Both tiles are still enumerated, because a head-tile-keyed INT4 V map (full channel rows at
+  tile 8) costs 8/4 and the rule must exclude it.
 
 WHAT IT DOES NOT COVER. The INT2/E4M3 ablation (`dequant_int2_to_f4=0`, which the fold
 ablation also takes) is not a shipped path: its V stream reads token columns at a 32-byte
 stride, which this model costs at 8/4, and nothing here enforces it. The softmax warpgroup's
 scale-record reads are not dequant-stream instructions.
 
-THE MODEL IS ANCHORED BELOW, in both directions: the half-row V deposit on the retired
-128-byte V image costs 8/4 at exactly the ring rows where ncu measured 8/4 (and 4/4 at row 6,
-the paper configuration's), and the retired full-row V load costs 8/4 as ncu measured.
+THE MODEL IS ANCHORED BELOW, in both directions: the half-row V deposit on the 128-byte V image
+costs 8/4 at exactly the ring rows where ncu measures 8/4 (and 4/4 at row 6, the token-128
+pair), and the full-row V load costs 8/4 as ncu measures.
 """
 from __future__ import annotations
 
@@ -82,7 +81,7 @@ INPUTS = {
 }
 
 #: Operand-ring starts: each of the eight rows, and the four starts production allocates
-#: (0x700, 0x780, 0x980 and 0x1180 in `_anchor_fold_outputs.INT4_OPERAND_RING_START`).
+#: (0x700, 0x780, 0x980 and 0x1180).
 OPERAND_RING_STARTS = [0x400 + 128 * r for r in range(8)] + [0x700, 0x780, 0x980, 0x1180]
 #: Code-ring starts: TMA-filled, so 128-byte aligned; each placement modulo 1,024.
 CODE_RING_STARTS = [0x20000 + 128 * r for r in range(8)]
@@ -647,7 +646,7 @@ def test_the_int2_floor_is_the_physical_minimum_of_the_padded_format():
 
 def test_the_dequant_streams_do_not_read_the_head_tile(dequant):
     """What makes the two head tiles run one map: the dequant warpgroup never reads
-    `q_head_tile`. Until 2026-09-30 it chose the INT4 V map by it."""
+    `q_head_tile`."""
     reads = [n.lineno for n in ast.walk(dequant) if isinstance(n, ast.Attribute)
              and n.attr == "q_head_tile"]
     assert reads == []
@@ -818,15 +817,14 @@ def test_the_int4_v_stages_take_the_64_byte_swizzle_on_the_host_and_on_the_devic
 
 
 # ---------------------------------------------------------------------------------------------
-# Negative controls: the model sees the conflicts ncu measured before this rule
+# Negative controls: the model sees the conflicts ncu measures
 # ---------------------------------------------------------------------------------------------
 
 def test_the_retired_half_row_map_on_the_128_byte_v_image_conflicts_where_ncu_measured():
-    """Before 2026-09-30 the INT4 V stage carried the 128-byte swizzle. The same chunk map
-    (row c // 2, token half c % 2, 128-byte rows with the page at byte 64 pk) is 8/4 at ring
-    rows 0, 1, 3, 4, 5 and 7, and 4/4 at rows 2 and 6. ncu measured 8/4 in the six INT4 pairs
-    whose ring starts at rows 0, 1, 3, 4 and 7, and 4/4 at row 6 (the token-128 pair, the
-    paper configuration)."""
+    """The chunk map that puts row c // 2, token half c % 2 on 128-byte rows with the page at
+    byte 64 pk is 8/4 at ring rows 0, 1, 3, 4, 5 and 7, and 4/4 at rows 2 and 6. ncu measures
+    8/4 in the six INT4 pairs whose ring starts at rows 0, 1, 3, 4 and 7, and 4/4 at row 6 (the
+    token-128 pair)."""
     conflicted = set()
     for row in range(8):
         av = 0x10000 + 128 * row
@@ -847,9 +845,9 @@ def test_the_retired_half_row_map_on_the_128_byte_v_image_conflicts_where_ncu_me
 
 
 def test_the_retired_full_row_v_load_is_8_over_4():
-    """The retired head-tile-8 V map loaded channel row t' + 64 q whole, 32 bytes as two
-    16-byte loads, so each quarter warp read 256 bytes at a 32-byte stride: 8/4 at every code
-    placement, as ncu measured in all 20 INT4 pairs at head tile 8."""
+    """A head-tile-8 V map that loads channel row t' + 64 q whole, 32 bytes as two 16-byte
+    loads, reads 256 bytes at a 32-byte stride in each quarter warp: 8/4 at every code
+    placement, as ncu measures in all 20 INT4 pairs at head tile 8."""
     for code in CODE_RING_STARTS:
         for warp in (0, 1):
             for q in (0, 1):

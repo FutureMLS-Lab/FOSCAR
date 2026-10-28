@@ -391,11 +391,10 @@ def test_run_requires_the_k_pool_order_where_the_pool_is_permuted(k_quant, bits)
     """Every configuration that reads a permuted pool must refuse to launch on
     an undeclared one.
 
-    The channel-wise entries are new as of 2026-08-12: they read the same two-mask
-    deposit as the token-wise ones now, so they carry the same pool contract and
-    owe the same declaration. The bits=4 rows are new as of 2026-08-15: the
-    raw-feed store shuffle made every INT4 pool permuted, so INT4 callers owe
-    the declaration too."""
+    The channel-wise entries read the same two-mask deposit as the token-wise
+    ones, so they carry the same pool contract and owe the same declaration. The
+    raw-feed store shuffle permutes every INT4 pool, so the bits=4 rows owe the
+    declaration too."""
     wrapper = _wrapper_for_k_order(k_quant=k_quant, bits=bits)
     with pytest.raises(ValueError, match="PERMUTED K pool"):
         wrapper._require_declared_k_pool_order(None)
@@ -411,13 +410,9 @@ def test_run_needs_no_declaration_where_the_pool_is_logical(k_quant, bits, kkw):
     """Every configuration that reads `pack_rows_lut` order keeps working with no
     new argument, so no existing dense caller changes.
 
-    CHANNEL-WISE K WAS IN THIS LIST UNTIL 2026-08-12 and moved to the permuted
-    test below when the axis term left `k_pool_is_permuted`; INT4 followed on
-    2026-08-15 when the raw-feed store shuffle made its pool permuted at every
-    configuration. That this test failed on the day the predicate widened is
-    the behaviour wanted: the declaration a caller owes depends on the
-    predicate, so the two must be changed together or a caller is told the
-    wrong thing."""
+    The declaration a caller owes depends on the same predicate that decides
+    whether the pool is permuted, so the two must be changed together or a
+    caller is told the wrong thing."""
     wrapper = _wrapper_for_k_order(k_quant=k_quant, bits=bits, kkw=kkw)
     wrapper._require_declared_k_pool_order(None)
     wrapper._require_declared_k_pool_order("logical")
@@ -439,14 +434,13 @@ def test_the_sm90_path_takes_no_declaration(fold_runtime):
     wrapper._require_declared_k_pool_order(None)
 
 
-# --- `kernel_cls` is retired, so the public doors refuse it ---------------------
-# Until 2026-10-07 `plan(kernel_kwargs={"kernel_cls": "pingpong"})` compiled the SM100
-# ping-pong fork, and the K pool order guard asked that fork's predicate. The fork is
-# deleted, so both doors must REFUSE a dict that still names the selector, for every
-# value it took, rather than plan and check the main kernel while the caller believes
-# it asked for the fork. The match is each door's own prefix, because a generic
-# TypeError naming `kernel_cls` would also come from the constructor splat deep inside
-# a compile, and would pass a test that matched only the name.
+# --- `kernel_cls` is not a selector, so the public doors refuse it --------------
+# The wrapper builds one SM100 kernel, so a dict that names `kernel_cls` asks for
+# another one. Both doors must REFUSE such a dict, for every value it can carry,
+# rather than plan and check the kernel while the caller believes it asked for
+# something else. The match is each door's own prefix, because a generic TypeError
+# naming `kernel_cls` would also come from the constructor splat deep inside a
+# compile, and would pass a test that matched only the name.
 
 _KERNEL_CLS_VALUES = [None, "pingpong"]
 
@@ -477,9 +471,10 @@ def test_plan_refuses_the_retired_kernel_cls(value):
 
 @pytest.mark.parametrize("value", _KERNEL_CLS_VALUES)
 def test_run_refuses_a_planned_dict_that_names_kernel_cls(value):
-    """The K pool order guard reads the planned dict BY NAME, so it consults the
-    retired table too: a dict naming the fork must not be answered for the main
-    kernel, whose K order is the opposite of the fork's at this configuration."""
+    """The K pool order guard reads the planned dict BY NAME, so it refuses a
+    dict naming `kernel_cls` as well: such a dict must not be answered for the
+    kernel this plan builds, whose K order is the opposite of the one it names
+    at this configuration."""
     wrapper = _wrapper_for_k_order(kkw={"dequant_int2_to_f4": 1, "kernel_cls": value})
     for order in (None, "logical", "permuted"):
         with pytest.raises(TypeError, match=_retired_prefix("PagedDecodeWrapper.run")):

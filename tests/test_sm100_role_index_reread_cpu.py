@@ -2,21 +2,20 @@
 """The Blackwell kernel's persistent item loop chooses every warp role from one fresh read.
 
 WHY. In a persistent build each CTA loops over work items, and at the top of each item every
-warp picks its role by comparing its warp index with the role's warp number
-(`docs/kernel/int_fold_decode.md`, "The warp role is re-read for every work item"). Two rules
-hold in a persistent build of either storage width:
+warp picks its role by comparing its warp index with the role's warp number. Two rules hold
+in a persistent build of either storage width:
 
-- One fresh read of the thread index per item. When the warp index came from the kernel-entry
-  read and stayed live through the loop, ptxas sometimes kept it in a per-thread register,
-  compiled the role choice as a divergent branch, and made the MMA and TMA warps rebuild their
-  uniform operands on every instruction they issued. So the kernel reads %tid.x once at the top
-  of every item (`_tid_x_fresh`), masks it with 1023 (the largest thread index a CTA can have)
-  so that the compiler knows it is not negative and the divisions are shifts, and derives the
-  item's warp index and warpgroup index from that one read.
+- One fresh read of the thread index per item. When the warp index comes from the kernel-entry
+  read and stays live through the loop, ptxas can keep it in a per-thread register, compile the
+  role choice as a divergent branch, and make the MMA and TMA warps rebuild their uniform
+  operands on every instruction they issue. So the kernel reads %tid.x once at the top of every
+  item (`_tid_x_fresh`), masks it with 1023 (the largest thread index a CTA can have) so that
+  the compiler knows it is not negative and the divisions are shifts, and derives the item's
+  warp index and warpgroup index from that one read.
 - One opaque copy per warp check of the role dispatch. Compared on one per-item value, the four
-  warp checks of the dispatch lost their source order (the PTX tested the MMA-KQ and TMA-VO
-  warp numbers first), and ptxas placed those two bodies after the dequant loops, which moved
-  every hot loop and made INT2 1 to 2% slower. So each of those four checks compares its own
+  warp checks of the dispatch lose their source order (the PTX tests the MMA-KQ and TMA-VO warp
+  numbers first), and ptxas can place those two bodies after the dequant loops, which moves
+  every hot loop and makes INT2 1 to 2% slower. So each of those four checks compares its own
   copy of the warp index, made by `_opaque_i32`, a side-effecting `mov` the compiler can
   neither merge with another copy nor see through.
 
@@ -38,7 +37,7 @@ THE RULE, read from the source (the modules import the DSL, so they are parsed, 
   example, therefore exposes its other arm.
 - The item's role indices and the copy function are assigned under exactly
   `if cutlass.const_expr(persistent)`; the other arm assigns the indices from the entry values
-  and the copy function as the identity, so a non-persistent build compiles as before. In a
+  and the copy function as the identity, so a non-persistent build compiles unchanged. In a
   persistent build the loop calls `_tid_x_fresh` exactly once, and each name in `PER_ITEM` is
   bound exactly once in the loop, by exactly its expression there. So a second fresh read, a
   later overwrite, an unmasked read and an expression that mixes in an entry value all fail.
@@ -61,8 +60,8 @@ THE RULE, read from the source (the modules import the DSL, so they are parsed, 
 WHAT IT DOES NOT COVER, because the kernel does not do it. Two warp positions still come from
 the kernel-entry read in a persistent build: the warp's place in its warpgroup
 (`warpgroup_widx`), which the softmax and correction roles receive, and the warp index the
-persistent epilogue compares after the loop. Re-reading those too was measured on 2026-10-01
-and not adopted, because it made some persistent INT4 builds slower. Thread positions (`tidx`,
+persistent epilogue compares after the loop. Re-reading those too makes some persistent INT4
+builds slower, so the kernel keeps the kernel-entry reads there. Thread positions (`tidx`,
 `lane_idx`, `warpgroup_tidx`) are per-thread values and keep their kernel-entry reads.
 
 The last test applies mutations to the sources in memory and requires the rule to reject each
@@ -320,7 +319,7 @@ def check_rule(src):
     loop = fn.body[_item_loop(fn)]
     entry = entry_role_indices(fn)
     assert {"warp_idx", "warpgroup_idx"} <= entry, entry
-    # The guard the rule keys on means what the kernel was built as: `persistent` is bound once in
+    # The guard the rule keys on means what the kernel is built as: `persistent` is bound once in
     # `kernel`, to the constructor's flag, with no condition on the width.
     cls = _class(src)
     sets = [n for n in ast.walk(cls) if isinstance(n, ast.Assign)

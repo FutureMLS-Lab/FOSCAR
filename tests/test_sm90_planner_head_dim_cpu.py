@@ -1,12 +1,10 @@
 # Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
-"""The SM90 split planner takes the head dimension, and plans D=128 exactly as before.
+"""The SM90 split planner takes the head dimension, and its D=128 decisions are pinned exactly.
 
 `PINGPONG_MODEL` is keyed by head dimension, and `plan_splits` and `plan_pingpong` require
 `head_dim` from every caller, so no caller can plan another head dimension as if it were 128.
-What must not move is every D=128 decision, so this file holds the decision table over
-B in {1, 2, 8, 32, 64, 128}, KV in {4096, 8192, 16384, 32768}, both widths, 8 KV heads and
-132 SMs as a literal. The literal was generated from main 0dc8be4, whose `plan_splits` took no
-head dimension; the command is in `profile/h100_planb_prb_20261001/PROVENANCE.md`.
+Every D=128 decision is held as a literal table over B in {1, 2, 8, 32, 64, 128}, KV in
+{4096, 8192, 16384, 32768}, both widths, 8 KV heads and 132 SMs.
 
 `scheduler.py` imports nothing but `math`, so it is loaded from its file and needs no DSL.
 `pingpong_runtime.py` imports torch at module level, so `plan_pingpong` is checked on its
@@ -35,19 +33,17 @@ DECISIONS_D128 = {
         "1/2 1/2 1/2 1/2", "1/2 1/2 1/2 1/2", "1/2 1/2 1/2 1/2"),
 }
 
-#: This is the one entry at main 0dc8be4, `src/cutedsl_decode/_sm90/scheduler.py:81-84`.
+#: The D=128 model entry, one cost per term.
 PINGPONG_MODEL_D128 = {"T_us": {2: 0.358, 4: 0.420},
                        "P_us": 5.867, "combine_us": 10.315, "K_us": 0.08}
 
-#: The landed 256 entry: the constants `fit_sm90_planner.py --head-dim 256 --fit --emit` printed
-#: on data/h100_planner_d256_20261003.long.csv
-#: (`profile/h100_planb_prd_20261002/planner/fit_A.txt`).
+#: The D=256 model entry, one cost per term.
 PINGPONG_MODEL_D256 = {"T_us": {2: 0.85, 4: 0.15},
                        "P_us": 0.0, "combine_us": 0.0, "K_us": 0.05}
 
-#: The D=256 decisions of the landed 256 entry, in the format of DECISIONS_D128, generated from
-#: that entry with this file's `_cell` over the same shapes. They differ from the legacy one-wave
-#: rule's (the absent-entry test below) at B=1 from KV=16384 at both widths and at B=2 at INT4.
+#: The D=256 decisions of that entry, in the format of DECISIONS_D128, computed with this
+#: file's `_cell` over the same shapes. They differ from the one-wave rule's picks (the
+#: absent-entry test below) at B=1 from KV=16384 at both widths and at B=2 at INT4.
 DECISIONS_D256 = {
     2: ("8/2/F 16/2/F 16/2/F 32/2/F", "8/2/F 16/2/F 16/2/F 16/2/F", "4/2 4/2 4/2 4/2",
         "1/2 1/2 1/2 1/2", "1/2 1/2 1/2 1/2", "1/2 1/2 1/2 1/2"),
@@ -119,9 +115,7 @@ def test_plan_pingpong_requires_the_head_dimension_and_forwards_it():
 def test_a_head_dimension_without_an_entry_plans_by_the_legacy_rule(sch, bits, monkeypatch):
     """With the 256 entry removed, the planner returns the one-wave rule's pick: on 132 SMs
     at two CTAs per SM that is max(1, min(264 // (8B), tiles, KV // 512)), which is one split
-    from B=32 up. This includes the 32 and 33 splits at B=1 that the D=128 model replaced
-    with 16. These are the picks the planner cells of the D=256 fit's ladder time, because that
-    ladder runs with no entry."""
+    from B=32 up, and 32 or 33 splits at B=1."""
     monkeypatch.delitem(sch.PINGPONG_MODEL, 256)
     legacy = {1: (8, 16, 32, 33), 2: (8, 16, 16, 16), 8: (4, 4, 4, 4),
               32: (1, 1, 1, 1), 64: (1, 1, 1, 1), 128: (1, 1, 1, 1)}

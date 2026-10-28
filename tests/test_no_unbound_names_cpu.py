@@ -1,15 +1,13 @@
 # Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
 """No function uses a name that nothing in scope binds.
 
-WHY THIS EXISTS. `baselines/adapters/ours.py` called `k_pool_perm` in a method
-whose only import of it lived in a DIFFERENT method, so `reference()` raised
-`NameError` on every call and took `validate.py`'s ours column and the split
-parity gate with it. That shipped in 820fb5f and survived a review. The same
-mistake was then made twice more while repairing it, once for `LEGACY` and once
-for `k_pool_perm` again in `accuracy_gate.py`, where it cost a GPU run to find.
+WHY THIS EXISTS. A name can be imported in one method and used in another, so the
+second raises `NameError` on every call while the first looks correct. A helper
+imported into the wrong function takes down the whole column that calls it, and it
+costs a GPU run to find because nothing fails until the line executes.
 
 The shape is specific to this repository and that is why a general linter has not
-been enough: `scripts/` and `baselines/` deliberately import the heavy modules
+been enough: modules here deliberately import the heavy dependencies
 (`_fold_harness`, `repack_sm100`, anything reaching cutlass) INSIDE the functions
 that need them, so that a CPU box can still import the file. Function-local
 imports are therefore normal here, and a name imported in one function is exactly
@@ -18,22 +16,20 @@ the kind of thing that looks bound when it is not.
 `python -m py_compile` cannot see this: an unbound load is legal Python until it
 runs. Nothing else in the suite covers it, because the failing paths need a GPU.
 
-THE SCOPE MODEL IS LEXICAL, AND IT HAS TO BE. An earlier revision collected
-bindings with `ast.walk`, which descends through every nested scope, and codex
-demonstrated the two holes that opens: a load satisfied only by a CLASS ATTRIBUTE
-was treated as bound, though a function body cannot see a class namespace, and so
-was a load satisfied only by a SIBLING nested function's import. Both are
-`NameError` at runtime and both passed. Bindings are therefore collected per
-scope, stopping at each nested function, lambda and class, and a scope's visible
-set is builtins, the module scope, its enclosing FUNCTION scopes, and its own.
+THE SCOPE MODEL IS LEXICAL, AND IT HAS TO BE. Collecting bindings with `ast.walk`
+descends through every nested scope and opens two holes: a load satisfied only by
+a CLASS ATTRIBUTE is treated as bound, though a function body cannot see a class
+namespace, and so is a load satisfied only by a SIBLING nested function's import.
+Both are `NameError` at runtime. Bindings are therefore collected per scope,
+stopping at each nested function, lambda and class, and a scope's visible set is
+builtins, the module scope, its enclosing FUNCTION scopes, and its own.
 
 WHAT IT DOES NOT CATCH, so nobody reads more into a pass. It resolves names, not
 values, and it is conservative on purpose: any name bound anywhere in the same
 scope counts, so a use before its assignment passes, and a conditional import
 inside `try` counts as bound. A file containing `import *` is skipped entirely,
 because what that binds is not knowable from the source. Attribute access is not
-checked. It exists to catch "imported over there, used over here", which is the
-mistake that has actually been made here.
+checked. It exists to catch "imported over there, used over here".
 """
 from __future__ import annotations
 
@@ -51,7 +47,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 #: a reader to ignore this gate. `_vendor/flash_attn/cute/utils.py` legitimately
 #: trips it: `ex2_emulation_2` reads `quack` under an import upstream makes
 #: conditional.
-VENDORED = ("src/cutedsl_decode/_vendor/", "baselines/vendor/")
+VENDORED = ("src/cutedsl_decode/_vendor/",)
 
 #: Anything that opens a new namespace. Bindings do not cross these.
 SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
@@ -84,12 +80,9 @@ def _own_nodes(scope: ast.AST):
     is written: a `def` binds its name, and decorators, argument defaults and base
     classes all run in the enclosing scope. A header part that is ITSELF a scope,
     such as a lambda used as an argument default, is yielded and not entered:
-    entering it charged the enclosing function for the lambda's own parameters,
-    which reported four false positives in the `gqa_decode_sm90_quant*.py` snapshots
-    under `183286a:solution/`, where
-    `index_transform=lambda index_q, index_k: (index_q, index_k)` is a default. The
-    visitor below picks that lambda up as a scope of its own, and the "lambda as an
-    argument default" case below holds it there.
+    entering it would charge the enclosing function for the lambda's own
+    parameters. The visitor below picks that lambda up as a scope of its own, and
+    the "lambda as an argument default" case below holds it there.
     """
     for child in ast.iter_child_nodes(scope):
         yield child
@@ -196,12 +189,11 @@ def test_no_function_loads_a_name_nothing_binds():
     # The shape this file exists for: imported in one function, used in another.
     ("siblings at module level",
      "def a():\n    from m import f\n\ndef b():\n    return f()\n", True),
-    # The same one level down. Missed by the `ast.walk` version, because a
-    # sibling's import counted as bound.
+    # The same one level down: a sibling's import must not count as bound.
     ("siblings nested",
      "def outer():\n    def a():\n        from m import g\n"
      "    def b():\n        return g()\n    return b\n", True),
-    # A class attribute is not visible to a function body. Also missed before.
+    # A class attribute is not visible to a function body.
     ("class attribute",
      "class C:\n    hidden = 1\ndef f():\n    return hidden\n", True),
     # Nor to a method of that same class.
@@ -214,7 +206,7 @@ def test_no_function_loads_a_name_nothing_binds():
      "def a():\n    from m import f\n    def b():\n        return f()\n"
      "    return b\n", False),
     # A star import makes the module's bindings unknowable, so the file is
-    # skipped. Reporting `sqrt` here was a false positive.
+    # skipped, and `sqrt` must not be reported.
     ("star import", "from math import *\ndef f():\n    return sqrt(4)\n", False),
     ("lambda arg", "def a():\n    return lambda x: x + 1\n", False),
     ("lambda as an argument default",

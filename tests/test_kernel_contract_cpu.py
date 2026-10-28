@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """CPU gates for the constructor contract the two decode kernels share.
 
-`kernel_contract.py` exists because the same argument name meant different things across
-the two kernels. `sdtype` is the case that actually bit: SM100 asserted
-`sdtype in ("f32", "bf16")` and SM90 asserted `sdtype in (torch.float32,
-torch.bfloat16)`, so one configuration could not be handed to both, and a caller had to
-know which kernel it was talking to before it could name a scale dtype. `page_size == 64`
-and `bits in (2, 4)` were each asserted twice with different messages, which is the
-same defect one step quieter: two copies free to drift, as `quant_block_offsets` did
-before #67 pulled it into one file.
+`kernel_contract.py` exists because the same argument name can mean different things
+across the two kernels. `sdtype` is the case that matters: SM100 asserts
+`sdtype in ("f32", "bf16")` and SM90 asserts `sdtype in (torch.float32,
+torch.bfloat16)`, so one configuration cannot be handed to both, and a caller has to
+know which kernel it is talking to before it can name a dtype. `page_size == 64` and
+`bits in (2, 4)` asserted in both constructors with different messages is the same
+defect one step quieter: two copies free to drift. The contract keeps each shared rule
+in one file.
 
 These gates need no GPU, because the contract is host-side by construction: nothing here
 is traced and nothing here touches kernel state.
@@ -51,7 +51,7 @@ def test_string_spellings_pass_through(spelling, want):
 
 
 def test_torch_spellings_are_accepted():
-    """The half that used to be an AssertionError on SM100."""
+    """The torch spellings normalize alongside the string ones."""
     torch = pytest.importorskip("torch")
     n = _contract().normalize_sdtype
     assert n(torch.float32) == "f32"
@@ -60,7 +60,7 @@ def test_torch_spellings_are_accepted():
 
 @pytest.mark.parametrize("bad", ["f16", "float32", 32, None, ()])
 def test_unknown_sdtype_is_refused_by_name(bad):
-    """And the message names what it got, which `assert sdtype in (...)` did not."""
+    """The message names the value it got, not only that the value was refused."""
     with pytest.raises(AssertionError) as e:
         _contract().normalize_sdtype(bad)
     assert repr(bad) in str(e.value)
@@ -69,7 +69,7 @@ def test_unknown_sdtype_is_refused_by_name(bad):
 def test_sdtype_is_not_folded_into_the_shape_check():
     """SM100 passes `sdtype=None` meaning "resolve it from the K axis", and that
     resolution needs quant fields the shape check runs before. Folding the two together
-    rejected None on 77 of 115 anchor cells."""
+    rejects None, so the shape check must leave sdtype out."""
     import inspect
     sig = inspect.signature(_contract().GQAPagedDecode._validate_shape)
     assert "sdtype" not in sig.parameters, (
@@ -80,9 +80,9 @@ def test_sdtype_is_not_folded_into_the_shape_check():
 def test_the_shared_shape_rules_hold():
     _contract().validate_problem(page_size=64, head_dim=128, q_head_tile=8, bits=2)
     # 256 rather than 64: the shared floor is a multiple of 128, because SM90 builds
-    # 128 and 256 only and SM100 tiles D at 128 with no partial-tile masking. This line
-    # pinned head_dim=64 until 2026-09-04, which was pinning a value that reached the
-    # SM90 epilogue and wrote past its own row.
+    # 128 and 256 only and SM100 tiles D at 128 with no partial-tile masking. A
+    # head_dim of 64 reaches the SM90 epilogue and writes past its own row, so the
+    # floor refuses it.
     _contract().validate_problem(page_size=64, head_dim=256, q_head_tile=1, bits=4)
 
 
@@ -102,10 +102,9 @@ def test_each_shared_rule_refuses_its_own_violation(kw, needle):
 def test_the_gqa_bound_is_not_claimed_as_shared():
     """It is SM90's rule and belongs in SM90.
 
-    A draft of the contract asserted `heads_per_kv <= q_head_tile` for both kernels.
     SM100's own constructor docstring says the opposite in as many words: it launches
     `ceil_div(q_heads // kv_heads, q_head_tile)` head tiles per KV head, so a larger
-    ratio is SPREAD over threadblocks rather than refused. (codex)
+    ratio is SPREAD over threadblocks rather than refused.
     """
     src = (_SRC / "cutedsl_decode" / "kernel_contract.py").read_text()
     assert "check_heads_per_kv" not in src, (
@@ -117,8 +116,8 @@ def test_the_gqa_bound_is_not_claimed_as_shared():
 
 @pytest.mark.parametrize("spoof", ["torch.float32", "torch.bfloat16"])
 def test_a_string_that_merely_looks_like_a_torch_dtype_is_refused(spoof):
-    """Matching on `str(x)` alone accepted the literal string and any object that
-    spelled itself that way. The type is checked first now. (codex)"""
+    """The type is checked before `str(x)`, so neither the literal string nor an
+    object that spells itself as a torch dtype is accepted."""
     with pytest.raises(AssertionError):
         _contract().normalize_sdtype(spoof)
 
@@ -135,7 +134,7 @@ def test_both_kernels_declare_the_contract_as_their_base():
     """Read from the SOURCE, so this holds without importing cutlass.
 
     A kernel that stops inheriting it keeps compiling and silently stops sharing the
-    vocabulary, which is the state this file was written to end.
+    vocabulary, which this gate refuses.
     """
     import ast
     for rel, cls in (("_sm100/int_fold_decode.py", "IntDecodeSm100"),
@@ -169,7 +168,6 @@ def test_each_constructor_actually_calls_the_shared_check(rel, cls):
     This is an AST check rather than a substring one, so reformatting cannot make it
     pass. It still does not prove the call SUCCEEDS -- only constructing the kernel does
     that, which needs cutlass and a GPU, and the hardware gate is where it happens.
-    (codex)
     """
     import ast
     _tree, init = _init_of(rel, cls)
@@ -180,7 +178,7 @@ def test_each_constructor_actually_calls_the_shared_check(rel, cls):
     assert calls, f"{cls}.__init__ must call self._validate_shape(...)"
     # AND IT MUST PASS THE CONSTRUCTOR'S OWN ARGUMENTS. Checking only that the call
     # exists would accept `self._validate_shape(page_size, head_dim, q_head_tile, 4)`,
-    # which validates a literal and lets the kernels drift on `bits`. (codex)
+    # which validates a literal and lets the kernels drift on `bits`.
     want = ["page_size", "head_dim", "q_head_tile", "bits"]
     passed = [ast.unparse(a) for a in calls[0].args]
     assert passed == want, (
@@ -192,20 +190,19 @@ def test_each_constructor_actually_calls_the_shared_check(rel, cls):
     ("_sm90/int_decode_pingpong.py", "IntPingPongDecodeSm90"),
 ])
 def test_every_name_a_constructor_reads_is_bound_before_it(rel, cls):
-    """The CRITICAL defect this file did not catch the first time.
+    """The CRITICAL defect a substring check misses.
 
-    SM90 called `normalize_sdtype` one line ABOVE its own function-local import, which
-    makes the name a local and raises UnboundLocalError on every construction. A
-    substring test saw the call and the import and was satisfied. This walks the
-    constructor in order instead: a name that is imported locally must not be read
-    before that import runs. (codex)
+    A function-local import makes the name local for the whole function, so a read
+    above that import raises UnboundLocalError on every construction. A substring test
+    sees the call and the import and is satisfied. This walks the constructor in order
+    instead: a name that is imported locally must not be read before that import runs.
     """
     import ast
     _tree, init = _init_of(rel, cls)
     local_imports = {}
     # TOP-LEVEL statements of the function body only. An import nested inside an `if`
     # or a loop may not run at all, so a line-number comparison against it proves
-    # nothing -- `if False: from x import y` would satisfy it. (codex)
+    # nothing -- `if False: from x import y` would satisfy it.
     for st in init.body:
         if isinstance(st, (ast.Import, ast.ImportFrom)):
             for a in st.names:
@@ -248,11 +245,11 @@ def test_the_sdtype_validity_rule_is_not_claimed_as_shared():
 
 
 def test_neither_kernel_still_asserts_the_shared_rules_itself():
-    """The duplicates this file replaced must not grow back.
+    """The shared rules live in one place, and the kernels must not restate them.
 
-    Each of these was asserted in BOTH constructors, in different words. A kernel is
-    free to narrow a rule -- SM90 requires `q_head_tile == 8` and SM100 requires
-    `q_head_tile >= 4` in real mode -- but not to restate the shared one.
+    Each of these belongs in the contract only. A kernel is free to narrow a rule --
+    SM90 requires `q_head_tile == 8` and SM100 requires `q_head_tile >= 4` in real
+    mode -- but not to restate the shared one.
     """
     banned = {
         "_sm100/int_fold_decode.py": [

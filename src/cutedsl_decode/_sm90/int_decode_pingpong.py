@@ -3,17 +3,11 @@
 """PING-PONG int2/int4 quantized-KV GQA decode (SM90): two SYMMETRIC full-attention
 consumer warpgroups per CTA, i.e. an intra-CTA split-K.
 
-It replaced a functional QK->PV pipelined kernel for the batched-decode regime, and was
-faster there; that kernel was retired on 2026-09-30 and is in git at
-`2237269:src/cutedsl_decode/_sm90/int_decode.py`. In the pipelined kernel the QK->PV
-P-handoff is a DEPENDENCY rather than a capacity gap, so no work migration can fill PV's
-idle; here the dependency is deleted instead. Each consumer WG runs the COMPLETE chain
-(K-unpack -> gemm0 -> log2-domain online softmax -> P-tilde -> V-unpack -> gemm1
-O0/O1/lc) on its own tiles, and the two independent streams overlap on the SM's pipes
-free-running.
-
-Development record, including the measured comparison and the fold ablation numbers:
-docs/kernel/int_decode_pingpong_sm90.md.
+In a QK->PV pipelined kernel the QK->PV P-handoff is a DEPENDENCY rather than a capacity
+gap, so no work migration can fill PV's idle; here the dependency is deleted instead.
+Each consumer WG runs the COMPLETE chain (K-unpack -> gemm0 -> log2-domain online
+softmax -> P-tilde -> V-unpack -> gemm1 O0/O1/lc) on its own tiles, and the two
+independent streams overlap on the SM's pipes free-running.
 
 STRUCTURE (384 threads, one CTA per (kv-head, batch) x split-K partition)
 
@@ -51,8 +45,7 @@ sRunningMax[q, consumer_wg_idx] and rescales its own accumulators with a per-thr
 column to the same (thread, elem). Because every thread derives its own `corr`, every
 thread reads the old max before the softmax barrier after which warp 0 stores the new
 one; a read after it is a race (`_online_softmax`). Same-WG STS -> wgmma-descriptor needs
-`fence.proxy.async` plus one WG barrier (ids 2/3), since the cross-WG `_PRDY`
-release/acquire that used to cover this is gone.
+`fence.proxy.async` plus one WG barrier (ids 2/3).
 
 CTA-TAIL MERGE (log2-max domain)
 
@@ -80,8 +73,7 @@ warps), so a barrier between the fences and the publishing thread completes the 
       released after the last group's copy, each with its own fence and warp barrier; the
       sP fence runs in the first group and cannot cover the V reads that follow it.
       Without this ordering the refill may land before the reads, which then return the
-      next occupant's bytes; the SM100 scale ring failed exactly this way
-      (docs/kernel/int_fold_decode.md).
+      next occupant's bytes.
   STS, then a wgmma read: sP (fence, per-WG barrier), the channel-K Q' planes and pad
       rows (fence, RDY / qBar), and the token-K sQ staging (fence, qBar).
 
@@ -97,8 +89,8 @@ HEAD DIMENSION
 The kernel builds head_dim 128 and 256 (`quant_layout.SM90_HEAD_DIMS`), and the constructor
 chooses the body at trace time through `group_channels`, which every site that differs reads:
 
-  whole-D body (D=128, `group_channels` None): the code this kernel has always compiled. One
-      QK wgmma group reads a 32-word register A operand unpacked from the thread's whole K row,
+  whole-D body (D=128, `group_channels` None): one QK wgmma group reads a 32-word
+      register A operand unpacked from the thread's whole K row,
       two 64-channel accumulators hold the output, and one PV group covers both halves.
   grouped body (D=256, `group_channels` 128): both contractions run as D/128 groups of 128
       channels, each doing the whole-D body's work on its channels. A thread copies one
@@ -127,38 +119,34 @@ pool or the increment STALLS FOREVER. The shipped split is IO dealloc 32, consum
 alloc 104, so 32*128 + 104*256 = 30720 = EXACTLY 80*384, under the 85*384 2-CTA pool.
 `min_blocks_per_sm=2` is asserted.
 
-`scripts/_sass_census_sm90.py` checks that every configuration of the PTX fingerprint,
-`scripts/_ptx_fingerprint_sm90.py`, compiles within that split without spilling registers or
-serializing its wgmma chain. It compiles each of those configurations, reads the device image
-inside the object that `export_to_c` writes for it, and fails a configuration whose image has
-a nonzero `STACK` or `LOCAL` figure in `cuobjdump -res-usage`, any `STL` or `LDL`
-instruction, an `HGMMA` count other than the PTX's `wgmma.mma_async` count, or a
-`WARPGROUP.DEPBAR` count other than the PTX's `wgmma.wait_group` count at any immediate. The
-numbers it measures depend on the assembler the DSL vendors and can move with any change to
-device code, so they are recorded with their date and commit in
-docs/kernel/int_decode_pingpong_sm90.md.
+A SASS census checks that every configuration of the PTX fingerprint compiles within that
+split without spilling registers or serializing its wgmma chain. It compiles each
+configuration, reads the device image inside the object that `export_to_c` writes for it,
+and fails a configuration whose image has a nonzero `STACK` or `LOCAL` figure in
+`cuobjdump -res-usage`, any `STL` or `LDL` instruction, an `HGMMA` count other than the
+PTX's `wgmma.mma_async` count, or a `WARPGROUP.DEPBAR` count other than the PTX's
+`wgmma.wait_group` count at any immediate. The numbers it measures depend on the
+assembler the DSL vendors and can move with any change to device code.
 
 The fingerprint's rows include fourteen at head dimension 256, so the census holds the grouped
 body to the same split: each ring depth of the admitted layout at both widths, with the fused
 combine off and on and, at int2, the phase lock on and off, all at four query heads per kv head,
 and two int2 rows at eight and at two (the GQA ratio is sampled at 2, 4 and 8, as at D=128).
 All fourteen pass at 128-channel groups, with 72 `HGMMA` against 72 `wgmma.mma_async` and
-8 `WARPGROUP.DEPBAR` against 8 `wgmma.wait_group` (docs/kernel/int_decode_pingpong_sm90.md,
-"Head dimension 256").
+8 `WARPGROUP.DEPBAR` against 8 `wgmma.wait_group`.
 
-Two roles once spilled registers to local memory under that split. Neither spills in any
-configuration that the census and its compile matrix checked on 2026-09-28, which cover 1 to 5
-and 8 query heads per kv head but not 6 or 7. The channel-wise-K Q'-plane builder runs in the
-IO warpgroup, with 29 registers for values. It stores each plane element through one of at
-most four lane terms plus an immediate (`_plane_store_split`, which needs both planes aligned
-to the swizzle's period under channel-wise K), and it stages its query block once per CTA in
-`sBuildQ`. Its loop used to carry an address per store and the hoisted query or a query
-pointer. Each consumer has 101 registers for values. Under channel-wise V it reads the lc
-wgmma's constant operand as one register quad loaded from `sLcOnes` (`lc_ones_quad`), where
-ptxas used to hold a separate four-register copy of two values for each lc wgmma, and it reads
-each fragment's channel-wise V scales at static offsets from one address.
-docs/kernel/int_decode_pingpong_sm90.md, "Register spills in the channel-wise paths
-(2026-09-28)", records the measurements.
+Two roles spill registers to local memory under that split unless their loops are written
+as follows. Neither spills in any configuration that the census and its compile matrix
+check, which cover 1 to 5 and 8 query heads per kv head but not 6 or 7. The channel-wise-K
+Q'-plane builder runs in the IO warpgroup, with 29 registers for values. It stores each
+plane element through one of at most four lane terms plus an immediate
+(`_plane_store_split`, which needs both planes aligned to the swizzle's period under
+channel-wise K), and it stages its query block once per CTA in `sBuildQ`; its loop carries
+no address per store and no hoisted query pointer. Each consumer has 101 registers for
+values. Under channel-wise V it reads the lc wgmma's constant operand as one register quad
+loaded from `sLcOnes` (`lc_ones_quad`), rather than as two values that ptxas copies into a
+separate four-register set for each lc wgmma, and it reads each fragment's channel-wise V
+scales at static offsets from one address.
 
 CODEGEN
 
@@ -175,12 +163,10 @@ one, and ``phase_lock`` and ``int2_fast_mantissa_injection`` apply to int2 only.
 
 The sUnpackMagic register-resident unpack magic (1 LOP3 per pair), the log2-domain
 softmax (sm2 = sm*log2e, with the mLSE *ln2 fixup), and the prepare-phase affine
-s'/z'/sV' folding came verbatim from the pipelined kernel. The host contracts are
-documented where they are defined: ``__call__`` for the launch tensors and their TMA
-views, `serving_cache.py` for the pool layout and the code pool orders (this kernel
-reads the chunk16 order that `code_pool_order` names), and `scripts/probes/repack_rs.py`
-for the plane-word bytes. `scripts/probes/fold_numerics.py` gates the fold algebra and
-`scripts/probes/probe_rs_bf16.py` the register-operand wgmma.
+s'/z'/sV' folding are the mechanisms this kernel shares with the QK->PV pipelined
+kernel. The host contracts are documented where they are defined: ``__call__`` for the
+launch tensors and their TMA views, and `serving_cache.py` for the pool layout and the
+code pool orders (this kernel reads the chunk16 order that `code_pool_order` names).
 
 WGMMA REGISTER OPERANDS
 
@@ -188,19 +174,14 @@ Every wgmma reads registers that went through a `_wgmma_fence` after an ordinary
 last wrote them: the A words the unpack wrote, the lc wgmma's A operand, and the PV accumulators
 the max correction rescaled. The fence asm takes each of those registers as a tied in/out operand
 and the wgmmas read its outputs, so every such write precedes the fence in the PTX, as the PTX
-ISA's `wgmma.fence` requires. A fence without operands let LLVM place the unpack after it.
+ISA's `wgmma.fence` requires. A fence without operands leaves LLVM free to place the unpack after
+it.
 
 The PV chains fence per k-step: each step's A words just before its wgmmas, and the
 accumulators and the lc operand that every step reads at the first step, so a step's unpack need
 not precede the earlier steps' wgmmas. A QK chain fences per k-step in the leading consumer under
-the phase lock (`qk_fence_per_step`) and once per chain otherwise. That is the QK issue order the
-assembler built at D=128 with the fold for the operand-free fence, and of the four placements
-measured it is the one closest to the previous speed. Over the 50 timed D=128 cases it is faster
-than before in both run orders in one case and slower in one; one fence per chain is slower in 19,
-by up to 2.7%, one per QK chain in both consumers is slower in 12, INT2 with token-wise K and V by
-up to 1.9%, and per k-step in both consumers spilled at D=256 (docs/kernel/int_decode_pingpong_sm90.md,
-"wgmma register operands", which defines the percentages). A chain added later passes its own
-registers the same way.
+the phase lock (`qk_fence_per_step`) and once per chain otherwise; per k-step in both consumers
+spills at D=256. A new chain passes its own registers the same way.
 
 Under the per-tile restart (`pv_tile_restart`) the PV and lc sums of a tile start from zero, and
 a wgmma with scale-D 0 ignores its accumulator, so those chains pass only their A words. The lc
@@ -208,17 +189,15 @@ chain runs after the PV chain there and fences its A words per k-step, as the PV
 
 MODIFYING THIS KERNEL
 
-`scripts/_check_roles.py` lists the extraction hazards and runs a check for each; the
-first four compile and fail at trace time, and the fifth runs silently wrong.
-`int_fold_decode.py`'s module docstring states them. Any refactor must also pass
-`scripts/_anchor_pingpong_outputs.py`, which gates bit-identity over 33 configurations,
-because a tolerance gate passes a refactor that perturbs every low mantissa bit.
+Extracting a consumer phase has five hazards: the first four fail at trace time and the
+fifth runs silently wrong. Any refactor must also pass a bit-identity gate over the
+configuration matrix, because a tolerance gate passes a refactor that perturbs every low
+mantissa bit.
 
 NUMERICS
 
-The numerics gate is `scripts/test_pingpong_quant_flex.py`, which compares every
-quantization pair against an f64 attention reference. This kernel has no debug_s
-folded-S tap.
+The numerics gate compares every quantization pair against an f64 attention reference.
+This kernel has no debug_s folded-S tap.
 
 The H100 wgmma adds each 16-product step into its f32 accumulator by truncation, so a long
 chain of steps over terms of one sign loses accuracy in one direction. The fold with
@@ -232,15 +211,14 @@ FOLD ABLATION (`fold_scale_zero`)
 
 Default True is the production fold path. False dequantizes K/V to REAL bf16 in the
 unpack (magic-y then packed-bf16 fma; int2 prefolds beta into z'', while int4 must keep
-the exact HSUB2 because the bf16 z-128s cancellation is a documented 1.25e-1 failure, and
+the exact HSUB2 because the bf16 z-128s cancellation fails at 1.25e-1, and
 so does int2 under `int2_fast_mantissa_injection=False`, whose beta is int4's 128),
 prefolds sm2 into the K scales so the softmax pre-EX2 is a pure mask-select, reads
 per-token V (s,z) pairs BEFORE the K-stage release and carries them packed across
 softmax, and feeds the lc-gemm a ones-row so l = sum p and c = 0. On H100 at int2 with
 the token-128 pair, it is slower than the fold wherever the planner runs one split
 (B >= 32, fold 1.08-1.09x faster). It is faster at B=1, where the planner splits 16 ways
-with the fused combine (0.92-0.94x). See data/measured/h100_fold_ab_grid_20260907.csv in
-the paper repository, measured at a5312d5.
+with the fused combine (0.92-0.94x).
 """
 try:
     from cutedsl_profiling.annotate import annotate
@@ -282,19 +260,19 @@ _PLCK = 5   # phase-lock order-barrier pair (int2, phase_lock=True): A arrives 5
 # 5/6 = _PLCK pair (qk-mma issue alternation, one-tile skew, A leads; absent when the
 # `phase_lock` constructor flag is off, and at int4 where the pair is never compiled).
 # Channel-K adds 7/8 (plane-0 RDY, A/B), 9/10 (plane-0 FREE), 12/13 (plane-1 RDY), 14/15 (plane-1 FREE),
-# all count 160 = builder warp 32 + consumer WG 128.  Id 11 is FREE (was the builder gang's
-# internal bias barrier before per-warp plane ownership made the reduce warp-local).
+# all count 160 = builder warp 32 + consumer WG 128.  Id 11 is unused: per-warp plane
+# ownership makes the bias reduce warp-local.
 
 MAGIC4 = 0x43004300   # bf16x2 (128.0, 128.0); 0x4300|q == bf16(128+q) for q in [0,16)
 MASK4 = 0x000F000F    # isolate low 4 bits of each bf16 lane (int4 codes)
-# int2 LINEAR-MAGIC (probe-gated): bf16 lane = 1s+8e+7m; 0x4080 = 4.0 (e=129, m=0);
+# int2 LINEAR-MAGIC: bf16 lane = 1s+8e+7m; 0x4080 = 4.0 (e=129, m=0);
 # m = q<<5 = 32q  =>  y = 4·(1 + 32q/128) = 4 + q, EXACT in bf16.  After `word >> (2p)` the code
 # pair sits at bits 0-1/16-17 of the u32 plane word; << 5 lands it at bits 5-6/21-22 = mantissa
 # bits 5-6 of each bf16 lane (MASK2L selects exactly those; plane-word garbage dies in the mask).
 # Unpack = one shift and one LOP3 per operand word (ptxas merges `>> 2p` and `<< 5` into one net
 # shift), with no floating-point op; a raw-q feed would need a bf16x2 sub = HADD2.
-# Fold (fold_numerics): y = q + 4  =>  s' = s, z' = z − 4s.  The base-4 encoding (vs the
-# original base-2 y = q/2 + 2) makes alpha=1, so the two per-column ALPHA_INV multiplies in
+# Fold (fold_numerics): y = q + 4  =>  s' = s, z' = z − 4s.  The base-4 encoding (rather than a
+# base-2 y = q/2 + 2) makes alpha=1, so the two per-column ALPHA_INV multiplies in
 # QK-prepare vanish behind the const_expr guard — int2 joins int4's multiply-free affine path
 # with the SAME z' = z − 4s cancellation (s' = s amplifies strictly less than s' = 2s).
 # WHY THIS IS THE int2 DEFAULT (`int2_fast_mantissa_injection=True`): of the eight operand words
@@ -303,8 +281,8 @@ MASK4 = 0x000F000F    # isolate low 4 bits of each bf16 lane (int4 codes)
 # other five are SHF.R.U32.HI. Per code word that is 13 ALU-pipe unpack instructions (5 SHF +
 # 8 LOP3) and 3 on the FMA pipe, where the opt-in below needs 15 on the ALU pipe (7 SHF + 8 LOP3)
 # and none on the FMA pipe, and this kernel's unpack saturates the ALU pipe (inferred from these
-# counts and the timing, not from a pipe-utilization profile). On H100 (2026-10-06) the opt-in
-# measured 2.7% slower with the fold and 3.8% slower with the fold off; int4 is unchanged.
+# counts and the timing, not from a pipe-utilization profile). On H100 the opt-in is 2.7%
+# slower with the fold and 3.8% slower with the fold off; int4 is unchanged.
 MASK2L = 0x00600060
 MAGIC2L = 0x40804080  # bf16x2 (4.0, 4.0)
 # THE OPT-IN int2 FEED, y = 128 + q (`int2_fast_mantissa_injection=False`), int4's magic and
@@ -439,7 +417,7 @@ def _build_q_layout(heads_per_kv, head_dim):
     return (words, 32, quarters, 2), (1, words, 32 * words, 32 * words * quarters)
 
 
-# ---- inline-PTX wgmma mechanics (kept from the fp8 skeleton; bf16 RS asm lifted from probe_rs_bf16) ----
+# ---- inline-PTX wgmma mechanics ----
 @dsl_user_op
 def _fence_acq_rel_gpu(*, loc=None, ip=None):
     # gpu-scope memory fence: publishes this thread's prior global stores before the
@@ -455,10 +433,8 @@ def _wgmma_fence(*operands, loc=None, ip=None):
 
     The PTX ISA requires a `wgmma.fence` between an ordinary instruction's access to a register
     and a `wgmma.mma_async` that reads that register as its A operand or its accumulator. A fence
-    asm with no operands orders only memory and other side effects, so LLVM was free to place the
-    pure integer unpack that writes an A word, or the rescale of an accumulator, after it, and it
-    did: at 1,000 of the 2,040 wgmmas of the D=128 fingerprint rows
-    (profile/h100_planb_prc_20261001/PROVENANCE.md, "Register-operand order").
+    asm with no operands orders only memory and other side effects, so LLVM is free to place the
+    pure integer unpack that writes an A word, or the rescale of an accumulator, after it.
 
     So each element of each register tensor in `operands`, Int32 A words or Float32
     accumulators, is an output of the fence asm and an input tied to that output ("=r" or "=f",
@@ -470,7 +446,7 @@ def _wgmma_fence(*operands, loc=None, ip=None):
 
     The kernel passes, before the wgmmas that read them, the registers that ordinary
     instructions write (module docstring, WGMMA REGISTER OPERANDS). With no operands this is the
-    bare fence, which the RS probes use."""
+    bare fence."""
     regs = []
     for t in operands:
         if t.element_type is not Int32 and t.element_type is not Float32:
@@ -512,7 +488,7 @@ def _wgmma_n8k16_bf16(acc, a0, a1, a2, a3, smem_b_desc, scaleD: cutlass.Constexp
     # descriptor), acc = 4 f32 in/out.  The acc is passed through tied constraints, because MLIR
     # llvm.inline_asm has NO "+f": $0-3 = acc out, $4-7 = tied acc-in (alias $0-3), $8-11 = a0..3,
     # $12 = smem_b_desc.  scaleD is materialized as a predicate via setp (bf16 wgmma scale-d operand is a
-    # predicate); trailing imm = imm-trans-b (0 = B K-major as stored, validated by the probe gate).
+    # predicate); trailing imm = imm-trans-b (0 = B K-major as stored).
     accv = [Float32(acc[i]).ir_value(loc=loc, ip=ip) for i in range(4)]
     av = [Int32(x).ir_value(loc=loc, ip=ip) for x in (a0, a1, a2, a3)]
     constraints = ",".join(["=f"] * 4 + [str(i) for i in range(4)] + ["r"] * 4 + ["l"])
@@ -608,9 +584,8 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
     #: shared-memory read, one 16-byte load per chunk at 16t + 2048c, so every warp load
     #: covers 512 consecutive bytes. At D=128 that is one chunk at int2, where the order
     #: coincides with the row order, and two at int4 (K: channels 0-63 and 64-127; V: the
-    #: two output halves), where the 32-byte row pitch put two lanes of every 8-lane group
-    #: on the same four banks (8 wavefronts per load against an ideal of 4, measured with
-    #: ncu in profile/h100_chunk16_bankconf_20260925/).
+    #: two output halves), where the 32-byte row pitch would put two lanes of every 8-lane
+    #: group on the same four banks (8 wavefronts per load against an ideal of 4).
     #: Everything that depends on the order is derived from this attribute rather than
     #: restating it: the consumer's shared-memory view (`_code_ring_words`), the refusal
     #: in `__call__` of a pool whose shape is not this order's, the fake tensors of
@@ -625,9 +600,9 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                  *, heads_per_kv):
         # THE DEFAULT QUANTIZATION IS TOKEN-WISE OVER THE FULL HEAD DIMENSION, resolved here
         # and nowhere else: `compile_pingpong` passes None through, so the default has one
-        # spelling. A literal ("token", 128) default was the D=128 pair at every head
-        # dimension, so a kernel built at D=256 without a pair was refused instead of built in
-        # the one layout its grouped body implements.
+        # spelling. A literal ("token", 128) default is the D=128 pair at every head
+        # dimension, so a kernel built at D=256 without a pair would be refused instead of
+        # built in the one layout its grouped body implements.
         if k_quant is None:
             k_quant = ("token", head_dim)
         if v_quant is None:
@@ -645,12 +620,10 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         #                     (page-aligned; pages of one group carry duplicate scales).
         #                     K: IO builds sm2·s∘Q planes + z·Q bias, fold becomes an
         #                     FADD.  V: per-group accumulator drain + z·l term.
-        # ONE quantization envelope for both decode kernels, refused in ONE place.
-        # Scattering it across inline asserts is how the V granularity check came to
-        # admit token-64 while a second assert twenty-five lines below refused it, and
-        # a reader of only the first produced five RUN-FAIL cells on a pristine build.
-        # `validate_quant_flex` is where a reader looking for the envelope will find
-        # it; keep it there.
+        # ONE quantization envelope for both decode kernels, refused in ONE place:
+        # `validate_quant_flex`. Keep it there, because an inline assert elsewhere can admit
+        # a configuration the envelope refuses, and a reader of that assert alone then
+        # builds a configuration that fails at run time.
         # NORMALIZED FIRST, because the head-dimension envelope below and the token-64 check
         # after it compare it, and a caller passing the string spelling would otherwise fail
         # there rather than at the contract.
@@ -659,16 +632,13 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                                     validate_quant_flex)
         # TMA ring depth (correctness-neutral prefetch), resolved here, before the head-dimension
         # envelope below, which admits a depth.
-        #   D=128: the bit-aware default inherited from the stage sweep of the retired pipelined
-        #     kernel (2237269:src/cutedsl_decode/_sm90/int_decode.py, CONFIG), where int2 won at 4
-        #     (its small codes leave SMEM headroom, and A1's barrier-relief unlocked deeper
-        #     prefetch vs the mem-latency stall) and int4 at 2 (2x-larger codes + closer to
-        #     BW-bound).
+        #   D=128: the bit-aware default, 4 at int2 (its small codes leave SMEM headroom, and
+        #     deeper prefetch wins against the memory-latency stall) and 2 at int4 (2x-larger
+        #     codes and closer to bandwidth-bound).
         #   Any other admitted head dimension (256): 2 at both widths. At the planner's split, B in
-        #     {1, 8, 128} and KV in {8192, 16384}, 4 stages was slower than 2 at five shapes at int4
+        #     {1, 8, 128} and KV in {8192, 16384}, 4 stages is slower than 2 at five shapes at int4
         #     (0.9-4.7%) and three at int2 (0.4-3.5%), and faster at one at each width (1.1%, 1.3%),
-        #     so the rule, 4 only where it is faster somewhere and slower nowhere, keeps 2
-        #     (profile/h100_planb_prd_20261002/PROVENANCE.md).
+        #     so the rule, 4 only where it is faster somewhere and slower nowhere, keeps 2.
         if num_stages is None:
             num_stages = (4 if bits == 2 else 2) if head_dim == 128 else 2
         # THE HEAD-DIMENSION ENVELOPE, refused FIRST, before `validate_quant_flex` and every
@@ -691,15 +661,14 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                 raise ValueError(refusal)
         k_quant, v_quant = validate_quant_flex(k_quant, v_quant, page_size, head_dim)
         # THE BODY, CHOSEN BY THE HEAD DIMENSION AT TRACE TIME, and the one rule every site
-        # that differs reads. None selects the whole-D body, which is what D=128 has always
-        # compiled: one QK wgmma group over every k-step, two 64-channel output accumulators,
+        # that differs reads. None selects the whole-D body: one QK wgmma group over every
+        # k-step, two 64-channel output accumulators,
         # and one PV group over both halves. Any other admitted head dimension runs the
         # GROUPED body, which cuts the QK contraction and the PV contraction into groups of
         # this many channels, each group doing the whole-D body's work on its channels, so
         # the register A operands and the packed words a thread holds at one time stay at one
         # group's worth and only the D/16 f32 output accumulators grow with D. 128 at both
-        # widths: the SASS census of the launched D=256 binaries passes at 128
-        # (docs/kernel/int_decode_pingpong_sm90.md, "Head dimension 256").
+        # widths: the SASS census of the launched D=256 binaries passes at 128.
         self.group_channels = None if head_dim == 128 else 128
         self.k_axis, self.k_group = k_quant
         self.v_axis, self.v_group = v_quant
@@ -709,12 +678,12 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # heads_per_kv is TRACE-TIME: the GQA ratio does not change between launches,
         # so it is a constructor argument rather than a kernel operand. Do not add a
         # runtime route beside it: the same number arriving by two routes leaves the
-        # signature unable to say which one wins. `IntDecodeSm100` has never had a
+        # signature unable to say which one wins. `IntDecodeSm100` has no
         # runtime GQA ratio either.
         #
         # ONE EXEMPTION, and it is not an invitation to a second. `__call__` derives
         # `merge_head_limit_dyn` and the CTA-tail merge predicate reads it instead of
-        # this constant. That is a code-generation fix, measured, and it is clamped to
+        # this constant. That is a code-generation fix, and it is clamped to
         # this value so it cannot decide anything this constant would not have decided;
         # it is not a second route to the ratio and nothing may select against it.
         #
@@ -744,7 +713,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # constant-prefolded into the K scales), softmax is a pure mask-select + max-reduce,
         # P-tilde is raw p, and the lc-gemm degenerates to an l-row of ones (c = 0).
         # fused_combine (trace-time): compile the XQA-style in-kernel last-CTA split
-        # reduction (v2 tree form; see the epilogue block; scheduler.plan_fused_combine
+        # reduction (tree form; see the epilogue block; scheduler.plan_fused_combine
         # is the enable policy). Enable ONLY for multi-split plans: compiled into a
         # single-split kernel the block adds register pressure although its runtime
         # guard never fires.
@@ -753,24 +722,17 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # phase_lock (tuning flag, trace-time; int2 only): compile the order-barrier pair
         # that forces the two consumer warpgroups' QK-mma issue windows into strict
         # alternation with a one-tile skew. The barriers only order issue, so both
-        # settings must produce bit-identical output, and a two-arm pair of
-        # `baselines/bench_sweep.py` checks that (`compare_bench_sweeps.py --pair` marks
-        # `outputs_agree`) as well as timing the two arms.
+        # settings must produce bit-identical output, and an A/B pair over the two arms
+        # checks that as well as timing them.
         #
-        # At D=128 its effect on the shipped kernel is unmeasured: the last paired A/B there
-        # predates a5312d5, which changed the consumer loop bodies, and covered only the
-        # legacy token-128/token-128 pair. docs/kernel/int_decode_pingpong_sm90.md names the
-        # instrument to re-run it with; the old record is
-        # 3f7f180:docs/kernel/int_decode_pingpong_sm90.md:86-123. At D=256 it was compared at
-        # int2 and 2 stages, and it stays on there, because switching it off was slower at two
-        # shapes and faster at none (profile/h100_planb_prd_20261002/PROVENANCE.md).
+        # At D=128 its effect is unmeasured. At D=256 it stays on: switching it off is
+        # slower at two shapes and faster at none.
         self.phase_lock = bool(phase_lock)
         # WHETHER THE FLAG REACHES EMITTED CODE, exposed rather than left for a caller to
         # re-derive. The pair is compiled only at int2, so `phase_lock` is inert at int4 and
         # the two settings then compile the SAME kernel. An A/B that read only
         # `phase_lock` off the two objects would see them differ and time one kernel
-        # against itself, which is the "applied as a dead statement" failure this
-        # repository keeps paying for. The barrier guards below read this predicate, so
+        # against itself. The barrier guards below read this predicate, so
         # there is one rule and not two. Derived from the constructor's `bits`, which is
         # the value `self.bits` is assigned further down, and `_validate_shape` just
         # below rejects any width that is neither 2 nor 4.
@@ -780,12 +742,11 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # BETA_FOLD 4), the faster unpack on Hopper (the module comment above MASK2L says why).
         # False feeds y = 128 + q, int4's constant and offset (MAGIC4 with MASK2, BETA_FOLD 128),
         # and with the fold off it subtracts the magic exactly, as int4 does, where the default
-        # prefolds beta into the bf16 zero. False is kept by owner decision (2026-10-06) so that
-        # the 128 + q construction the paper presents exists in the kernel. On H100 it is 2.7%
+        # prefolds beta into the bf16 zero. False keeps the 128 + q construction available.
+        # On H100 it is 2.7%
         # slower with the fold and 3.8% slower with the fold off, and its fold error grows with
         # the tokens one split covers (9.15e-3 at B=2 over one 32768-token split, against about
-        # 2.5e-3 for the default; docs/kernel/int_decode_pingpong_sm90.md,
-        # "`int2_fast_mantissa_injection`"). Constructor-only, like `phase_lock` and
+        # 2.5e-3 for the default). Constructor-only, like `phase_lock` and
         # `fold_scale_zero`: `compile_pingpong` does not take it, so its default is spelled here
         # and nowhere else.
         self.int2_fast_mantissa_injection = bool(int2_fast_mantissa_injection)
@@ -798,7 +759,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # THE LC WGMMA'S ONES-ROW OPERAND AS ONE REGISTER QUAD, derived from the
         # configuration. On the fold path with channel-wise V the lc wgmma computes l alone,
         # and its A operand is a constant (`_lc_ones_layout`). Written as two values, each
-        # passed twice to every lc wgmma, it made ptxas hold a separate four-register copy of
+        # passed twice to every lc wgmma, it makes ptxas hold a separate four-register copy of
         # them for each of a tile's four lc wgmmas, all live with the PV wgmmas in flight: 16
         # registers for two values at the consumer's register peak. Loaded once per CTA from
         # `sLcOnes`, it is four distinct registers that all four read. The fold-off path keeps
@@ -809,41 +770,37 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # and the lc accumulator's c rows sum P~ * (z/s - beta); the output is (O + c) / l. On
         # V data centred near zero, such as the Gaussian cases measured, every c term is
         # negative and the output is the small difference of two sums each about 1,200 (int2)
-        # and 7,000 (int4) times its size (docs/kernel/int_decode_pingpong_sm90.md, "Fold
-        # accuracy with token-wise V"). The H100 wgmma adds a 16-product step into its f32
+        # and 7,000 (int4) times its size. The H100 wgmma adds a 16-product step into its f32
         # accumulator by truncation: it aligns the accumulator and the products on the largest,
         # keeps 26 bits and cuts the sum toward zero. A sum of terms of one sign carried
         # through the whole split therefore loses part of an accumulator ulp at every step,
         # always in the same direction, and the cancellation multiplies that loss (7.5e-2 at
-        # int2 over 32768 tokens in one split on the Gaussian case of
-        # baselines/check_sm90_split_parity.py, against a 5e-3 bar). So each tile's PV and lc
+        # int2 over 32768 tokens in one split on the Gaussian case, against a 5e-3 bar). So each tile's PV and lc
         # wgmmas start from zero (scale-d 0 on the tile's first step), and the tile's sums
         # join the running f32 totals in one rounded multiply-add that also applies the max
         # correction, total = total * corr + tile. The lc wgmma runs after the PV wgmmas have
         # retired, from an A operand loaded per tile, so that neither that operand nor the lc
-        # sums hold registers while the PV wgmmas are in flight (issued together, int4 and
-        # head dimension 256 spilled). Channel-wise V already restarts per V group, and the
+        # sums hold registers while the PV wgmmas are in flight (issued together, they spill
+        # at int4 and head dimension 256). Channel-wise V already restarts per V group, and the
         # fold-off path sums the dequantized values themselves, with no offset beta for a
         # second sum to cancel. The grouped body (`group_channels`) admits only this path,
         # and implements only the restart.
         self.pv_tile_restart = self.fold and self.v_axis == "token"
         assert self.group_channels is None or self.pv_tile_restart, \
             "the grouped body implements only the per-tile restart of the fold with token-wise V"
-        # The four shape arguments both kernels take, checked in ONE place. `bits` and
-        # `page_size` were asserted here with a different message from SM100's for the
-        # same rule, and `sdtype` was asserted against a DIFFERENT VOCABULARY: this
-        # kernel refused "bf16" and SM100 refused torch.bfloat16, so one configuration
-        # could not be handed to both. The head dimension was refused above, before this
-        # check asserts, because an assert is removed by `python -O`.
+        # The four shape arguments both kernels take, checked in ONE place, so that one
+        # configuration can be handed to both: a per-kernel assert gives the same rule two
+        # messages and can give `sdtype` two vocabularies. The head dimension is refused
+        # above, before these asserts, because an assert is removed by `python -O`.
         self._validate_shape(page_size, head_dim, q_head_tile, bits)
         # ...and then what only THIS kernel narrows.
         assert q_head_tile == 8, "inline RS wgmma is m64n8k16, so q_head_tile must be 8; the 16-wide legacy path was stripped"
         # PAGED-ONLY: the repacked N(=64)-token tile IS the page, and mPT[(b, gt)] indexes
-        # the GLOBAL page (NP) dim of the code and scale pools. There is no contiguous path;
-        # it was exactly an identity block table (block_table[b,gt]=base_b+gt).
+        # the GLOBAL page (NP) dim of the code and scale pools. There is no contiguous path,
+        # which would be an identity block table (block_table[b,gt]=base_b+gt).
         # `self.sdtype` STAYS A TORCH DTYPE, because that is what this kernel's tensor
         # construction wants, and changing it would be a body change rather than a
-        # contract one. What changed is the door: either spelling gets in.
+        # contract one. Either spelling gets in.
         self.sdtype = torch.float32 if sdtype_name == "f32" else torch.bfloat16
         self.sdtype_name = sdtype_name
         self.scale_element_type = Float32 if sdtype_name == "f32" else BF16   # CuTe element type of the scale pool
@@ -862,7 +819,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # alpha=1 for every feed: the ALPHA_INV multiplies in QK-prepare are const_expr-elided.
         self.ALPHA_INV = 1.0
         self.BETA_FOLD = 4.0 if self.int2_fast_mantissa_injection_active else 128.0
-        # repacked plane-word row sizes (bytes per warpgroup-thread row, see repack_rs.py), from
+        # repacked plane-word row sizes (bytes per warpgroup-thread row), from
         # the one pool geometry every writer uses (`serving_cache`, CODE POOL GEOMETRY):
         self.k_code_bytes_per_thread, self.v_code_bytes_per_thread = code_row_bytes(
             head_dim, page_size, bits)
@@ -952,8 +909,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         tiles (interleaved so both stream concurrently from the shared ring; each WG strides its
         pipeline state by 2 and releases only its own stages, so the producer machinery is
         untouched). Each WG runs against its own sP/sWarpMax/sLcFactors/sRunningMax plane
-        (= the old handoff slot dim, now the consumer_wg_idx dim; the skew-2 _PRDY/_PFREE
-        protocol and cross-WG sCorr are GONE --
+        (the handoff slot dim becomes the consumer_wg_idx dim;
         each WG rescales its own accumulators with per-thread corr registers).  At the CTA tail
         the two partial softmaxes merge in the log2-max domain: m = max(mA,mB), w_x =
         exp2(m_x - m) applied to O, l and c (B stashes to smem, A merges and writes out).
@@ -963,7 +919,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         planes / merge-role
         const_exprs stay immediates.  All state arrives as EXPLICIT parameters: the DSL bans
         closures capturing locals in dynamic control flow, but a plain @cute.jit call with
-        arguments traces fine (A/B-verified vs the hand-inlined form: byte-identical PTX,
+        arguments traces fine (byte-identical PTX to the hand-inlined form,
         int2 and int4)."""
         D, Nkv, PG, S = self.head_dim, self.page_size, self.q_head_tile, self.num_stages
         W = self.group_channels    # channels per wgmma group on the grouped body; None at D=128
@@ -1067,7 +1023,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         K_TOK64 = self.k_axis == "token" and self.k_group == D // 2   # per-token per-D-half (s,z)
         LEGACY_RING = self.qoff["legacy"]
         # flat ring index = BASE + token*STRIDE (+1 for z); trace-time constants (no closures
-        # in dynamic control flow — DSL 4.5.2 ban)
+        # in dynamic control flow)
         K_BASE = _KS if LEGACY_RING else (self.qoff["k_ring"] if self.qoff["k_ring"] is not None else 0)
         K_STR = 4 if LEGACY_RING or K_TOK64 else 2   # tok-64 ring row = (s_lo, z_lo, s_hi, z_hi)
         V_BASE = _VS if LEGACY_RING else (self.qoff["v_ring"] if self.qoff["v_ring"] is not None else 0)
@@ -1111,9 +1067,9 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                     # groups ahead, and consecutive groups sharing one id would accumulate
                     # arrivals across phases (partial release / phase slip).
                     # FREE for the previous group is arrived EARLY (right after that tile's
-                    # qk _wgmma_wait0, sBias hoisted to registers in prepare) — granting the
-                    # builder ~2 tile-slots of lookahead instead of zero; the late-FREE form
-                    # exposed the whole build chain on the consumer critical path.
+                    # qk _wgmma_wait0, sBias hoisted to registers in prepare), which grants the
+                    # builder ~2 tile-slots of lookahead; a late FREE puts the whole build chain
+                    # on the consumer critical path.
                     # RDY: plane built. One barrier whose id is computed (7 + WG for plane 0,
                     # 12 + WG for plane 1): written as two branch-selected barriers, NVVM 23
                     # predicates both, and the pair slows INT2 channel-wise K.
@@ -1311,14 +1267,12 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                     # V-DRAIN SCALE PREFETCH. On group-ending tiles the drain's 16 per-channel
                     # scale LDGs are issued here in PV-prepare, so they land under the V unpack
                     # and PV wgmma instead of forming a cold serial chain inside the drain.
-                    # Full record: git show 3f7f180:src/cutedsl_decode/_sm90/int_decode_pingpong.py (lines 744-746).
                     if v_group_ends:
-                        # REFUTED, do not re-propose: pointing BOTH WGs at one shared
-                        # page's duplicate scale copy, in group-start (cold) and
-                        # group-last (warm) variants, is slower on int2 V-ch128/256.
-                        # The int2 V-channel consumer is perturbation-sensitive at the
-                        # 104-register cap and the halved line traffic buys nothing
-                        # robust. Keep the per-WG group-ending page.
+                        # Both WGs read the per-WG group-ending page rather than one shared
+                        # page's duplicate scale copy: the shared form, in group-start (cold)
+                        # or group-last (warm) variants, is slower on int2 V-ch128/256,
+                        # because the int2 V-channel consumer is perturbation-sensitive at the
+                        # 104-register cap and the halved line traffic buys nothing robust.
                         v_page_pf = mPT[(Int64(batch_idx), global_tile_idx)]
                         # The page's scale rows, located once by its 64-bit page coordinate
                         # (64-BIT INDEXING, `kernel`), so the offsets inside them, bounded by
@@ -1326,9 +1280,9 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                         # (s and z of both 64-channel halves) are then read at static offsets
                         # from one address, the fragment's first scale, which the loads carry
                         # as immediates. Indexing the pool with page, kv head and channel at
-                        # once instead let consumer B's copy of this code give every load its
-                        # own 64-bit address and keep the kv-head term as a 64-bit value across
-                        # the tile loop, which spilled at the register cap at V-channel-64,
+                        # once instead gives consumer B's copy of this code every load its
+                        # own 64-bit address and keeps the kv-head term as a 64-bit value across
+                        # the tile loop, which spills at the register cap at V-channel-64,
                         # where every tile drains.
                         gVDrainPage = mScaleRaw[(Int64(v_page_pf), None, None)]
                         for j in cutlass.range_constexpr(accum_fragment_size):
@@ -1394,8 +1348,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                     # The same fence also orders every thread's V-code LDS above against the
                     # V warp's TMA refill, and the barrier orders all 128 fences before the
                     # lane-0 arrives, so the V release costs no fence of its own. A separate
-                    # fence at the LDS cost about 1-2% of decode time on H100 (exploratory
-                    # A/B, profile/h100_proxy_fence_20260924).
+                    # fence at the LDS costs about 1-2% of decode time on H100.
                     pipeline_v.consumer_release(consumer_state)
                 else:
                     # THE GROUPED PV CONTRACTION, prepared here and issued in pv-mma. Build group
@@ -1468,7 +1421,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                     if cutlass.const_expr(self.pv_tile_restart):
                         # THE LC WGMMA, after the PV wgmmas have retired, so that neither its A
                         # operand nor its sums are live while they are in flight (issued with
-                        # them, int4 spilled). One 16-byte load per step: lane t reads bytes
+                        # them, they spill at int4). One 16-byte load per step: lane t reads bytes
                         # [16t, 16t+16) of step kt's 128-byte row, its four A words in order. Only
                         # threads 0 to 7 load: A row r feeds only C row r, and the rows of l and c,
                         # which they hold and the epilogue reads, take exactly their factors; no
@@ -1545,7 +1498,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                                     rOutAccum[j, (W // 64) * g + hh] * rMaxCorrection[j] + rPvSum[j, hh]   # cols match: cS_pv[j][1] == cS_qk[j][1]
                     # THE LC WGMMA, after the PV groups have joined their totals, so that neither
                     # its A operand nor its sums are live while a group's PV wgmmas are in flight
-                    # (issued with group 0's, this body spilled). Every thread reads
+                    # (issued with group 0's, this body spills). Every thread reads
                     # row t % 8 of the strip with one 16-byte load per step; A row r feeds only C
                     # row r, so the rows of l and c, which threads 0 to 7 hold and the epilogue
                     # reads, take exactly their factors, and the copies in threads 8 to 127 fill
@@ -1694,13 +1647,12 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
             gQPlanes = mQ[(Int64(batch_idx), None, None)]
           # ===== Q'-plane builders (per-warp plane ownership; idle otherwise) =====
             # Warp 10 owns EVEN groups (plane 0), warp 11 ODD groups (plane 1): the two
-            # planes build CONCURRENTLY instead of serially through one 64-thread gang
-            # (transplanted from the B200 kernel: plane building is latency-shaped —
-            # load, cvt and STS chains — so halving the threads per plane costs little
-            # per-plane latency while doubling plane concurrency).  Each lane covers D/32
-            # channels (d = lane + 32·qtr) and the bias reduce is fully warp-local —
-            # the cross-warp sBiasPart round-trip and builder-internal barrier (old id
-            # 11) are gone.
+            # planes build CONCURRENTLY instead of serially through one 64-thread gang,
+            # because plane building is latency-shaped (load, cvt and STS chains), so
+            # halving the threads per plane costs little per-plane latency while doubling
+            # plane concurrency.  Each lane covers D/32
+            # channels (d = lane + 32·qtr) and the bias reduce is fully warp-local, with no
+            # cross-warp sBiasPart round-trip and no builder-internal barrier.
             # Per K token-group G: plane G%2 <- bf16(sm2·s_d·Q[h,d]) (the gemm0 B operand
             # absorbs scale AND sm2), sBias[h, G%2] <- sm2·Σ_d z_d·Q[h,d] − BETA·Σ_d
             # bf16(sm2·s_d·Q[h,d]) (the fold's whole bias, the second sum cancelling the
@@ -1776,10 +1728,10 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                 # (single-buffered: no snapshot registers), so the cold LDG chain — the
                 # builder's dominant serial cost per crossing — hides behind the bias
                 # butterfly + publish + the next FREE wait instead of sitting on the
-                # consumers' critical path.  Unconditional across Gt (the per-warp
-                # layout already pays the 2·D/32 prefetch registers; the old gang's Gt=256
-                # inline-LDG path is slower here, because a lane's cold chain doubles
-                # with per-warp ownership and nothing hides it).
+                # consumers' critical path.  Unconditional across Gt: the per-warp
+                # layout already pays the 2·D/32 prefetch registers, and a Gt=256
+                # inline-LDG pass is slower here, because a lane's cold chain doubles
+                # with per-warp ownership and nothing hides it.
                 # unconditional with a CLAMPED tile: a warp owning zero groups
                 # (single-group range) harmlessly reads in-range scales it never
                 # uses, and `pf_page`/`d0` stay defined outside any dynamic if
@@ -2131,7 +2083,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                 # `heads_per_kv`, and it must stay that way: see `__call__`, where the
                 # limit is built and clamped. The value has to be live across the tile
                 # loop above for the fix to hold, so deriving the same quantity here
-                # instead does not work -- measured, the loop bodies go back to 425/417.
+                # instead does not work; the loop bodies go back to 425/417.
                 if head_idx < merge_head_limit_dyn:
                     max_a = sRunningMax[(head_idx, 0)]; max_b = sRunningMax[(head_idx, 1)]
                     merged_max = cute.arch.fmax(max_a, max_b)
@@ -2181,14 +2133,13 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
             # TRACE-TIME GATED. Compiling this block into a single-split kernel
             # inflates WG-A's register allocation even though the runtime guard never
             # fires, so callers enable it exactly when the scheduler plans OUTER > 1.
-            # Full record: git show 3f7f180:src/cutedsl_decode/_sm90/int_decode_pingpong.py (lines 1372-1375).
             #
-            # v2 (tree form): v1's one-WG serial online merge ran one DEPENDENT L2
-            # round-trip per split and lost to the standalone combine at OUTER >= 32.
-            # Here BOTH consumer WGs split the q-heads (A: even, B: odd) and the
+            # Tree form: BOTH consumer WGs split the q-heads (A: even, B: odd) and the
             # merge is two flat passes — a global max over split LSEs, then
             # exp2-weighted sums into 4 independent partials — so the split loads
-            # have no serial correction chain and pipeline 4 wide.
+            # have no serial correction chain and pipeline 4 wide. A one-WG serial
+            # online merge instead runs one DEPENDENT L2 round-trip per split and loses
+            # to the standalone combine at OUTER >= 32.
             rAccP = cute.make_rmem_tensor(4, Float32)
             rWsP = cute.make_rmem_tensor(4, Float32)
             rLBlk = cute.make_rmem_tensor(16, Float32)
@@ -2290,8 +2241,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # rows (output channels 16-63 of each half) skip the rescale while the LSE, which
         # comes from warp 0's rows, stays exact. The previous tile's store is ordered
         # before this read by the PV-prepare barrier. Reading at entry rather than just
-        # before the barrier lets the max reduction hide the load; the measurements are
-        # in docs/kernel/int_decode_pingpong_sm90.md ("Running-max race").
+        # before the barrier lets the max reduction hide the load.
         for j in cutlass.range_constexpr(4):
             _, nj_m = tQkCoord[j]
             rOldMax[j] = sRunningMax[(nj_m, consumer_wg_idx)]
@@ -2416,8 +2366,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # Three of the five OUTPUTS below are bound only under a `const_expr` guard,
         # so the `return` would raise UnboundLocalError on every other configuration.
         # Returning a value is a use like any other: the name has to exist on every
-        # path. The guards, which an earlier version of this comment got wrong in both
-        # cases: `tQkB1` is bound under `K_CH`, the channel-K
+        # path. The guards are: `tQkB1` is bound under `K_CH`, the channel-K
         # Q'-plane arm, and `sV2`/`zV2` are bound under NOT `self.fold`, the fold-off
         # dequant ablation. Naming the wrong guard here is how a later cleanup deletes
         # a pre-init that some configuration still needs.
@@ -2452,15 +2401,13 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                 if cutlass.const_expr(not V_CH):
                     rVScale[j] = sKvQuantParams[(V_BASE + mj_s * V_STR, consumer_state.index)].to(Float32)
                     rVZero[j] = sKvQuantParams[(V_BASE + mj_s * V_STR + 1, consumer_state.index)].to(Float32)
-            # NOTE: K stage NOT released yet — the V codes ride a separate pipeline but
-            # this WG's V wait happens later; release after the V-phase copy like PV did
-            # is wrong here (same stage index carries K for THIS tile) — release now:
-            # codes in rKCodeWords, scales in rmem -> stage fully consumed.
+            # The K stage is released HERE, not after the V-phase copy: the V codes ride a
+            # separate pipeline, so a V-phase release is wrong for K, whose stage this tile
+            # has fully consumed into rKCodeWords and rmem.
             # Codes and scale block are both TMA-refilled, so every thread fences its
             # generic-proxy reads above, and the warp barrier orders all 32 fences
             # before lane 0's arrive (CROSS-PROXY ORDERING). Deferring this release to
-            # the V release's existing fence instead measured about 10% slower at int4
-            # (exploratory A/B, profile/h100_proxy_fence_20260924), whose two stages
+            # the V release's existing fence costs about 10% at int4, whose two stages
             # leave each WG one K stage and no refill slack.
             # The grouped body still has later groups to read from this stage, so it releases
             # the stage after the last group's copy, in qk-mma, with the same three statements.
@@ -2537,7 +2484,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
             if cutlass.const_expr(self.int2_fast_mantissa_injection_active):
                 # int2-only beta prefold (drops the per-word HSUB2): z'' = (z-4s)*sm2;
                 # |z-4s| ~ |z| keeps bf16(z'') error in the ulp(v) class.  int4's
-                # z-128s cancellation is the documented 1.25e-1 failure -> keeps sub, and
+                # z-128s cancellation fails at 1.25e-1 -> keeps sub, and
                 # so does int2's 128 + q feed (`int2_fast_mantissa_injection=False`).
                 zk0 = (zk0 - Float32(4.0) * sr0) * softmax_scale_log2
                 zk1 = (zk1 - Float32(4.0) * sr1) * softmax_scale_log2
@@ -2631,10 +2578,10 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         cnt_index = Int64(batch_idx) * kv_head_count + kv_head_idx   # fused-combine split counter cell
         thread_idx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        # ONE head count, and it is trace-time. This used to be a marshalled `Int32`
-        # operand that an optional hint then overrode, so the same number could arrive
-        # by two routes; now the builder, the epilogue and the fused combine all read
-        # the same Python int and their compares and indexing constant-fold.
+        # ONE head count, and it is trace-time: the builder, the epilogue and the fused
+        # combine all read the same Python int, so their compares and indexing
+        # constant-fold. A marshalled `Int32` operand with an optional hint would let the
+        # same number arrive by two routes.
         heads_per_kv = self.heads_per_kv
         D, Nkv, PG, S = self.head_dim, self.page_size, self.q_head_tile, self.num_stages
         k_code_bytes_per_thread, v_code_bytes_per_thread = self.k_code_bytes_per_thread, self.v_code_bytes_per_thread    # repacked row bytes (per warpgroup thread)
@@ -2699,9 +2646,8 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # REGISTER-RESIDENT UNPACK MAGIC for the unpack's (a & MASK) | MAGIC. Two 32-bit
         # immediates cannot fuse into one LOP3 (there is one immediate slot), so MAGIC is
         # loaded through smem to make it opaque to constant folding, which lets ptxas fuse
-        # and(imm)+or(reg) into ONE LOP3 per pair. The inline-asm alternative halved the
-        # magic LOP3s but caused heavy rematerialization and LDL/STL spills and was far slower.
-        # Full record: git show 3f7f180:src/cutedsl_decode/_sm90/int_decode_pingpong.py (lines 1824-1831).
+        # and(imm)+or(reg) into ONE LOP3 per pair. The inline-asm alternative halves the
+        # magic LOP3s but causes heavy rematerialization and LDL/STL spills, and is far slower.
         sUnpackMagic = smem.allocate_tensor(Int32, cute.make_layout(1), byte_alignment=4)
         # Allocated LAST, and only where they are read, so that no buffer allocated before them
         # moves and a configuration that reads neither keeps its shared-memory map: the channel-K
@@ -2717,7 +2663,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
             lc_ones_shape, lc_ones_stride = _lc_ones_layout()
             sLcOnes = smem.allocate_tensor(Int32, cute.make_layout(lc_ones_shape, stride=lc_ones_stride), byte_alignment=16)
 
-        # TMA pipelines (fp8-crib mechanism): producer = elect-one TMA issue (arrive_and_expect_tx is
+        # TMA pipelines: producer = elect-one TMA issue (arrive_and_expect_tx is
         # elect_one inside the sync object), consumer = one warpgroup (lane 0 of each of its 4 warps
         # arrives on release). K stage barrier carries codes + the ONE interleaved paged scale block
         # (2 TMA ops, tx bytes accumulate: codes + N*4*sizeof(sdtype)); V stage carries codes only.
@@ -2749,9 +2695,9 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         if warp_idx >= 8:                       # ===== IO warpgroup (warps 8-11, thread_idx 256-383) =====
             if cutlass.const_expr(self._min_blocks == 2):
                 # pingpong: IO gives its registers to the merged consumers.  The split MUST
-                # sum to an EXACT multiple of 384 within the 2-CTA pool (setmaxnregs.inc
-                # stalls FOREVER if the CTA pool can't satisfy it — the r2b 24/72=56*384
-                # exactness was load-bearing): 32*128 + 104*256 = 30720 = 80*384 <= 85*384.
+                # sum to an EXACT multiple of 384 within the 2-CTA pool, because
+                # setmaxnregs.inc stalls FOREVER if the CTA pool cannot satisfy it:
+                # 32*128 + 104*256 = 30720 = 80*384 <= 85*384.
                 cute.arch.setmaxregister_decrease(32)
             io_thread_idx = thread_idx - 256
             with annotate.range("load-Q"):
@@ -2847,7 +2793,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # SERVING-READINESS CONTRACT (paged-ONLY; serving_cache.ServingCache):
         # mQ: query tensor bf16 [B, HQ, D] — loaded by IO warps into sQ (swizzled, gemm0 B operand).
         # mKq/mVq: GLOBAL fragment-order code pools uint8 [NP, HKV, per/16, 128, 16] in the chunk16
-        #      order `code_pool_order` names (repack_rs.py order="chunk16"; NO batch dim).  A
+        #      order `code_pool_order` names (chunk16; NO batch dim).  A
         #      row-major [NP, HKV, 128, per] pool is refused.  dim 0 = NP physical pages;
         #      mPT[(b, gt)] is the GLOBAL page id (the 64-token tile IS the page).
         # mScale: ONE interleaved PAGED scale pool, sdtype [NP, HKV, N, 4]; last dim = (s_k,z_k,s_v,
@@ -2859,9 +2805,9 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # bmm1 = softmax scale (folded at use with the K fold), bmm2 = output scale.
         # The GQA ratio is NOT a launch argument: it is `heads_per_kv`, fixed at
         #      construction, and the constructor refuses a ratio above PG because the
-        #      m64n8 wgmma only produces PG head-columns.  It used to arrive here as
-        #      an operand, where nothing could check it and a larger ratio silently
-        #      dropped the heads at and above PG.
+        #      m64n8 wgmma only produces PG head-columns. A launch operand would arrive
+        #      where nothing could check it, and a larger ratio would silently drop the
+        #      heads at and above PG.
         D, Nkv, PG = self.head_dim, self.page_size, self.q_head_tile
         sQ_layout = sm90_utils.make_smem_layout(BF16, LayoutEnum.ROW_MAJOR, (PG, D))       # gemm0 B operand (descriptor-compatible)
         sP_layout = sm90_utils.make_smem_layout(BF16, LayoutEnum.ROW_MAJOR, (PG, Nkv), 2)  # gemm1 B operand (bf16)
@@ -2948,8 +2894,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # numerical one: folding that single compare against the constant costs the
         # uniform registers that hold the wgmma shared-memory descriptors, so ptxas
         # rebuilds the descriptor arithmetic inside both consumer warpgroup loops on
-        # every tile (PR #65, 425/417 SASS per body against 336/335). See the
-        # `heads_per_kv` section of docs/kernel/int_decode_pingpong_sm90.md.
+        # every tile (425/417 SASS per body against 336/335).
         #
         # CLAMPED TO THE CONSTANT, so it can never admit a head the constant would
         # have masked. The constructor takes `heads_per_kv` directly and nothing
@@ -2962,7 +2907,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # Built here rather than taken as an argument because `__call__` already has
         # both operands, so no caller signature changes and no thread divides on the
         # device. Every other use of the ratio keeps the trace-time constant, which is
-        # what specializes the Q'-plane builder. (2026-09-08)
+        # what specializes the Q'-plane builder.
         merge_head_limit_dyn = cutlass.min(Int32(mQ.shape[1]) // h_kv,
                                           Int32(self.heads_per_kv))
         self.kernel(mQ, tma_k_codes, tma_v_codes, tma_quant_params, _scale_raw_view(mScale), mPT, mSL, mOp, mOut, mLSE, mCnt,
