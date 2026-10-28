@@ -35,7 +35,6 @@ src/cutedsl_decode/
 │   ├── serving_cache.py        the pool contract and its host builders
 │   ├── int_append.py           fused quantize-and-append write path
 │   ├── splitk_combine.py       external split-K combine kernel
-│   └── warpmma_decode.py       configurable-granularity warp-MMA variant
 └── _sm100/
     ├── int_fold_decode.py      the Blackwell decode kernel
     ├── int_fold_asm.py         single-instruction inline-asm primitives
@@ -56,10 +55,6 @@ invisible to a search of the import list: `launch_reduction` reaches the kernel 
 class-qualified call, and `reduction_epilogue` reads `gmem_fmax` as a module global. Keep
 the module name, the class name and `gmem_fmax` as they are, because breaking either
 dependency fails at trace time rather than at import time, as a broken reduction launch.
-
-`_sm90/warpmma_decode.py` is not on the `PagedDecodeWrapper` path. It is a standalone
-warp-MMA kernel whose quantization axis and group size are configurable, and the wrapper
-imports nothing from it.
 
 ## Architecture dispatch
 
