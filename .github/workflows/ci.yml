@@ -6,6 +6,27 @@ on:
   pull_request:
 
 jobs:
+  provenance:
+    # The shipped source must not carry the private research record: no dates,
+    # commit hashes, review names, hostnames, absolute paths, or history.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No private provenance in the package
+        run: |
+          set -e
+          fail=0
+          check() { if git grep -nE "$1" -- src/ ; then echo "FAILED: $2"; fail=1; fi }
+          check '20[0-9]{2}-[0-9]{2}-[0-9]{2}'        "a date"
+          check '\b(codex|owner decision|CLAUDE\.md)' "a review or agent reference"
+          check 'the paper repository|the paper repo' "a paper reference"
+          check '/Users/|/home/|/scratch/'            "an absolute path"
+          check 'research-secure|ssr-b200'            "a hostname"
+          check '\bgit show [0-9a-f]{7}'              "a git-show pointer"
+          check 'docs/(kernel|superpowers)/'          "an internal docs path"
+          check 'baselines/|profile/|data/measured'   "an internal tree"
+          exit $fail
+
   cpu:
     runs-on: ubuntu-latest
     strategy:

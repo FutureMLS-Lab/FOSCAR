@@ -294,7 +294,7 @@ def test_every_fixed_d_kernel_carries_a_guard_in_source(module, name):
 # No head-dimension default on the Hopper host path
 # ---------------------------------------------------------------------------------------------
 
-#: Each entry is the (file under src/ or baselines/, qualified name) of a function on the
+#: Each entry is the (file under src/, qualified name) of a function on the
 #: Hopper host path whose head-dimension default was removed or resolved from the head
 #: dimension, and the list holds every such function.
 NO_HEAD_DIM_DEFAULT = (
@@ -306,8 +306,6 @@ NO_HEAD_DIM_DEFAULT = (
     ("src/cutedsl_decode/_sm90/splitk_combine.py", "SplitKCombine.__init__"),
     ("src/cutedsl_decode/_sm90/scheduler.py", "plan_splits"),
     ("src/cutedsl_decode/_sm90/scheduler.py", "_plan_pingpong_model"),
-    ("baselines/adapters/ours.py", "_storage_bits_per_element"),
-    ("baselines/adapters/ours.py", "OursSm90.__init__"),
 )
 
 
@@ -372,57 +370,6 @@ def test_the_hopper_default_pair_builds_the_d128_kernel(bits, fused_combine, fol
     implicit = cls(128, **common)
     explicit = cls(128, k_quant=("token", 128), v_quant=("token", 128), **common)
     assert kernel_cache.simple_attributes(implicit) == kernel_cache.simple_attributes(explicit)
-
-
-def _split_parity(monkeypatch):
-    """The split-parity script loaded by path with its interpreter re-exec disarmed and no
-    `CUTE_DSL_ARCH`, so `main()` returns at the first refusal it reaches."""
-    monkeypatch.setenv("BASELINES_ENV_APPLIED", "1")
-    monkeypatch.delenv("CUTE_DSL_ARCH", raising=False)
-    spec = importlib.util.spec_from_file_location(
-        "_split_parity_under_test", REPO / "baselines" / "check_sm90_split_parity.py")
-    parity = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(parity)
-    return parity
-
-
-@pytest.mark.parametrize("argv,refusal", [
-    (["--head-dim", "192"], "the SM90 kernel builds head_dim in (128, 256) only"),
-    (["--head-dim", "256", "--flex"], "--flex at --head-dim 256"),
-])
-def test_the_split_parity_script_refuses_before_the_device(monkeypatch, capsys, argv,
-                                                           refusal):
-    """A head dimension the kernel does not build, and `--flex` at 256, where no second layout
-    is admitted, are refused with status 2 before the architecture and device checks."""
-    import sys
-
-    parity = _split_parity(monkeypatch)
-    monkeypatch.setattr(sys, "argv", ["check", *argv])
-    assert parity.main() == 2
-    out = capsys.readouterr().out
-    assert refusal in out
-    assert "CUTE_DSL_ARCH" not in out, "the head dimension must be refused first"
-
-
-def test_the_split_parity_script_admits_256_up_to_the_architecture_check(monkeypatch,
-                                                                         capsys):
-    import sys
-
-    parity = _split_parity(monkeypatch)
-    monkeypatch.setattr(sys, "argv", ["check", "--head-dim", "256"])
-    assert parity.main() == 2
-    assert "CUTE_DSL_ARCH must be sm_90a" in capsys.readouterr().out
-
-
-def test_the_split_parity_rows_follow_the_head_dimension(monkeypatch):
-    parity = _split_parity(monkeypatch)
-    full = ("token", 256)
-    assert parity.configs_for(256, False) == [(full, full)]
-    assert parity.configs_for(128, False) == [parity.FLEX_CONFIGS[0]]
-    assert parity.configs_for(128, True) == list(parity.FLEX_CONFIGS)
-    assert parity.FLEX_CONFIGS[0] == (("token", 128), ("token", 128))
-    with pytest.raises(ValueError):
-        parity.configs_for(256, True)
 
 
 # ---------------------------------------------------------------------------------------------
