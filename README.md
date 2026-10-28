@@ -203,17 +203,21 @@ Which code produced each column:
 
 ```sh
 pytest -q            # CPU suite: no GPU and no CUDA toolkit required
-pytest -q -m gpu     # GPU tests, on an SM90 or SM100 device
+pytest -m gpu        # the pool builders, on the hardware their kernel runs on
 ```
 
 A test module whose name ends in `_cpu` must pass with no GPU. The CPU suite
 runs in about ten seconds.
 
 With a CUDA device and the CuTe DSL installed, the modules that need them run
-instead of skipping. On an H100 the SM90 path is exercised end to end: pools
-built by `pool_sm90`, then `plan()` and `run()`, scored against a
-storage-matched reference. The worst per-(batch, head) relative L2 is under
-3e-3 at both widths.
+instead of skipping. The GPU test builds pools with the builder this package
+ships for the running architecture, runs the decode kernel on them, and scores
+the output against a storage-matched reference, so the pool contract and the
+kernel are one gate.
+
+Both architectures were checked that way: an H100 for `pool_sm90`, a B200 for
+`pool`. The worst per-(batch, head) relative L2 is under 3e-3 at int2 and int4
+on both.
 
 ## Limitations
 

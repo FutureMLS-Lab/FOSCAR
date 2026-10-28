@@ -130,8 +130,9 @@ def dequant_pools(mKq, mVq, mScale, bits):
 
 def pack_rows_lut(codes, bits):
     """codes [..., R, E] (E % 16 == 0) -> uint8 [..., R, E*bits//8], LUT byte order.
-    Lifted VERBATIM (bit layout, not shape convention) from `probe_sm100_dequant.pack_lut` —
-    SASS/gate-validated, do not change without re-validating against the probe:
+    The bit layout is fixed by the kernel's byte-lane extraction and is checked by
+    `check_k_store_perm_f4` and `check_k_store_perm_i4`; do not change it without
+    re-validating those:
       int4: sequential nibbles — byte i holds codes 2i (low nibble), 2i+1 (high nibble); the
             raw-code compaction's masks split a u32's even/odd nibbles (this layout was
             originally the PRMT selector format of the retired two-table LUT dequant).
@@ -170,8 +171,7 @@ def pack_rows_lut(codes, bits):
 
 
 def unpack_rows_lut(packed, bits, E):
-    """Inverse of `pack_rows_lut` (round-trip asserted by G1a-lut). Bit layout lifted verbatim
-    from `probe_sm100_dequant.unpack_lut`."""
+    """Inverse of `pack_rows_lut`. The round trip is exact at both widths."""
     *lead, R, B = packed.shape
     flat = packed.reshape(-1, B)
     if bits == 4:
@@ -187,8 +187,8 @@ def unpack_rows_lut(packed, bits, E):
 
 
 def v_store_perm_sm100(bits):
-    """Legacy MN-major V operand-ring store order (Task 3 derivation; see the
-    kernel's dequant-WG V path in `src/cutedsl_decode/_sm100/int_fold_decode.py`).
+    """Legacy MN-major V operand-ring store order, matching the kernel's
+    dequant-warpgroup V path in `_sm100/int_fold_decode.py`.
 
     Kernel-side contract being satisfied: dequant thread (col = t%64, half = t//64) of a
     V code stage (one page) loads the packed flat byte run
@@ -256,9 +256,9 @@ def v_store_perm_sm100_f4(bits):
     each packed word. The two masks produce tokens 8w..8w+3 and 8w+4..8w+7
     as E4M3 bytes for a K-major V operand. This replaces the old token-major
     INT4 pool without changing its shape: old pools MUST be rebuilt.
-    Gate: G1i4 (below).
+    Checked by `_gate_i4_v_perm` below.
 
-    Source frame (pinned by G1f4 against `build_pools_lut`'s V leg): the array
+    Source frame (checked by `_gate_f4_v_perm` against `build_pools_lut`'s V leg): the array
     this perm indexes into is the DIM-MAJOR flat V view
     `qv_t.reshape(D * PS)` (qv_t = q^T, shape [D, PS], i.e. flat position k = d*PS + tok)
     -- the SAME frame `v_store_perm_sm100` composes against. So the closed form's flat
@@ -306,7 +306,7 @@ def check_k_store_perm_f4():
     """Prove the permuted pool read with two masks equals the unpermuted pool
     read with the production gather, as operand WORDS rather than as inputs.
 
-    This is the K counterpart of G1f4, and it is why the perm may be trusted.
+    This is the K counterpart of `_gate_f4_v_perm`, and it is why the permutation may be trusted.
 
     IT IS EXHAUSTIVE, not a sample, and the second loop is what makes it so. Every
     output bit of both deposits depends on exactly one input code position, since
@@ -445,7 +445,7 @@ def _k_store_perm_inverse(k_store_perm, bits=2):
 
 
 def build_pools_lut(k, v, bits, v_store_perm=None, k_store_perm=None):
-    """LUT-order `build_pools` (spec §5): identical pool shapes/dtypes, code bytes packed with
+    """LUT-order `build_pools`: identical pool shapes and dtypes, code bytes packed with
     `pack_rows_lut` (SASS-validated dequant path) instead of the plane-interleaved order.
     `k_store_perm` (default None = identity = K rows token-major and unpermuted)
     reorders the K CHANNEL positions before packing, which is what the mask
@@ -787,9 +787,7 @@ def ref_paged_attention_fp8q_flex(q_fp8, q_scale, mKq, mVq, mScale, bits,
 
 
 def quantize_q_fp8(q):
-    """Per-tensor absmax fp8 Q (spec §4), op order BIT-EXACT to
-    `fold_numerics_sm100.q_eff_fp8_tensor` (the certified sim; verified over thousands of
-    random tensors — see module docstring):
+    """Per-tensor absmax fp8 Q, in the operation order the kernel's scale fold assumes:
         qs    = 448 / amax(|q.float()|).clamp_min(1e-30)     (f32 MULTIPLY-scale)
         q_fp8 = e4m3(clamp(q.float() * qs, ±448))            (multiply, NOT divide-by-s)
         Q_eff = q_fp8.float() / qs                           (dequant DIVIDES by qs)
@@ -797,9 +795,9 @@ def quantize_q_fp8(q):
     The algebraically-equal divide form (s = amax/448; q/s; codes*s) rounds differently in
     f32 (~12% of elements land 1 fp8 ULP off) and MUST NOT be used: the Task-4 G3.5
     folded-S gate (rel <= 1e-5 vs this oracle) requires op-order identity with the sim.
-    A harness folding the Q dequant into the kernel's scale_s knob uses
-    scale_s = sm_scale / (q_scale * k_scale) — the natural form under multiply-scales
-    (`_fp8_baseline_ab.py` follows this convention)."""
+    A caller folding the Q dequant into the kernel's scale_s knob uses
+    scale_s = sm_scale / (q_scale * k_scale), which is the natural form under
+    multiply-scales."""
     qs = E4M3_MAX / q.float().abs().amax().clamp_min(1e-30)
     q_fp8 = (q.float() * qs).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
     return q_fp8, qs.item()
@@ -872,9 +870,9 @@ def dequant_bf16_fma_e4m3(codes, s, z):
 def ref_paged_attention_fp8q(q_fp8, q_scale, mKq, mVq, mScale, bits, block_table, seq_lens,
                               sm_scale, v_store_perm=None, kv_round=None,
                               k_store_perm=None):
-    """fp8-Q-contract storage-matched paged reference (spec §4): Q_eff = q_fp8.float()/q_scale
+    """fp8-Q storage-matched paged reference: Q_eff = q_fp8.float()/q_scale
     (q_scale is `quantize_q_fp8`'s MULTIPLY-scale qs = 448/amax; the DIVIDE here matches
-    `fold_numerics_sm100.q_eff_fp8_tensor`'s dequant direction bit-exactly), KV dequantized
+    the kernel's dequant direction exactly), KV dequantized
     from the LUT pools (`build_pools_lut`/`unpack_rows_lut`), fp32 attention, paged via
     block_table/seq_lens with ragged tails. Mirrors `ref_paged_attention`'s structure
     exactly, swapping in the LUT dequant and the fp8 Q.
@@ -947,8 +945,8 @@ def ref_paged_attention_fp8q_fast(q_fp8, q_scale, mKq, mVq, mScale, bits, block_
     """Head-batched einsum version of `ref_paged_attention_fp8q` for LARGE problems (Task-5
     matrix at bs64/HQ32/kv8k — the per-(b,hq) loop is too slow there). Numerics: NOT
     bit-equal to the loop version — einsum's f32 reduction order differs (measured ~4e-7
-    max abs on O(1) outputs); cross-gated vs the loop at atol=rtol=1e-6 (G1f). The LOOP
-    version remains THE gate/oracle reference (G1b-lut, Task-4 G3.5); use this one where a
+    max abs on O(1) outputs); cross-checked against the loop at atol=rtol=1e-6. The loop
+    version remains the oracle; use this one where a
     5e-3-class tolerance makes the ~1e-6 difference invisible."""
     B, HQ, d = q_fp8.shape
     assert d == D
@@ -971,7 +969,7 @@ def ref_paged_attention_fp8q_fast(q_fp8, q_scale, mKq, mVq, mScale, bits, block_
 
 
 def ref_paged_attention(q, mKq, mVq, mScale, bits, block_table, seq_lens, sm_scale):
-    """q [B,HQ,D] -> o [B,HQ,D] f32. Dequantizes the SAME pools the kernel reads (spec §8)."""
+    """q [B,HQ,D] -> o [B,HQ,D] f32, over the same pools the kernel reads."""
     B, HQ, d = q.shape
     assert d == D
     k_hat, v_hat = dequant_pools(mKq, mVq, mScale, bits)
@@ -999,7 +997,7 @@ def _words_of(flat_u8):
 
 
 def _gate_f4_v_perm(bits=2, NP=3, seed=0):
-    """G1f4: v_store_perm_sm100_f4 property gate -- the kernel's two-mask expand
+    """`v_store_perm_sm100_f4` property gate: the kernel's two-mask expand
     reconstructs dim-major token codes from perm+pack pool words, bit-exact."""
     torch.manual_seed(seed)
     ok = True
@@ -1017,15 +1015,15 @@ def _gate_f4_v_perm(bits=2, NP=3, seed=0):
                                    q[p, j::16, :].t().to(lo.dtype)))       # token 16w+j
             ok &= bool(torch.equal((hi >> (4 * j)) & 0x3,
                                    q[p, j + 8::16, :].t().to(hi.dtype)))   # token 16w+8+j
-    print(f"[G1f4 bits={bits}] dim-major two-mask expand property: "
+    print(f"[v perm int2, bits={bits}] dim-major two-mask expand property: "
           f"{'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def _gate_i4_v_perm(NP=3, seed=0):
-    """G1i4: v_store_perm_sm100_f4(4) property gate -- the kernel's two-mask
+    """`v_store_perm_sm100_f4(4)` property gate: the kernel's two-mask
     int4 deposit reconstructs each channel row's token runs from perm+pack pool
-    words, byte-exact, with no PRMT. The int4 twin of G1f4."""
+    words, byte-exact, with no PRMT. The int4 twin of the gate above."""
     torch.manual_seed(seed)
     ok = True
     q = torch.randint(0, 16, (NP, PS, D), dtype=torch.uint8)   # [page, token, dim]
@@ -1042,13 +1040,13 @@ def _gate_i4_v_perm(NP=3, seed=0):
                                    q[p, b::8, :].t().to(lo.dtype)))       # token 8w+b
             ok &= bool(torch.equal((hi >> (8 * b)) & 0xF,
                                    q[p, b + 4::8, :].t().to(hi.dtype)))   # token 8w+4+b
-    print(f"[G1i4] dim-major two-mask int4 deposit property: "
+    print(f"[v perm int4] dim-major two-mask int4 deposit property: "
           f"{'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def _gate_i4_v_perm_roundtrip(NP=2, seed=1):
-    """G1i4-rt: v_store_perm_sm100_f4(4) is a true permutation of the dim-major
+    """`v_store_perm_sm100_f4(4)` is a true permutation of the dim-major
     flat V view -- inverting it (argsort) recovers the original source exactly."""
     torch.manual_seed(seed)
     ok = True
@@ -1059,12 +1057,12 @@ def _gate_i4_v_perm_roundtrip(NP=2, seed=1):
         qv_flat = q[p].t().contiguous().reshape(-1)
         stored = qv_flat[perm]
         ok &= bool(torch.equal(stored[inv], qv_flat))
-    print(f"[G1i4-rt] perm round-trip via argsort: {'PASS' if ok else 'FAIL'}")
+    print(f"[v perm int4 round-trip] argsort recovers the source: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def _gate_f4_v_perm_roundtrip(bits=2, NP=2, seed=1):
-    """G1f4-rt: v_store_perm_sm100_f4 is a true permutation of the dim-major flat V
+    """`v_store_perm_sm100_f4` is a true permutation of the dim-major flat V
     view -- inverting it (argsort) recovers the original source exactly."""
     torch.manual_seed(seed)
     ok = True
@@ -1075,14 +1073,14 @@ def _gate_f4_v_perm_roundtrip(bits=2, NP=2, seed=1):
         qv_flat = q[p].t().contiguous().reshape(-1)
         stored = qv_flat[perm]
         ok &= bool(torch.equal(stored[inv], qv_flat))
-    print(f"[G1f4-rt bits={bits}] perm round-trip via argsort: {'PASS' if ok else 'FAIL'}")
+    print(f"[v perm int2 round-trip, bits={bits}] argsort recovers the source: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 # First 16 values + full-perm sha256 of v_store_perm_sm100(2), recorded BEFORE
 # v_store_perm_sm100_f4 was added (T1 report `.superpowers/sdd/f4vp/task-1-report.md`),
 # so a future edit that accidentally perturbs the flag-off perm while touching this file
-# trips a gate instead of silently regressing Task 3's kernel contract.
+# trips a gate instead of silently regressing the kernel's contract.
 _V_STORE_PERM_SM100_BITS2_FIRST16 = [0, 512, 64, 576, 256, 768, 320, 832,
                                       128, 640, 192, 704, 384, 896, 448, 960]
 # sha256 of the full 8192-length perm as little-endian int64 bytes.
@@ -1091,7 +1089,7 @@ _V_STORE_PERM_SM100_BITS2_SHA256 = (
 
 
 def _gate_f4_flagoff_unchanged():
-    """G1f4-flagoff: adding v_store_perm_sm100_f4 must not perturb the existing flag-off
+    """Adding `v_store_perm_sm100_f4` must not perturb the existing flag-off
     v_store_perm_sm100(2) -- checksummed against the pre-change values (first-16 spot
     values + full-perm sha256)."""
     import hashlib
@@ -1099,7 +1097,7 @@ def _gate_f4_flagoff_unchanged():
     ok = p[:16].tolist() == _V_STORE_PERM_SM100_BITS2_FIRST16
     dig = hashlib.sha256(p.to(torch.int64).numpy().tobytes()).hexdigest()
     ok &= dig == _V_STORE_PERM_SM100_BITS2_SHA256
-    print(f"[G1f4-flagoff] v_store_perm_sm100(2) unchanged (first-16 + full sha256): "
+    print(f"[v perm flag-off] v_store_perm_sm100(2) unchanged (first-16 + full sha256): "
           f"{'PASS' if ok else 'FAIL'}")
     return ok
 
@@ -1118,7 +1116,7 @@ FLEX_GATE_CONFIGS = [
 
 
 def _gate_flex_pools(seed=3):
-    """G1g gates for the flex pool builders.
+    """Self-gates for the flex pool builders.
     G1g-legacy: build_pools_flex at the legacy config == build_pools_lut on
     the SAME data through the SAME page perm, byte-identical (mKq/mVq/mScale).
     G1g-rt: per flex config, page-local dequant of the built pool gathered
