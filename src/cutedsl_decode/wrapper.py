@@ -259,17 +259,9 @@ class PagedDecodeWrapper:
     """PyTorch-facing wrapper for the paged CuTe DSL GQA decode kernel (SM90/SM100)."""
 
     @flashinfer_api
-    def __init__(
-        self,
-        float_workspace_buffer: torch.Tensor,
-        use_cuda_graph: bool = False,
-    ) -> None:
+    def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
-        # `use_cuda_graph` is accepted and ignored: it was already dead before
-        # the dense path was removed (nothing read self._use_cuda_graph), and it
-        # is a public constructor argument, so dropping it would break callers
-        # for no gain.
         self._planned = False
         # None = dense mode (everything below is unused); 2 or 4 = quantized.
         self._bits: Optional[int] = None

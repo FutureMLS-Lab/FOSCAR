@@ -35,7 +35,6 @@ On SM100 the workspace holds the split-K partial results for `reduction="kernel"
 It is a flat `uint8` CUDA tensor, and the wrapper raises `RuntimeError` with the required byte count when it is too small.
 On SM90 the wrapper allocates its own partial buffers and the workspace stays unused.
 
-`use_cuda_graph=` is accepted and has no effect.
 Graph capture needs no constructor flag; see [CUDA graph capture](#cuda-graph-capture).
 
 ## Page-table construction
