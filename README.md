@@ -150,25 +150,24 @@ same Q dtype.
 
 ## Benchmarks
 
-Decode latency normalized against FlashInfer bf16 at the same shape, so 1.00 is
-FlashInfer bf16 and lower is better. The absolute latency in microseconds is in
-the figure below and in `benchmarks/decode_latency.csv`.
+Decode latency on one NVIDIA B200, against FlashInfer and TensorRT-LLM's
+`trtllm-gen` decode kernels. The figure plots each kernel's latency divided by
+FlashInfer bf16's at the same shape, so the dashed line at 1.00 is bf16 and every
+other series reads as a fraction of it. The table gives the latency itself, in
+microseconds.
 
-![Decode latency against batch size at KV lengths 8K and 32K](docs/decode-latency.png)
+![Decode latency relative to FlashInfer bf16, against batch size at KV lengths 8K and 32K](docs/decode-latency.png)
 
-| Batch | KV len | int2 | int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 | bf16 (us) |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 8K | **0.71x** | 0.77x | 1.00x | 0.78x | 0.81x | 16.1 |
-| 1 | 32K | **0.47x** | 0.56x | 1.00x | 0.65x | 0.52x | 35.3 |
-| 8 | 8K | **0.41x** | 0.51x | 1.00x | 0.57x | 0.41x | 55.5 |
-| 8 | 32K | **0.38x** | 0.45x | 1.00x | 0.57x | 0.41x | 166.9 |
-| 32 | 8K | **0.38x** | 0.44x | 1.00x | 0.56x | 0.42x | 170.2 |
-| 32 | 32K | **0.36x** | 0.43x | 1.00x | 0.53x | 0.42x | 602.4 |
-| 128 | 8K | **0.36x** | 0.41x | 1.00x | 0.52x | 0.37x | 600.4 |
-| 128 | 32K | **0.33x** | 0.38x | 1.00x | 0.51x | 0.36x | 2323.6 |
-
-The last column is the reference each row is divided by, so a row can be read
-back as absolute latency.
+| Batch | KV len | int2 | int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 8K | **11.5** | 12.4 | 16.1 | 12.5 | 13.0 |
+| 1 | 32K | **16.6** | 19.7 | 35.3 | 22.9 | 18.5 |
+| 8 | 8K | **22.9** | 28.2 | 55.5 | 31.6 | 22.9 |
+| 8 | 32K | **63.0** | 75.7 | 166.9 | 95.5 | 69.2 |
+| 32 | 8K | **65.1** | 75.2 | 170.2 | 95.5 | 72.2 |
+| 32 | 32K | **214.1** | 257.0 | 602.4 | 317.9 | 250.7 |
+| 128 | 8K | **214.6** | 248.0 | 600.4 | 314.8 | 223.3 |
+| 128 | 32K | **765.9** | 877.7 | 2323.6 | 1189.8 | 832.7 |
 
 What the columns store per cached value, including the scale and offset:
 
@@ -181,7 +180,7 @@ Two things follow from that table and are worth stating plainly.
 The 2-bit kernel reads about 1.8 times fewer bytes than NVFP4 and takes 0.86 to
 1.00 of its latency, so the traffic saving does not turn into latency: the
 dequantization and the on-chip work absorb most of it. Against bf16, which
-stores 6.4 times as many bits per value, it takes 0.33 to 0.71.
+stores 6.4 times as many bits per value, it sits at 0.33 to 0.71 of the line.
 
 At 4 bits, where this package and NVFP4 store the same number of bits per value,
 the two are close and TRT-LLM is faster at seven of the eight shapes. The 2-bit
@@ -207,12 +206,16 @@ Which code produced each column:
 ## Testing
 
 ```sh
-pytest -q            # CPU suite: no GPU and no CUDA toolkit required
+pytest -q            # everything that needs no GPU
 pytest -m gpu        # the pool builders, on the hardware their kernel runs on
 ```
 
-A test module whose name ends in `_cpu` must pass with no GPU. The CPU suite
-runs in about ten seconds.
+A test module whose name ends in `_cpu` must pass with no GPU and no CUDA
+toolkit. Most of the package is host code, and these tests cover it: the
+planners, the pool builders, the kernel cache, the constructor contract, and the
+static geometry of the kernels, such as shared-memory bank models and fragment
+maps. The whole run takes about ten seconds, and on a GPU host the same command
+also runs the modules that need one.
 
 With a CUDA device and the CuTe DSL installed, the modules that need them run
 instead of skipping. The GPU test builds pools with the builder this package
