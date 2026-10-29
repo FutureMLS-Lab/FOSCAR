@@ -74,6 +74,37 @@ out = w.run(q, k_pool, v_pool, scale_pool=scale_pool,
             k_pool_order="permuted")     # [batch, q_heads, head_dim]
 ```
 
+### Quantization granularity
+
+The quickstart above uses the default: one scale and offset per token, over the
+whole head dimension. Granularity is chosen per tensor by an `(axis, group)`
+pair, and the pool builder and `plan()` must be given the same pair.
+
+```python
+k_pool, v_pool, scale_pool, block_table, _aux = pool.build_pools_flex(
+    k_log, v_log, bits,
+    k_quant=("channel", 128),      # one scale per channel, per 128-token group
+    v_quant=("token", 128),        # one scale per token over the head dimension
+    k_store_perm=pool.k_store_perm_sm100_f4(bits),
+    v_store_perm=pool.v_store_perm_sm100_f4(bits))
+
+w.plan(indptr, indices, seq_lens, ..., bits=bits,
+       k_quant=("channel", 128), v_quant=("token", 128))
+```
+
+Accepted pairs, at `head_dim` 128:
+
+| | token-wise | channel-wise |
+|---|---|---|
+| K | group `D` (default) or `D/2` | token group 64, 128 or 256 |
+| V | group `D` only | token group 64, 128 or 256 |
+
+Channel-wise K is the setting that helps most when a few channels dominate.
+`build_pools` (as opposed to `build_pools_flex`) always builds the default
+token-wise pools, so use `build_pools_flex` whenever the granularity differs.
+K at group `D/2` additionally needs a bf16 scale pool: pass `sdtype=torch.bfloat16`
+to the builder and `kernel_kwargs={"sdtype": torch.bfloat16}` to `plan()`.
+
 `plan()` compiles the kernel for one static configuration and is called when the
 page table or the sequence lengths change. `run()` is called every decode step
 and is graph-capturable. Call `plan()` once at model load to pay the JIT cost
