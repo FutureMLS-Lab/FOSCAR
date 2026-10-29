@@ -9,10 +9,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Boolean
 
-from cutedsl_decode._vendor.quack import layout_utils
-import cutedsl_decode._vendor.flash_attn.cute.utils as utils
-from cutedsl_decode._vendor.quack.cute_dsl_utils import ParamsBase
-from cutedsl_decode._vendor.flash_attn.cute.seqlen_info import SeqlenInfoQK
+from fosca._vendor.quack import layout_utils
+import fosca._vendor.flash_attn.cute.utils as utils
+from fosca._vendor.quack.cute_dsl_utils import ParamsBase
+from fosca._vendor.flash_attn.cute.seqlen_info import SeqlenInfoQK
 
 
 @dataclass

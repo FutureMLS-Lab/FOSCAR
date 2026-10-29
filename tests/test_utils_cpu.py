@@ -8,13 +8,13 @@ is imported only when a kernel is planned or compiled.
 import pytest
 import torch
 
-from cutedsl_decode import _utils
+from fosca import _utils
 
 
 def test_the_package_imports_without_the_dsl():
-    import cutedsl_decode
+    import fosca
 
-    assert isinstance(cutedsl_decode.__version__, str)
+    assert isinstance(fosca.__version__, str)
 
 
 def test_the_api_decorator_is_transparent():

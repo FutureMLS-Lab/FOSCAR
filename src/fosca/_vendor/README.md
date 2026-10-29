@@ -14,7 +14,7 @@ project's entire kernel surface.
   pipeline, seqlen_info, softmax, utils.
   https://github.com/Dao-AILab/flash-attention/tree/main/flash_attn/cute
 
-All internal imports are rewritten to the `cutedsl_decode._vendor` package path.
+All internal imports are rewritten to the `fosca._vendor` package path.
 Do not edit these modules except to refresh them from upstream. See
 [LICENSE](LICENSE) for the license text and the `NOTICE` file at the repository
 root for the attribution and the list of changes.

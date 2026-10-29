@@ -1,4 +1,4 @@
-# cutedsl-decode
+# fosca
 
 Quantized-KV paged GQA decode kernels for Hopper (SM90) and Blackwell (SM100),
 written in CuTe DSL and exposed through one architecture-agnostic wrapper.
@@ -21,7 +21,7 @@ pip install -e ".[cu13]"    # CUDA 13: Blackwell, and Hopper
 pip install -e ".[cu12]"    # CUDA 12: Hopper only
 ```
 
-The same extras work with `pip install "cutedsl-decode[cu13]"` once the package
+The same extras work with `pip install "fosca[cu13]"` once the package
 is published to PyPI.
 
 The package contains no compiled extensions. Everything is JIT-compiled by
@@ -36,7 +36,7 @@ than producing a wrong result.
 
 ```python
 import torch
-from cutedsl_decode import PagedDecodeWrapper, get_capabilities, pool
+from fosca import PagedDecodeWrapper, get_capabilities, pool
 
 device = "cuda"
 arch = get_capabilities()["arch"]                 # "sm90" or "sm100"
@@ -106,25 +106,25 @@ is supported.
 Both architectures ship a builder that turns a bf16 KV cache into the packed
 pools their kernel reads.
 
-On Blackwell, `cutedsl_decode.pool` packs the pools and also carries a reference
+On Blackwell, `fosca.pool` packs the pools and also carries a reference
 implementation of the same attention, so a kernel run can be checked against a
 storage-matched oracle:
 
 ```python
-from cutedsl_decode import pool
+from fosca import pool
 
-k_pool, v_pool, scale_pool = pool.build_pools_lut(
+k_pool, v_pool, scale_pool = pool.build_pools(
     k, v, bits,                                  # k, v: [pages, 64, kv_heads, dim]
     k_store_perm=pool.k_store_perm_sm100_f4(bits),
     v_store_perm=pool.v_store_perm_sm100_f4(bits))
 ```
 
-On Hopper, `cutedsl_decode.pool_sm90` quantizes and repacks into the chunk-major
+On Hopper, `fosca.pool_sm90` quantizes and repacks into the chunk-major
 pools the SM90 kernel reads, and lays the pages out as one global pool behind a
 block table:
 
 ```python
-from cutedsl_decode import pool_sm90
+from fosca import pool_sm90
 
 cache = pool_sm90.build_pools_sm90(
     k, v, bits,                                  # k, v: [batch, kv_heads, kv_len, dim]
@@ -141,7 +141,7 @@ not declared through `k_pool_order`.
 ## Accuracy
 
 `baselines`-style end-to-end scoring is not part of this release. What the
-package ships is the reference implementation in `cutedsl_decode.pool`, whose
+package ships is the reference implementation in `fosca.pool`, whose
 `dequant_pools_flex` inverts a pool and `ref_paged_attention_fp8q_flex` scores
 attention over the dequantized logical stream through the block table. Comparing
 a kernel run against that reference measures the kernel's own error, because

@@ -9,8 +9,8 @@ and compare against the values placed through the same map.
 import pytest
 import torch
 
-from cutedsl_decode import pool_sm90, quant_ref
-from cutedsl_decode._sm90.serving_cache import code_row_bytes
+from fosca import pool_sm90, quant_ref
+from fosca._sm90.serving_cache import code_row_bytes
 
 D, PAGE = 128, 64
 

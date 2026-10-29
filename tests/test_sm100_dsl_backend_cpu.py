@@ -29,7 +29,7 @@ class _CudaVersion:
 def test_the_sm100_compile_refuses_only_the_cuda12_backend(monkeypatch, major, refused):
     from cutlass.base_dsl import version_info
 
-    from cutedsl_decode._sm100 import fold_runtime
+    from fosca._sm100 import fold_runtime
 
     monkeypatch.setattr(version_info, "CUDA_VERSION", _CudaVersion(major, 9))
     if refused:
@@ -42,7 +42,7 @@ def test_the_sm100_compile_refuses_only_the_cuda12_backend(monkeypatch, major, r
 
 def test_the_guard_runs_in_the_trace_before_the_compile():
     """A guard nothing calls protects nothing."""
-    from cutedsl_decode._sm100 import fold_runtime
+    from fosca._sm100 import fold_runtime
 
     src = inspect.getsource(fold_runtime.compile_fold)
     start = src.index("def _trace():")

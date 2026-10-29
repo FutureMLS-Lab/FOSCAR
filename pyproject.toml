@@ -3,7 +3,7 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cutedsl-decode"
+name = "fosca"
 version = "0.1.0"
 description = "Quantized-KV paged decode kernels for Hopper (SM90) and Blackwell (SM100), written in CuTe DSL."
 readme = "README.md"
@@ -40,7 +40,7 @@ Changelog = "https://github.com/donglinz/fosca/blob/main/CHANGELOG.md"
 where = ["src"]
 
 [tool.setuptools.package-data]
-cutedsl_decode = ["py.typed", "_vendor/LICENSE", "_vendor/README.md"]
+fosca = ["py.typed", "_vendor/LICENSE", "_vendor/README.md"]
 
 [tool.uv]
 conflicts = [[{ extra = "cu12" }, { extra = "cu13" }]]

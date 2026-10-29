@@ -58,7 +58,7 @@ def main():
     out = torch.zeros(B, HQ, D, device=dev, dtype=torch.bfloat16)
     sf = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     comb = SplitKCombine(D)
-    from cutedsl_decode._sm90.pingpong_runtime import sm90_compiler
+    from fosca._sm90.pingpong_runtime import sm90_compiler
     compile_fn, _ = sm90_compiler(os.environ.get('OPT_LEVEL', '3'))
     cd = compile_fn(comb, from_dlpack(op, assumed_align=16), from_dlpack(lse, assumed_align=16),
                     from_dlpack(out, assumed_align=16), Int32(OUTER), Int32(B), Int32(HQ), sf)

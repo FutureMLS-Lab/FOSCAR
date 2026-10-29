@@ -18,8 +18,8 @@ import runpy
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SCHEDULER = ROOT / "src/cutedsl_decode/_sm90/scheduler.py"
-RUNTIME = ROOT / "src/cutedsl_decode/_sm90/pingpong_runtime.py"
+SCHEDULER = ROOT / "src/fosca/_sm90/scheduler.py"
+RUNTIME = ROOT / "src/fosca/_sm90/pingpong_runtime.py"
 BATCHES = (1, 2, 8, 32, 64, 128)
 KV_LENS = (4096, 8192, 16384, 32768)
 KV_HEADS, SMS = 8, 132

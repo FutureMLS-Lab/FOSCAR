@@ -1,6 +1,6 @@
 # SGLang Integration Guide
 
-This page shows how to wire `cutedsl-decode` into an SGLang-style attention backend.
+This page shows how to wire `fosca` into an SGLang-style attention backend.
 It covers the plan/run lifecycle, the page-table inputs `plan()` consumes, the arguments that belong outside the decode loop, CUDA graph capture, and the feature set the wrapper accepts.
 Read it if you are adding this package to an engine's decode path; install steps, the support matrix, and pool construction are in the [README](../README.md).
 The wrapper keeps the plan/run split of FlashInfer's paged-decode wrapper.
@@ -25,7 +25,7 @@ Allocate one wrapper per layer or per worker.
 
 ```python
 import torch
-from cutedsl_decode import PagedDecodeWrapper
+from fosca import PagedDecodeWrapper
 
 workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
 wrapper = PagedDecodeWrapper(workspace)
@@ -117,8 +117,8 @@ wrapper.plan(dummy_indptr, dummy_indices, dummy_seq_lens,
              bits=2)
 ```
 
-The cache lives under `$XDG_CACHE_HOME/cutedsl-decode/kernel-cache`, or `~/.cache/cutedsl-decode/kernel-cache` when `XDG_CACHE_HOME` is unset.
-`CUTEDSL_DECODE_KERNEL_CACHE_DIR` moves it, and `CUTEDSL_DECODE_KERNEL_CACHE=0` disables it.
+The cache lives under `$XDG_CACHE_HOME/fosca/kernel-cache`, or `~/.cache/fosca/kernel-cache` when `XDG_CACHE_HOME` is unset.
+`FOSCA_KERNEL_CACHE_DIR` moves it, and `FOSCA_KERNEL_CACHE=0` disables it.
 
 `plan()` exposes what it decided as read-only properties: `kv_splits`, `reduction`, `bits`, and `scale_pool_dtype`.
 
@@ -145,7 +145,7 @@ When `out=` is passed, `run()` writes into it and returns it.
 `k_pool` and `v_pool` are the packed code pools: `uint8`, with one contiguous block per (page, kv-head).
 `scale_pool` is the per-(page, kv-head) affine block and is required.
 With the default `("token", head_dim)` granularity for both tensors it is the interleaved f32 pool `[num_pages, num_kv_heads, page_size, 4] = (s_k, z_k, s_v, z_v)`.
-With any other granularity it is the flat sectioned block `[num_pages, num_kv_heads, block_tot]` that `cutedsl_decode.quant_layout.quant_block_offsets` describes.
+With any other granularity it is the flat sectioned block `[num_pages, num_kv_heads, block_tot]` that `fosca.quant_layout.quant_block_offsets` describes.
 `run()` checks the pool's shape against the planned granularity and its dtype against the planned scale precision.
 
 On SM90 both code pools are chunk-major.
@@ -166,7 +166,7 @@ When omitted, `run()` derives it from `scale_pool` with a `.max().item()` device
 `wrapper.pscale_lp(scale_pool)` computes it once; recompute it only when the pool's maximum V scale changes.
 
 **`k_pool_order=`** is mandatory on SM100 wherever the plan reads a permuted K pool, which is 4 bits at every configuration and 2 bits with the default E2M1 feed.
-Declare `"permuted"` for a pool built with `pool.k_store_perm_sm100_f4(bits)`, and `"logical"` for a pool in plain `pack_rows_lut` order, which the plan accepts only where it reads logical order.
+Declare `"permuted"` for a pool built with `pool.k_store_perm_sm100_f4(bits)`, and `"logical"` for a pool in plain `pack_rows` order, which the plan accepts only where it reads logical order.
 Nothing in the pool's bytes reveals the order, so an undeclared or contradictory declaration raises instead of being guessed.
 The store order an external writer has to meet is in [`K_STORE_PERM.md`](K_STORE_PERM.md).
 SM90 ignores this argument; its code-pool order is the chunk-major one described above, checked by shape.
@@ -184,7 +184,7 @@ SM90 ignores it.
 Every key is present on an unsupported device, with empty or `False` values, so a caller can read any key without a `KeyError`.
 
 ```python
-from cutedsl_decode import get_capabilities
+from fosca import get_capabilities
 
 caps = get_capabilities()
 q_len_per_req = 1                       # this request's query length
@@ -204,14 +204,14 @@ The keys that matter for routing are `arch` (`"sm90"`, `"sm100"`, or `"unsupport
 The default for both is `("token", head_dim)`, which is the shipped fast path.
 K also accepts `("token", head_dim // 2)` and `("channel", G)`, and V accepts `("token", head_dim)` and `("channel", G)`.
 `G` is one of 64, 128, or 256 and must be a multiple of the page size.
-The scale pool layout follows the pair and is given by `cutedsl_decode.quant_layout.quant_block_offsets`.
+The scale pool layout follows the pair and is given by `fosca.quant_layout.quant_block_offsets`.
 Pass the granularity through `k_quant` and `v_quant`; naming it in `kernel_kwargs` raises.
 
 At head_dim 256, which only SM90 accepts, the kernel builds the default pair with an f32 scale pool and nothing else.
 `plan()` raises `ValueError` for every other pair or pool precision.
 
 K token-64 needs a bfloat16 scale pool.
-On SM90, build the pool with `cutedsl_decode._sm90.serving_cache.make_serving_cache_flex(..., D=head_dim, sdtype=torch.bfloat16)` and pass `kernel_kwargs={"sdtype": torch.bfloat16}` to `plan()`; a mismatch raises an error naming both arguments.
+On SM90, build the pool with `fosca._sm90.serving_cache.make_serving_cache_flex(..., D=head_dim, sdtype=torch.bfloat16)` and pass `kernel_kwargs={"sdtype": torch.bfloat16}` to `plan()`; a mismatch raises an error naming both arguments.
 On SM100, K token-64 selects the bfloat16 pool by default, and `wrapper.scale_pool_dtype` reports the dtype the plan compiled for.
 
 `kernel_kwargs=` is an advanced escape hatch.

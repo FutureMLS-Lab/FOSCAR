@@ -29,7 +29,7 @@ def _contract():
     """Load the module BY PATH. The package `__init__` imports torch and cutlass, and
     this file's whole claim is that the contract needs neither."""
     spec = importlib.util.spec_from_file_location(
-        "kernel_contract", _SRC / "cutedsl_decode" / "kernel_contract.py")
+        "kernel_contract", _SRC / "fosca" / "kernel_contract.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
@@ -37,7 +37,7 @@ def _contract():
 
 def test_module_is_torch_free():
     """Loaded with no torch import of its own, like `quant_layout.py`."""
-    src = (_SRC / "cutedsl_decode" / "kernel_contract.py").read_text()
+    src = (_SRC / "fosca" / "kernel_contract.py").read_text()
     assert "import torch" not in src, (
         "the contract is imported by both kernel modules and must stay torch-free")
 
@@ -106,10 +106,10 @@ def test_the_gqa_bound_is_not_claimed_as_shared():
     `ceil_div(q_heads // kv_heads, q_head_tile)` head tiles per KV head, so a larger
     ratio is SPREAD over threadblocks rather than refused.
     """
-    src = (_SRC / "cutedsl_decode" / "kernel_contract.py").read_text()
+    src = (_SRC / "fosca" / "kernel_contract.py").read_text()
     assert "check_heads_per_kv" not in src, (
         "the GQA bound is SM90-specific and must not live in the shared contract")
-    sm90 = (_SRC / "cutedsl_decode" / "_sm90" / "int_decode_pingpong.py").read_text()
+    sm90 = (_SRC / "fosca" / "_sm90" / "int_decode_pingpong.py").read_text()
     assert "heads_per_kv must be in [1," in sm90, (
         "SM90 still needs the bound its wgmma shape imposes")
 
@@ -139,7 +139,7 @@ def test_both_kernels_declare_the_contract_as_their_base():
     import ast
     for rel, cls in (("_sm100/int_fold_decode.py", "IntDecodeSm100"),
                      ("_sm90/int_decode_pingpong.py", "IntPingPongDecodeSm90")):
-        tree = ast.parse((_SRC / "cutedsl_decode" / rel).read_text())
+        tree = ast.parse((_SRC / "fosca" / rel).read_text())
         node = next(n for n in ast.walk(tree)
                     if isinstance(n, ast.ClassDef) and n.name == cls)
         bases = [ast.unparse(b) for b in node.bases]
@@ -150,10 +150,10 @@ def test_both_kernels_declare_the_contract_as_their_base():
 def _init_of(rel, cls):
     """The `__init__` FunctionDef of a kernel class, parsed from source."""
     import ast
-    tree = ast.parse((_SRC / "cutedsl_decode" / rel).read_text())
+    tree = ast.parse((_SRC / "fosca" / rel).read_text())
     node = next(n for n in ast.walk(tree)
                 if isinstance(n, ast.ClassDef) and n.name == cls)
-    return ast.parse((_SRC / "cutedsl_decode" / rel).read_text()), next(
+    return ast.parse((_SRC / "fosca" / rel).read_text()), next(
         m for m in node.body
         if isinstance(m, ast.FunctionDef) and m.name == "__init__")
 
@@ -234,13 +234,13 @@ def test_the_sdtype_validity_rule_is_not_claimed_as_shared():
     validity rule, and normalisation must stay spelling-only so that it cannot
     become a shared gate by accident.
     """
-    from cutedsl_decode.kernel_contract import normalize_sdtype
+    from fosca.kernel_contract import normalize_sdtype
 
     assert normalize_sdtype("bf16") == "bf16"
     assert normalize_sdtype("f32") == "f32"
     for rel, needle in (("_sm100/int_fold_decode.py", 'assert sdtype == "f32"'),
                         ("_sm90/int_decode_pingpong.py", 'assert sdtype_name == "bf16"')):
-        got = (_SRC / "cutedsl_decode" / rel).read_text()
+        got = (_SRC / "fosca" / rel).read_text()
         assert needle in got, f"{rel} must keep its own sdtype rule: {needle}"
 
 
@@ -264,6 +264,6 @@ def test_neither_kernel_still_asserts_the_shared_rules_itself():
         ],
     }
     for rel, needles in banned.items():
-        src = (_SRC / "cutedsl_decode" / rel).read_text()
+        src = (_SRC / "fosca" / rel).read_text()
         for n in needles:
             assert n not in src, f"{rel} still carries the shared rule: {n.strip()}"

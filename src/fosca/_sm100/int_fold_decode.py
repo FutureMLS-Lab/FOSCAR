@@ -27,7 +27,7 @@ HOST CONTRACT
 -------------
 
 The kernel consumes packed pools, not dequantized tensors. Build them with
-``cutedsl_decode.pool``; ``_sm100/fold_runtime.py`` is the single
+``fosca.pool``; ``_sm100/fold_runtime.py`` is the single
 compile and launch path.
 
 * ``mKq``    uint8 [NP, HKV, 64, D*bits//8], token-major rows.
@@ -47,7 +47,7 @@ compile and launch path.
 The within-word code order of both pools is MODE-KEYED: whether the store-time
 permutation is applied depends on ``bits`` and the resolved
 ``dequant_int2_to_f4`` feed. Do not hardcode it. Ask ``k_pool_is_permuted`` for K,
-and ``cutedsl_decode.pool.v_store_perm_sm100`` or ``v_store_perm_sm100_f4`` for V, keyed the
+and ``fosca.pool.v_store_perm_sm100`` or ``v_store_perm_sm100_f4`` for V, keyed the
 same way. The pool builder asks the same classmethods, so the two sides cannot
 disagree.
 Main INT4 and INT2/FP4 V pools pack tokens within channel rows, using only a
@@ -227,12 +227,12 @@ from cutlass.cute.typing import (
     Union,
 )
 
-from cutedsl_decode.kernel_contract import GQAPagedDecode, normalize_sdtype
-from cutedsl_decode.quant_layout import (
+from fosca.kernel_contract import GQAPagedDecode, normalize_sdtype
+from fosca.quant_layout import (
     quant_block_offsets,
     validate_quant_flex,
 )
-from cutedsl_decode._sm100.int_fold_asm import (
+from fosca._sm100.int_fold_asm import (
     _cvt2_bf16x2,
     _e4m3x4_of_bf16x2,
     _fma2_bf16,
@@ -242,7 +242,7 @@ from cutedsl_decode._sm100.int_fold_asm import (
     _tid_x_fresh,
     _opaque_i32,
 )
-from cutedsl_decode._sm100.gqa_decode import (
+from fosca._sm100.gqa_decode import (
     # Kernel invariants
     mma_modes,
     mma_dice,
@@ -441,7 +441,7 @@ class IntDecodeSm100(GQAPagedDecode):
         fold-off ablation (fold_scale_zero=False) is set; an explicit value
         always wins (explicit 1 with the fold off still trips the ctor assert).
         Pool keying
-        (`cutedsl_decode.pool.v_store_perm_sm100_f4`) calls this same resolver, so kernel mode
+        (`fosca.pool.v_store_perm_sm100_f4`) calls this same resolver, so kernel mode
         and pool perm cannot disagree under defaults."""
         if dequant_int2_to_f4 is not None:
             return bool(int(dequant_int2_to_f4))
@@ -463,7 +463,7 @@ class IntDecodeSm100(GQAPagedDecode):
         unconditional (no flag resolves it off, and `fold_scale_zero=False`
         is ctor-refused at this width), so the pool order is unconditional with
         it, and the store shuffle is `k_store_perm_sm100_f4(4)` (the 8-slot
-        `_T8_I4`). The int2 False cases read `pack_rows_lut` order, because the
+        `_T8_I4`). The int2 False cases read `pack_rows` order, because the
         E4M3 feed gathers on nibble spacing, and int2's feed term matters:
         `resolve_dequant_int2_to_f4` is off under the fold-off arm, which then
         reads logical order.
@@ -478,7 +478,7 @@ class IntDecodeSm100(GQAPagedDecode):
         and `tests/test_pool_call_sites_cpu.py` fails the build if any raw
         unpack stops accounting for the order.
 
-        Whoever writes the pool calls THIS, through `cutedsl_decode.pool`.
+        Whoever writes the pool calls THIS, through `fosca.pool`.
         A permuted pool read by a gather, or a logical pool read by two masks, is
         silently wrong at every K channel and raises nothing, so one predicate on
         both sides is what makes the pairing unreachable rather than merely
@@ -684,7 +684,7 @@ class IntDecodeSm100(GQAPagedDecode):
             (kwarg absent) resolves to True for ``bits == 2`` unless the
             fold-off ablation (``fold_scale_zero=False``) is set; see
             ``resolve_dequant_int2_to_f4``, the single resolver shared with
-            ``cutedsl_decode.pool.v_store_perm_sm100_f4``. An explicit 0 selects the
+            ``fosca.pool.v_store_perm_sm100_f4``. An explicit 0 selects the
             token-major flag-off mode.
 
             POOL CONTRACT, and a mismatch here produces loud garbage rather than
@@ -791,10 +791,10 @@ class IntDecodeSm100(GQAPagedDecode):
             bits, dequant_int2_to_f4,
             fold_scale_zero=self.fold_scale_zero)
         # K POOL ORDER, DERIVED. When this is true the pool's 2-bit codes are
-        # permuted at store time by `cutedsl_decode.pool.k_store_perm_sm100_f4`, and the
+        # permuted at store time by `fosca.pool.k_store_perm_sm100_f4`, and the
         # K deposit reads two masks instead of the two-part gather. There is no
         # kwarg for it: `k_pool_is_permuted` states why, and whoever builds the
-        # pool asks the same classmethod through `cutedsl_decode.pool`, so
+        # pool asks the same classmethod through `fosca.pool`, so
         # the two sides cannot disagree about an absent argument.
         #
         # It holds for EITHER K axis. The deposit reproduces the logical-order
@@ -1124,10 +1124,10 @@ class IntDecodeSm100(GQAPagedDecode):
             Programmatic Dependent Launch. Runtime-dynamic — no recompile on
             toggle.
         mKq, mVq, mScale
-            Quantized KV pools (the ``build_pools_lut`` contract, V packed with
+            Quantized KV pools (the ``build_pools`` contract, V packed with
             ``v_store_perm_sm100_f4(bits)`` for INT4 or INT2 with
             ``dequant_int2_to_f4=1``, otherwise ``v_store_perm_sm100(bits)``. K is
-            packed in ``pack_rows_lut`` order, EXCEPT that INT4 and INT2 with
+            packed in ``pack_rows`` order, EXCEPT that INT4 and INT2 with
             the f4 feed at either K axis require ``k_store_perm_sm100_f4(bits)``
             applied to the codes first: ask ``k_pool_is_permuted``, which is the
             same classmethod this class answers. The kernel does not ask it to
@@ -1143,7 +1143,7 @@ class IntDecodeSm100(GQAPagedDecode):
             whose section offsets come from ``quant_layout.quant_block_offsets``.
             See the module docstring's HOST CONTRACT.
             Scale convention: the kernel takes NO q_scale — the
-            per-tensor Q descale 1/qs_Q (``cutedsl_decode.pool.quantize_q_fp8``'s
+            per-tensor Q descale 1/qs_Q (``fosca.pool.quantize_q_fp8``'s
             MULTIPLY-scale) multiplies the WHOLE folded S
             (S = sm*(s_t*S_raw + z'_t*QSum_e4m3)/qs_Q), so the host folds it
             into ``scale_s = sm_scale / q_scale`` and the kernel keeps
@@ -2902,7 +2902,7 @@ class IntDecodeSm100(GQAPagedDecode):
         # transpose exists on either path (the V source byte order
         # that makes this true IS the mode-keyed pool perm —
         # v_store_perm_sm100 flag-off, v_store_perm_sm100_f4
-        # dim-major for INT4 and INT2/FP4 — cutedsl_decode.pool).
+        # dim-major for INT4 and INT2/FP4 — fosca.pool).
         words = mma_tile_k * bits // 64  # src u32/(tok, dim-half)
         # src u32 per thread slot per stage; equal to `words` by construction
         # since one dequant warpgroup is hardcoded, kept as the per-slot name
@@ -3030,7 +3030,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # == 2-bit code (q/2 exact). Pool row d = 16 contiguous
             # bytes = dim d's 64 tokens, pre-interleaved so source
             # u32 w (tokens [16w, 16w+16)) expands by the two-mask
-            # contract (cutedsl_decode.pool, the enforcing oracle):
+            # contract (fosca.pool, the enforcing oracle):
             # lo = w & 0x33333333 (nibble j = token 16w+j), hi =
             # (w >> 2) & 0x33333333 (nibble j = token 16w+8+j) —
             # LSB-first nibbles = the chunk's 8 data bytes. The
@@ -3206,8 +3206,8 @@ class IntDecodeSm100(GQAPagedDecode):
         def map_int2_f4(rS, rOutU, words):
             # 2->4-bit nibble deposit: the e2m1 nibble IS the
             # 2-bit code (q/2 exact: nibbles 0/1/2/3 decode to
-            # 0/.5/1/1.5). pack_rows_lut puts code i of a u32 at bit
-            # 16*(i//8) + 4*(i%4) + 2*((i%8)//4) (cutedsl_decode.pool,
+            # 0/.5/1/1.5). pack_rows puts code i of a u32 at bit
+            # 16*(i//8) + 4*(i%4) + 2*((i%8)//4) (fosca.pool,
             # the enforcing oracle): per 16-bit half, codes 0-3 sit at nibble
             # bits [1:0] and codes 4-7 at nibble bits [3:2].
             # Gathering LSB-first nibble words (out0 nibble j = code
@@ -3225,7 +3225,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # `k_pool_is_permuted` is always true, and an unreachable
             # second layout is a second contract a pool writer can
             # satisfy by mistake.
-            # `cutedsl_decode.pool.check_k_store_perm_f4` proves the two
+            # `fosca.pool.check_k_store_perm_f4` proves the two
             # forms emit byte-identical operand words.
             for wl in cutlass.range_constexpr(words):
                 w = rS[wl]
@@ -3318,7 +3318,7 @@ class IntDecodeSm100(GQAPagedDecode):
             return _sub2_bf16(y, Int32(MAGIC2L))
 
         def map_int2_k_dq(rS, s_b, z_b, rOutU, words):
-            # K source (pack_rows_lut): for output word aa, the code
+            # K source (pack_rows): for output word aa, the code
             # of local dim 4aa+j sits at bit sh + 4j, with
             # sh = 16*(aa//2) + 2*(aa%2) -- the SAME geometry the
             # fold path's PRMT selector uses, read per-element here
@@ -3358,7 +3358,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # feed carries q itself (the magic base is subtracted in
             # bf16x2_q), so these are the pool's own (s, z) at their
             # natural magnitudes and the FMA evaluates q*s + z --
-            # `dequant_pools_lut`'s expression exactly. An OOB
+            # `dequant_pools`'s expression exactly. An OOB
             # page's TMA zero-fill gives s = z = 0, hence an
             # all-zero operand row: the same thing the baseline's
             # zero-filled K/V stage carried, which is what tma_mask

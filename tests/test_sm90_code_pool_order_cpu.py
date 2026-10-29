@@ -33,14 +33,14 @@ def _load(monkeypatch, name, path):
 
 @pytest.fixture
 def sc(monkeypatch):
-    for pkg in ("cutedsl_decode", "cutedsl_decode._sm90"):
+    for pkg in ("fosca", "fosca._sm90"):
         stub = types.ModuleType(pkg)
         stub.__path__ = []
         monkeypatch.setitem(sys.modules, pkg, stub)
-    _load(monkeypatch, "cutedsl_decode.quant_layout",
-          ROOT / "src/cutedsl_decode/quant_layout.py")
-    return _load(monkeypatch, "cutedsl_decode._sm90.serving_cache",
-                 ROOT / "src/cutedsl_decode/_sm90/serving_cache.py")
+    _load(monkeypatch, "fosca.quant_layout",
+          ROOT / "src/fosca/quant_layout.py")
+    return _load(monkeypatch, "fosca._sm90.serving_cache",
+                 ROOT / "src/fosca/_sm90/serving_cache.py")
 
 
 def _rows(*lead, per, seed=0):
@@ -213,7 +213,7 @@ def test_k_and_v_in_different_orders_are_refused(sc, builder):
 
 def test_the_pingpong_kernel_declares_the_chunk16_order():
     """Read from the source, because importing the kernel needs the DSL."""
-    tree = ast.parse((ROOT / "src/cutedsl_decode/_sm90/int_decode_pingpong.py").read_text())
+    tree = ast.parse((ROOT / "src/fosca/_sm90/int_decode_pingpong.py").read_text())
     cls = next(n for n in ast.walk(tree)
                if isinstance(n, ast.ClassDef) and n.name == "IntPingPongDecodeSm90")
     values = [n.value.value for n in cls.body

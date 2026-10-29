@@ -17,7 +17,7 @@ jobs:
           set -e
           fail=0
           # The vendored trees keep their upstream comments, so they are excluded.
-          check() { if git grep -nE "$1" -- src/ ':!src/cutedsl_decode/_vendor'; then
+          check() { if git grep -nE "$1" -- src/ ':!src/fosca/_vendor'; then
                       echo "FAILED: $2"; fail=1; fi }
           check '20[0-9]{2}-[0-9]{2}-[0-9]{2}'        "a date"
           check '\b(codex|owner decision|CLAUDE\.md)' "a review or agent reference"
@@ -68,8 +68,8 @@ jobs:
           import glob, zipfile
           wheel = glob.glob("dist/*.whl")[0]
           names = zipfile.ZipFile(wheel).namelist()
-          for required in ("cutedsl_decode/py.typed",
-                           "cutedsl_decode/_vendor/LICENSE"):
+          for required in ("fosca/py.typed",
+                           "fosca/_vendor/LICENSE"):
               assert required in names, f"{required} missing from the wheel"
           assert any(n.endswith("LICENSE") for n in names), "LICENSE missing"
           assert any(n.endswith("NOTICE") for n in names), "NOTICE missing"

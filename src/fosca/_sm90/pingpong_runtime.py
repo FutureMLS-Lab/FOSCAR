@@ -2,7 +2,7 @@
 """Compile and launch glue for ``IntPingPongDecodeSm90``, the SM90 quantized KV kernel.
 
 This is the Hopper sibling of ``_sm100/fold_runtime.py``: it is what
-:class:`cutedsl_decode.PagedDecodeWrapper` calls when ``plan(bits=...)`` runs on
+:class:`fosca.PagedDecodeWrapper` calls when ``plan(bits=...)`` runs on
 an SM90 device, so the quantized path has one public entry point on both
 architectures. The entry points are ``compile_pingpong`` and
 ``compile_constructed`` for compilation, ``alloc_pingpong_workspace`` for the

@@ -1,6 +1,6 @@
 # Design and Internals
 
-This page describes how `cutedsl-decode` is built: the package layout, how the wrapper
+This page describes how `fosca` is built: the package layout, how the wrapper
 picks a kernel for the device it runs on, the lifecycle of that wrapper, the workspace
 the split-K reduction needs, and how a launch is bound to a CUDA stream. It is written
 for contributors and for integrators wiring the package into a serving engine, who want
@@ -19,7 +19,7 @@ upstream change has to be merged by hand.
 ## Package layout
 
 ```
-src/cutedsl_decode/
+src/fosca/
 ├── __init__.py                 public API: PagedDecodeWrapper, get_capabilities, is_supported, pool
 ├── wrapper.py                  PagedDecodeWrapper: plan/run, arch dispatch, feature gating
 ├── _utils.py                   device detection and the capability descriptor
@@ -47,7 +47,7 @@ src/cutedsl_decode/
 
 `_sm90` and `_sm100` are private, and nothing architecture-specific is exported at the
 top level. `_utils`, `quant_layout` and `kernel_contract` import nothing from the CuTe
-DSL, so `import cutedsl_decode` works on a machine with no CUDA toolkit installed; the
+DSL, so `import fosca` works on a machine with no CUDA toolkit installed; the
 DSL is imported at the point a kernel is compiled.
 
 `_sm100/gqa_decode.py` is a split-K reduction library rather than a kernel, despite the
@@ -67,7 +67,7 @@ decision as a dictionary whose keys are always present, with empty or false valu
 unsupported device, so a router can read any key without a `KeyError`.
 
 ```python
-from cutedsl_decode import get_capabilities, is_supported
+from fosca import get_capabilities, is_supported
 
 print(is_supported())                 # True on an SM90 or SM100 device
 print(get_capabilities()["arch"])     # "sm90", "sm100" or "unsupported"

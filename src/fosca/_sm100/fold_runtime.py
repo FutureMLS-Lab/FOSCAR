@@ -2,7 +2,7 @@
 """Compile and launch glue for the SM100 quantized decode kernel.
 
 This module is the single place that compiles and launches the SM100 fold
-kernel, so :class:`cutedsl_decode.PagedDecodeWrapper`, the public API, and the
+kernel, so :class:`fosca.PagedDecodeWrapper`, the public API, and the
 benchmark drivers share one compile path and one launch path.
 
 Entry points
@@ -199,7 +199,7 @@ def _refuse_cuda12_dsl_backend():
     if major is not None and major < 13:
         raise RuntimeError(
             f"compile_fold: the SM100 kernel needs nvidia-cutlass-dsl's CUDA 13 backend "
-            f"(install cutedsl-decode[cu13]); this DSL loaded CUDA "
+            f"(install fosca[cu13]); this DSL loaded CUDA "
             f"{version_info.CUDA_VERSION}, whose ptxas miscompiles this kernel on B200")
 
 
@@ -230,7 +230,7 @@ def compile_fold(
     One compile serves every batch size and every KV length, because the batch,
     page count and kv_splits dims are `cute.sym_int()`. Memoise on the remaining
     (static) arguments: a trace costs 10 to 13 s on B200 with DSL 4.5.2, and
-    `cutedsl_decode.kernel_cache` serves a repeat of the same trace from disk in
+    `fosca.kernel_cache` serves a repeat of the same trace from disk in
     milliseconds.
 
     `bits_tuning`: the per-bits ctor knobs to apply (default `BITS_TUNING`).
@@ -615,7 +615,7 @@ def plan_fold(p, bits, *, sequence_tile=256):
     """(kv_splits, reduction) the SM100 planner would choose for this problem.
 
     Thin adapter from a problem dict (keys "b", "h_kv", "seq_lens") to
-    `cutedsl_decode._sm100.scheduler.plan_splits_sm100`, so the planner is
+    `fosca._sm100.scheduler.plan_splits_sm100`, so the planner is
     reachable from the one place every fold launch goes through.
 
     `PagedDecodeWrapper` does NOT go through here — it calls

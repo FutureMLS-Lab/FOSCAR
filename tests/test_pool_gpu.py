@@ -11,7 +11,7 @@ up here as a residual rather than as a wrong answer nobody checks.
 import pytest
 import torch
 
-from cutedsl_decode import (
+from fosca import (
     PagedDecodeWrapper,
     get_capabilities,
     is_supported,
@@ -78,7 +78,7 @@ def test_the_sm100_builder_drives_its_kernel_to_the_reference(bits):
     v_perm = pool.v_store_perm_sm100_f4(bits)
     # The builder takes physical pages: [pages, page_size, kv_heads, head_dim].
     nt = KV // PS
-    mKq, mVq, mScale = pool.build_pools_lut(
+    mKq, mVq, mScale = pool.build_pools(
         k.permute(0, 2, 1, 3).reshape(BATCH * nt, PS, HKV, D),
         v.permute(0, 2, 1, 3).reshape(BATCH * nt, PS, HKV, D),
         bits, k_store_perm=k_perm, v_store_perm=v_perm)
@@ -96,7 +96,7 @@ def test_the_sm100_builder_drives_its_kernel_to_the_reference(bits):
     out = w.run(q_fp8, mKq, mVq, scale_pool=mScale, k_pool_order="permuted")
     torch.cuda.synchronize()
 
-    k_hat, v_hat = pool.dequant_pools_lut(mKq, mVq, mScale, bits,
+    k_hat, v_hat = pool.dequant_pools(mKq, mVq, mScale, bits,
                                           v_store_perm=v_perm, k_store_perm=k_perm)
     want = _reference(q_fp8.float() / q_scale, k_hat, v_hat, block_table, seq, SM_SCALE)
     assert _worst_rel_l2(out, want) < TOLERANCE

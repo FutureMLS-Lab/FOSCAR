@@ -64,7 +64,7 @@ RULES A CHANGE HERE MUST RESPECT
 
 The self-test below is the cheap always-on version of the held-out validation,
 pinned to measured optima so it fails loudly if these constants drift.
-Run: ``python src/cutedsl_decode/_sm100/scheduler.py``.
+Run: ``python src/fosca/_sm100/scheduler.py``.
 """
 import math
 

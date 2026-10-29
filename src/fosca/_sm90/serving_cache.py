@@ -371,7 +371,7 @@ def make_serving_cache(per_req_codes_k, per_req_codes_v, per_req_scales, seq_len
 # Flexible-granularity pool (per-tensor quant configs) — consumed by IntPingPongDecodeSm90's
 # k_quant/v_quant modes.  The scale-block layout is NOT defined here, and must not be
 # copied here: it is the same contract both decode kernels read, and a second copy needs
-# a drift check to stay honest.  See `cutedsl_decode/quant_layout.py` for the sectioned
+# a drift check to stay honest.  See `fosca/quant_layout.py` for the sectioned
 # layout it describes.
 # ---------------------------------------------------------------------------------------------
 from ..quant_layout import quant_block_offsets  # noqa: F401  (re-exported for callers)

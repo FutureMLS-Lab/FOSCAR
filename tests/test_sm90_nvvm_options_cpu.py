@@ -15,7 +15,7 @@ import pytest
 pytest.importorskip("cutlass", reason="needs nvidia-cutlass-dsl")
 
 runtime = pytest.importorskip(
-    "cutedsl_decode._sm90.pingpong_runtime", reason="imports torch")
+    "fosca._sm90.pingpong_runtime", reason="imports torch")
 
 
 def _kern(head_dim, fused_combine, bits=2, k=("token", 128), v=("token", 128)):

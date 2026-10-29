@@ -11,13 +11,13 @@ import torch
 pytest.importorskip("cuda", reason="needs the CUDA Python bindings")
 
 
-PACKAGE_DIR = Path(__file__).resolve().parents[1] / "src/cutedsl_decode"
+PACKAGE_DIR = Path(__file__).resolve().parents[1] / "src/fosca"
 SM100_DIR = PACKAGE_DIR / "_sm100"
-HOST_PACKAGE = "_cutedsl_decode_sm100_host_test"
-HOST_PARENT = "_cutedsl_decode_host_test_parent"
+HOST_PACKAGE = "_fosca_sm100_host_test"
+HOST_PARENT = "_fosca_host_test_parent"
 #: Every synthetic sys.modules name this fixture installs, so it can undo them.
 _INSTALLED: list[str] = []
-WRAPPER_HOST_PACKAGE = "_cutedsl_decode_wrapper_host_test"
+WRAPPER_HOST_PACKAGE = "_fosca_wrapper_host_test"
 
 
 def _load_fold_runtime():
@@ -27,7 +27,7 @@ def _load_fold_runtime():
     synthetic package needs a PARENT for that relative import to resolve; without one
     it fails with "attempted relative import beyond top-level package". The parent is
     built here and the layout module preloaded into it, which keeps the fixture
-    torch-only: `cutedsl_decode/quant_layout.py` imports nothing at all.
+    torch-only: `fosca/quant_layout.py` imports nothing at all.
 
     Every synthetic name is recorded in `_INSTALLED` so `_unload_fold_runtime` can take
     them back out; without that, whichever test ran first would fix the module identity
@@ -408,7 +408,7 @@ def test_run_requires_the_k_pool_order_where_the_pool_is_permuted(k_quant, bits)
     (("token", 128), 2, {"dequant_int2_to_f4": 0}),   # the E4M3 feed
 ])
 def test_run_needs_no_declaration_where_the_pool_is_logical(k_quant, bits, kkw):
-    """Every configuration that reads `pack_rows_lut` order keeps working with no
+    """Every configuration that reads `pack_rows` order keeps working with no
     new argument, so no existing dense caller changes.
 
     The declaration a caller owes depends on the same predicate that decides

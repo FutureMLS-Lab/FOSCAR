@@ -1,6 +1,6 @@
 # Copyright 2026 Donglin Zhuang
 # SPDX-License-Identifier: Apache-2.0
-# src/cutedsl_decode/kernel_contract.py
+# src/fosca/kernel_contract.py
 """The constructor contract both decode kernels share: names, meanings, validation.
 
 No kernel body lives here, and that restriction is the point rather than an oversight.

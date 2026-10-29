@@ -27,11 +27,11 @@ pytest.importorskip("cuda", reason="needs the CUDA Python bindings")
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from cutedsl_decode.pool import (D, PS, _T8_I4, _check_k_store_perm,  # noqa: E402
+from fosca.pool import (D, PS, _T8_I4, _check_k_store_perm,  # noqa: E402
                                  _k_store_perm_inverse, build_pools_flex,
-                                 build_pools_lut, check_k_store_perm_f4,
+                                 build_pools, check_k_store_perm_f4,
                                  check_k_store_perm_i4, dequant_pools_flex,
-                                 dequant_pools_lut, k_store_perm_sm100_f4,
+                                 dequant_pools, k_store_perm_sm100_f4,
                                  v_store_perm_sm100, v_store_perm_sm100_f4)
 
 
@@ -53,13 +53,13 @@ def test_k_and_v_shuffle_only_the_reduction_axis(bits):
 
 @pytest.mark.parametrize("bits", [2, 4])
 def test_v_two_mask_expansion_and_pool_shape(bits):
-    from cutedsl_decode.pool import _gate_f4_v_perm, _gate_i4_v_perm
+    from fosca.pool import _gate_f4_v_perm, _gate_i4_v_perm
     gate = _gate_f4_v_perm if bits == 2 else _gate_i4_v_perm
     assert gate(seed=17)
     torch.manual_seed(31)
     k = torch.randn(2, PS, 3, D)
     v = torch.randn_like(k)
-    pools = build_pools_lut(k, v, bits,
+    pools = build_pools(k, v, bits,
                             k_store_perm=k_store_perm_sm100_f4(bits),
                             v_store_perm=v_store_perm_sm100_f4(bits))
     assert pools[0].shape == (2, 3, PS, D * bits // 8)
@@ -78,7 +78,7 @@ def test_old_int4_whole_page_order_is_not_the_main_pool_contract(monkeypatch):
     assert torch.equal(torch.sort(new).values, torch.arange(D * PS))
     # Sensitivity control: the expansion oracle must reject an old-layout pool,
     # not simply agree with whichever packing convention it is handed.
-    from cutedsl_decode import pool as pool_mod
+    from fosca import pool as pool_mod
     monkeypatch.setattr(pool_mod, "v_store_perm_sm100_f4", lambda bits: old)
     assert not pool_mod._gate_i4_v_perm(seed=17)
 
@@ -91,7 +91,7 @@ def k_pool_perm(bits, kernel_kwargs=None):
     dict. The import is lazy because the predicate lives beside the kernel, which
     pulls in the CuTe DSL; the gates above are pure Python and must stay
     collectable without it."""
-    from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
+    from fosca._sm100.int_fold_decode import IntDecodeSm100
 
     kkw = dict(kernel_kwargs or {})
     if not IntDecodeSm100.k_pool_is_permuted(
@@ -274,12 +274,12 @@ def unpack(mKq, k_store_perm):
     caller passes the FORWARD perm to model the regression and the inverse to
     model the correct reference; the parameter carries the contract name so
     `test_pool_call_sites_cpu` sees the order is taken, not assumed."""
-    from cutedsl_decode.pool import unpack_rows_lut
-    return unpack_rows_lut(mKq, 4, D).float()[..., k_store_perm.long()]
+    from fosca.pool import unpack_rows
+    return unpack_rows(mKq, 4, D).float()[..., k_store_perm.long()]
 
 
 def test_only_the_int2_e4m3_feed_is_logical():
-    """The int2 e4m3 feed reads `pack_rows_lut` spacing, so the predicate must
+    """The int2 e4m3 feed reads `pack_rows` spacing, so the predicate must
     answer False for it and the pool writer must leave it logical. int4's
     raw-code deposit reads the 8-slot shuffle at every configuration, so the
     predicate answers True for it with no feed term.
@@ -287,7 +287,7 @@ def test_only_the_int2_e4m3_feed_is_logical():
     The property is a positive statement about the predicate, which is the
     stronger form: a refusal only fires when a caller asks, while the predicate
     is what every caller gets."""
-    from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
+    from fosca._sm100.int_fold_decode import IntDecodeSm100
     assert IntDecodeSm100.k_pool_is_permuted(2, dequant_int2_to_f4=0) is False
     assert k_pool_perm(2, {"dequant_int2_to_f4": 0}) is None
     assert IntDecodeSm100.k_pool_is_permuted(4) is True
@@ -317,20 +317,20 @@ def test_validator_rejects_non_permutations_and_cross_width_perms():
 
 
 def test_legacy_pool_builder_applies_and_inverts_the_perm():
-    """`build_pools_lut` is the legacy path `make_pool_problem` and the e2e gate
+    """`build_pools` is the legacy path `make_pool_problem` and the e2e gate
     use. It applies the K store permutation to the K pool only, and its
     reference dequantization inverts it."""
     torch.manual_seed(0)
-    # build_pools_lut takes [NP, PS, HKV, D]
+    # build_pools takes [NP, PS, HKV, D]
     k = torch.randn(2, PS, 1, D, dtype=torch.bfloat16)
     v = torch.randn(2, PS, 1, D, dtype=torch.bfloat16)
     kperm = k_store_perm_sm100_f4(2)
-    plain = build_pools_lut(k, v, 2)
-    permd = build_pools_lut(k, v, 2, k_store_perm=kperm)
+    plain = build_pools(k, v, 2)
+    permd = build_pools(k, v, 2, k_store_perm=kperm)
     assert not torch.equal(plain[0], permd[0]), "perm did not reach the K pool"
     assert torch.equal(plain[1], permd[1]), "perm must not touch the V pool"
-    k_plain, _ = dequant_pools_lut(*plain, 2)
-    k_permd, _ = dequant_pools_lut(*permd, 2, k_store_perm=kperm)
+    k_plain, _ = dequant_pools(*plain, 2)
+    k_permd, _ = dequant_pools(*permd, 2, k_store_perm=kperm)
     assert torch.allclose(k_plain, k_permd), "reference did not invert the order"
 
 
@@ -348,7 +348,7 @@ def test_channel_wise_k_is_permuted_too():
     exhaustively on a basis rather than by sampling. Group locality is checked
     below as a separate, weaker property: sigma never moves a value across a
     16-channel group, so it never crosses a packed word."""
-    from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
+    from fosca._sm100.int_fold_decode import IntDecodeSm100
     for k_quant in (("channel", 64), ("channel", 128), ("channel", 256)):
         kwargs = {"dequant_int2_to_f4": 1, "k_quant": k_quant}
         assert IntDecodeSm100.k_pool_is_permuted(2, **kwargs) is True
@@ -359,7 +359,7 @@ def test_channel_wise_k_is_permuted_too():
         for d in range(perm.numel()):
             assert int(perm[d]) // 16 == d // 16, (d, int(perm[d]))
     # And the property the safety actually rests on, stated where it is used.
-    from cutedsl_decode.pool import check_k_store_perm_f4
+    from fosca.pool import check_k_store_perm_f4
     assert check_k_store_perm_f4() is True
 
 
@@ -368,7 +368,7 @@ def test_token_wise_k_is_permuted_with_no_kwarg():
 
     No kwarg appears here, which is the property under test: the layout follows
     from bits, feed and axis alone."""
-    from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
+    from fosca._sm100.int_fold_decode import IntDecodeSm100
     k = IntDecodeSm100(64, D, 4, bits=2, dequant_int2_to_f4=1,
                         k_quant=("token", 128), v_quant=("token", 128))
     assert k.k_pool_permuted is True
@@ -382,7 +382,7 @@ def test_the_removed_kwarg_is_gone():
     A kwarg that is silently accepted and does nothing is worse than one that
     raises: a caller who passes `k_f4_prepermuted=0` believes it is getting a
     logical pool from a kernel that reads a permuted one."""
-    from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
+    from fosca._sm100.int_fold_decode import IntDecodeSm100
     with pytest.raises(TypeError):
         IntDecodeSm100(64, D, 4, bits=2, k_f4_prepermuted=0)
 
@@ -393,7 +393,7 @@ def test_the_removed_kwarg_is_gone():
 # pool is built one way and read the other with no symptom.
 
 def _predicate():
-    from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
+    from fosca._sm100.int_fold_decode import IntDecodeSm100
     return IntDecodeSm100.k_pool_is_permuted
 
 
@@ -420,7 +420,7 @@ def test_the_predicate_answers_for_every_knob(bits, kw, want):
 def test_pool_keying_cannot_disagree_with_the_kernel(bits, kw):
     """The one property everything else rests on. `k_pool_perm` must return a
     permutation exactly when the kernel reads one, for every knob combination."""
-    from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100 as cls
+    from fosca._sm100.int_fold_decode import IntDecodeSm100 as cls
     kernel_on = cls.k_pool_is_permuted(
         bits,
         dequant_int2_to_f4=kw.get("dequant_int2_to_f4"),
@@ -434,7 +434,7 @@ def test_pool_keying_cannot_disagree_with_the_kernel(bits, kw):
 def test_the_shipped_int2_config_is_permuted_with_no_kwarg():
     """Stated as its own gate because it is the shipped configuration: an int2
     kernel built with nothing but its width reads a permuted pool."""
-    from cutedsl_decode._sm100.int_fold_decode import IntDecodeSm100
+    from fosca._sm100.int_fold_decode import IntDecodeSm100
     k = IntDecodeSm100(64, D, 4, bits=2)
     assert k.dequant_int2_to_f4 is True, "precondition: f4 is the int2 default"
     assert k.k_pool_permuted is True

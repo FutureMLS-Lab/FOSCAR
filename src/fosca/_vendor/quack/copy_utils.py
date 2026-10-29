@@ -16,8 +16,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 
-from cutedsl_decode._vendor.quack import layout_utils
-from cutedsl_decode._vendor.quack.utils import make_vector
+from fosca._vendor.quack import layout_utils
+from fosca._vendor.quack.utils import make_vector
 
 
 Sm100MmaPeerBitMask = 0xFEFFFFFF
@@ -58,7 +58,7 @@ def sr_cvt_copy(
 ) -> None:
     """Like cvt_copy but uses stochastic rounding for FP32 -> BF16 conversion."""
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
-    from cutedsl_decode._vendor.quack.rounding import convert_f32_to_bf16_sr
+    from fosca._vendor.quack.rounding import convert_f32_to_bf16_sr
     from cutlass.cute.tensor import TensorSSA
 
     src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)

@@ -64,7 +64,7 @@ import pytest
 from ._smem_banks import wavefronts
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-KERNEL = ROOT / "src/cutedsl_decode/_sm100/int_fold_decode.py"
+KERNEL = ROOT / "src/fosca/_sm100/int_fold_decode.py"
 
 #: The inputs `kernel` hands `_dequant_warpgroup`, at page 64 and head_dim 128 (the only page
 #: size the kernel accepts, `kernel_contract.py`; the only head dim the wrapper accepts).

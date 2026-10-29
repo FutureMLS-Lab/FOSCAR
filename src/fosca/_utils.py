@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Device detection and the capability descriptor.
 
-This module imports nothing from the CuTe DSL, so importing ``cutedsl_decode``
+This module imports nothing from the CuTe DSL, so importing ``fosca``
 works on a machine that has no CUDA toolkit installed.
 """
 import functools

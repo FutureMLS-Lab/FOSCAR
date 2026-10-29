@@ -30,7 +30,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-SRC = REPO / "src" / "cutedsl_decode"
+SRC = REPO / "src" / "fosca"
 
 #: Every decode constructor that fixes D, and the rule each one enforces.
 D_128_OR_256 = (
@@ -71,7 +71,7 @@ BUILDERS = {
 
 def _cls(module, name):
     import importlib
-    return getattr(importlib.import_module(f"cutedsl_decode.{module}"), name)
+    return getattr(importlib.import_module(f"fosca.{module}"), name)
 
 
 def _build(module, name, head_dim):
@@ -154,7 +154,7 @@ def test_plan_refuses_an_unaccepted_head_dim():
     ones below never get read; passing real ones would need a device.
     """
     wrapper = pytest.importorskip(
-        "cutedsl_decode.wrapper", reason="the wrapper imports torch and the DSL")
+        "fosca.wrapper", reason="the wrapper imports torch and the DSL")
     empty = torch.zeros(1, dtype=torch.int32)
     with pytest.raises(ValueError) as e:
         wrapper.PagedDecodeWrapper(torch.zeros(1)).plan(
@@ -176,7 +176,7 @@ def test_plan_refuses_head_dim_256_on_sm100(monkeypatch):
     """SM100's kernel builds 256 but nothing measures it there, so plan() refuses it once the
     architecture is known, naming SM100."""
     wrapper = pytest.importorskip(
-        "cutedsl_decode.wrapper", reason="the wrapper imports torch and the DSL")
+        "fosca.wrapper", reason="the wrapper imports torch and the DSL")
     monkeypatch.setattr(wrapper, "_is_sm90", lambda *a, **k: False)
     with pytest.raises(ValueError, match="plan\\(\\) accepts 128 only on SM100"):
         _plan_on_cpu(wrapper)
@@ -188,7 +188,7 @@ def test_plan_passes_the_head_dim_checks_at_256_on_sm90(monkeypatch):
     An unknown kernel keyword stops it there with that path's own refusal, before anything is
     compiled or any placeholder paging tensor is read on a device."""
     wrapper = pytest.importorskip(
-        "cutedsl_decode.wrapper", reason="the wrapper imports torch and the DSL")
+        "fosca.wrapper", reason="the wrapper imports torch and the DSL")
     monkeypatch.setattr(wrapper, "_is_sm90", lambda *a, **k: True)
     with pytest.raises(NotImplementedError, match="the SM90 quantized path takes its knobs"):
         _plan_on_cpu(wrapper, kernel_kwargs={"not_a_knob": 1})
@@ -220,7 +220,7 @@ def test_plan_at_256_refuses_every_layout_but_the_built_one_on_sm90(monkeypatch,
     """At 256 the SM90 path refuses every layout but the one the kernel builds with the
     constructor's own reason, ahead of the D=128 envelope's assert and pool advice."""
     wrapper = pytest.importorskip(
-        "cutedsl_decode.wrapper", reason="the wrapper imports torch and the DSL")
+        "fosca.wrapper", reason="the wrapper imports torch and the DSL")
     monkeypatch.setattr(wrapper, "_is_sm90", lambda *a, **k: True)
     monkeypatch.setattr(wrapper, "get_num_sm", _stop_at_the_planner)
     kernel_kwargs = {"sdtype": torch.bfloat16} if bf16_pool else None
@@ -234,7 +234,7 @@ def test_plan_at_256_admits_the_built_layout_up_to_the_planner_on_sm90(monkeypat
                                                                         v_quant):
     """The layout the kernel builds at 256 passes every layout check and reaches the planner."""
     wrapper = pytest.importorskip(
-        "cutedsl_decode.wrapper", reason="the wrapper imports torch and the DSL")
+        "fosca.wrapper", reason="the wrapper imports torch and the DSL")
     monkeypatch.setattr(wrapper, "_is_sm90", lambda *a, **k: True)
     monkeypatch.setattr(wrapper, "get_num_sm", _stop_at_the_planner)
     with pytest.raises(_Planned):
@@ -246,7 +246,7 @@ def test_plan_at_128_still_names_the_pool_k_token_half_needs_on_sm90(monkeypatch
     """The one-layout refusal is scoped to head dimensions other than 128: at 128, K token-64
     with a float32 pool still gets the advice to build a bfloat16 pool."""
     wrapper = pytest.importorskip(
-        "cutedsl_decode.wrapper", reason="the wrapper imports torch and the DSL")
+        "fosca.wrapper", reason="the wrapper imports torch and the DSL")
     monkeypatch.setattr(wrapper, "_is_sm90", lambda *a, **k: True)
     monkeypatch.setattr(wrapper, "get_num_sm", _stop_at_the_planner)
     with pytest.raises(ValueError, match="token-64 requires a bfloat16 scale pool"):
@@ -256,7 +256,7 @@ def test_plan_at_128_still_names_the_pool_k_token_half_needs_on_sm90(monkeypatch
 def test_compile_constructed_refuses_a_mismatched_head_dim():
     """A D=128 kernel compiled against D=64 tensors is the bypass the guard misses."""
     runtime = pytest.importorskip(
-        "cutedsl_decode._sm90.pingpong_runtime", reason="imports the DSL")
+        "fosca._sm90.pingpong_runtime", reason="imports the DSL")
     src = Path(runtime.__file__).read_text()
     assert "kern.head_dim" in src, (
         "compile_constructed must tie the fake tensor extents to the kernel's own "
@@ -265,7 +265,7 @@ def test_compile_constructed_refuses_a_mismatched_head_dim():
 
 def test_the_shared_contract_floor_is_128_not_64():
     contract = pytest.importorskip(
-        "cutedsl_decode.kernel_contract", reason="imports torch")
+        "fosca.kernel_contract", reason="imports torch")
     contract.validate_problem(page_size=64, head_dim=128, q_head_tile=8, bits=2)
     with pytest.raises(AssertionError):
         contract.validate_problem(page_size=64, head_dim=64, q_head_tile=8, bits=2)
@@ -293,14 +293,14 @@ def test_every_fixed_d_kernel_carries_a_guard_in_source(module, name):
 #: Hopper host path that carries no head-dimension default and resolves the head
 #: dimension from its caller, and the list holds every such function.
 NO_HEAD_DIM_DEFAULT = (
-    ("src/cutedsl_decode/_sm90/int_decode_pingpong.py", "IntPingPongDecodeSm90.__init__"),
-    ("src/cutedsl_decode/_sm90/pingpong_runtime.py", "compile_pingpong"),
-    ("src/cutedsl_decode/_sm90/pingpong_runtime.py", "plan_pingpong"),
-    ("src/cutedsl_decode/_sm90/serving_cache.py", "make_serving_cache_flex"),
-    ("src/cutedsl_decode/quant_layout.py", "quant_block_offsets"),
-    ("src/cutedsl_decode/_sm90/splitk_combine.py", "SplitKCombine.__init__"),
-    ("src/cutedsl_decode/_sm90/scheduler.py", "plan_splits"),
-    ("src/cutedsl_decode/_sm90/scheduler.py", "_plan_pingpong_model"),
+    ("src/fosca/_sm90/int_decode_pingpong.py", "IntPingPongDecodeSm90.__init__"),
+    ("src/fosca/_sm90/pingpong_runtime.py", "compile_pingpong"),
+    ("src/fosca/_sm90/pingpong_runtime.py", "plan_pingpong"),
+    ("src/fosca/_sm90/serving_cache.py", "make_serving_cache_flex"),
+    ("src/fosca/quant_layout.py", "quant_block_offsets"),
+    ("src/fosca/_sm90/splitk_combine.py", "SplitKCombine.__init__"),
+    ("src/fosca/_sm90/scheduler.py", "plan_splits"),
+    ("src/fosca/_sm90/scheduler.py", "_plan_pingpong_model"),
 )
 
 
@@ -357,7 +357,7 @@ def test_the_hopper_kernel_refuses_a_bad_head_dim_before_the_shared_validator(he
 def test_the_hopper_default_pair_builds_the_d128_kernel(bits, fused_combine, fold):
     """The attributes the kernel cache keys on, and every value the host launch reads, are
     those of the kernel built with ("token", 128) for both tensors."""
-    from cutedsl_decode import kernel_cache
+    from fosca import kernel_cache
 
     cls = _cls("_sm90.int_decode_pingpong", "IntPingPongDecodeSm90")
     common = dict(bits=bits, fused_combine=fused_combine, fold_scale_zero=fold,

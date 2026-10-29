@@ -10,7 +10,7 @@ passed in rather than derived, since deriving it is a device synchronisation.
 import pytest
 import torch
 
-from cutedsl_decode import (
+from fosca import (
     PagedDecodeWrapper,
     get_capabilities,
     is_supported,
@@ -40,7 +40,7 @@ def _planned(bits):
         v = torch.randn_like(k)
         k_perm = pool.k_store_perm_sm100_f4(bits)
         v_perm = pool.v_store_perm_sm100_f4(bits)
-        mKq, mVq, mScale = pool.build_pools_lut(k, v, bits,
+        mKq, mVq, mScale = pool.build_pools(k, v, bits,
                                                 k_store_perm=k_perm,
                                                 v_store_perm=v_perm)
         seq = torch.full((BATCH,), KV, device="cuda", dtype=torch.int32)

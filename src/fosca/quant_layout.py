@@ -1,6 +1,6 @@
 # Copyright 2026 Donglin Zhuang
 # SPDX-License-Identifier: Apache-2.0
-# src/cutedsl_decode/quant_layout.py
+# src/fosca/quant_layout.py
 """The scale-block layout and quantization envelope, shared by both decode kernels.
 
 Torch-free, so the kernel modules can import it.  Per (page, kv-head) the scale

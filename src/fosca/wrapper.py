@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Copyright (c) 2026 Donglin Zhuang (standalone cutedsl-decode adaptation).
+# Copyright (c) 2026 Donglin Zhuang (standalone fosca adaptation).
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from FlashInfer's CuTe DSL paged-decode wrapper (see NOTICE).
 
@@ -81,7 +81,7 @@ def _torch_to_cutlass(dtype: torch.dtype):
     }
     if dtype not in table:
         raise TypeError(
-            f"cutedsl-decode does not support {dtype}; supported: {list(table)}"
+            f"fosca does not support {dtype}; supported: {list(table)}"
         )
     return table[dtype]
 
@@ -158,7 +158,7 @@ def _get_compiled_fold_kernel(
     module serves every batch size and KV length. A trace costs 10 to 13 s on
     B200, so this in-process memo is the
     difference between a usable plan() and an unusable one, and
-    :mod:`cutedsl_decode.kernel_cache` underneath it serves a repeat of the same
+    :mod:`fosca.kernel_cache` underneath it serves a repeat of the same
     trace from disk across processes.
 
     ``kernel_kwargs`` arrives as a sorted tuple of pairs because
@@ -963,10 +963,10 @@ class PagedDecodeWrapper:
 
         NOTHING CAN DETECT THIS FROM THE BYTES. The kernel reads a K pool
         whose codes were permuted at store time by
-        `cutedsl_decode.pool.k_store_perm_sm100_f4`: at int4 at EVERY configuration
+        `fosca.pool.k_store_perm_sm100_f4`: at int4 at EVERY configuration
         (the raw-feed 8-slot shuffle) and at int2 with the E2M1 feed at either
         K axis. A pool written in
-        `pack_rows_lut` order has the same dtype, the same shape and the same byte
+        `pack_rows` order has the same dtype, the same shape and the same byte
         count, and decodes to finite, plausible values with every K channel taken
         from the wrong slot inside its packed-word group. No validation can see
         that, so the only alternative to a silent wrong answer is to make the
@@ -975,7 +975,7 @@ class PagedDecodeWrapper:
 
         This is where the risk lives: a pool writer can build the order the
         kernel does not read, and nothing in the pool's bytes reveals which order
-        it carries. `cutedsl_decode.pool` and `docs/K_STORE_PERM.md` give a writer
+        it carries. `fosca.pool` and `docs/K_STORE_PERM.md` give a writer
         the order it has to meet; this guard covers a caller that builds pools
         some other way.
 
@@ -1006,7 +1006,7 @@ class PagedDecodeWrapper:
         if not want_permuted:
             if k_pool_order == "permuted":
                 raise ValueError(
-                    "this plan reads K in LOGICAL (pack_rows_lut) order, so a "
+                    "this plan reads K in LOGICAL (pack_rows) order, so a "
                     "permuted pool would be read wrong. Ask "
                     "IntDecodeSm100.k_pool_is_permuted; "
                     "see docs/K_STORE_PERM.md")
@@ -1016,17 +1016,17 @@ class PagedDecodeWrapper:
                 "this plan reads a PERMUTED K pool, and the order cannot be "
                 "detected from the pool itself, so run() requires you to declare "
                 "it: pass k_pool_order='permuted' if the K codes were permuted "
-                "by cutedsl_decode.pool.k_store_perm_sm100_f4 before packing, which is "
+                "by fosca.pool.k_store_perm_sm100_f4 before packing, which is "
                 "what this configuration reads (bits=4 at every configuration, "
                 "or bits=2 with the E2M1 feed at either K axis). A pool in "
-                "pack_rows_lut order is silently wrong "
+                "pack_rows order is silently wrong "
                 "here at every K channel. See docs/K_STORE_PERM.md")
         if k_pool_order != "permuted":
             raise ValueError(
                 "k_pool_order='logical' contradicts this plan, which reads a "
                 "PERMUTED K pool (bits=4 everywhere; bits=2 with the E2M1 feed "
                 "at either K axis). Permute "
-                "the K codes with cutedsl_decode.pool.k_store_perm_sm100_f4 before "
+                "the K codes with fosca.pool.k_store_perm_sm100_f4 before "
                 "packing, or plan a configuration that reads logical order; see "
                 "docs/K_STORE_PERM.md")
 
@@ -1274,7 +1274,7 @@ class PagedDecodeWrapper:
             main SM100 kernel, rebuild INT4 V caches created before the
             K-major V alignment: their shape is unchanged but their byte
             order is incompatible. Resolve the writer's order with
-            ``cutedsl_decode.pool.v_store_perm_sm100_f4(bits)``; see
+            ``fosca.pool.v_store_perm_sm100_f4(bits)``; see
             ``docs/K_STORE_PERM.md``. INT2 layouts are unchanged by that
             alignment. On Hopper both code pools are in the chunk16 order that
             ``IntPingPongDecodeSm90.code_pool_order`` names,
@@ -1295,8 +1295,8 @@ class PagedDecodeWrapper:
             shuffle) and INT2 with the E2M1 feed at either K axis. A caller
             that omits it where it is required is refused rather than run wrong.
             ``"permuted"`` says the K codes were reordered by
-            ``cutedsl_decode.pool.k_store_perm_sm100_f4`` before packing; ``"logical"``
-            says they are in plain ``pack_rows_lut`` order. ``None`` is accepted
+            ``fosca.pool.k_store_perm_sm100_f4`` before packing; ``"logical"``
+            says they are in plain ``pack_rows`` order. ``None`` is accepted
             only for configurations that read logical order: dense callers and
             the INT2 e4m3 feed.
 

@@ -2,7 +2,7 @@
 
 This page specifies the byte order in which the Blackwell (SM100) decode kernel
 expects its quantized K and V pools to be written. It is for anyone who fills a
-pool outside `cutedsl_decode.pool`: a serving-cache append path, a converter from
+pool outside `fosca.pool`: a serving-cache append path, a converter from
 another cache format, or a fixture that packs its own codes. The builder API is
 summarized in [Building pools](../README.md#building-pools); this page is the
 normative statement of the order itself. Hopper pools use a different layout and
@@ -27,7 +27,7 @@ The scale pool is unaffected by the store order. At the legacy granularity, wher
 both K and V are token-wise with group 128, it is `f32 [NP, HKV, 64, 4]` holding
 `(s_k, z_k, s_v, z_v)` per token. At any other granularity it is the sectioned
 block `[NP, HKV, block_tot]` in the pool's storage dtype, whose section offsets
-come from `cutedsl_decode.quant_layout.quant_block_offsets`.
+come from `fosca.quant_layout.quant_block_offsets`.
 
 ## The two store permutations
 
@@ -61,7 +61,7 @@ eight channels from the wrong slot.
 
 ### Why the masks need these orders
 
-`pack_rows_lut` is the packer both pools go through. At INT4 it writes sequential
+`pack_rows` is the packer both pools go through. At INT4 it writes sequential
 nibbles, so byte `i` holds code `2i` in the low nibble and code `2i + 1` in the
 high nibble. At INT2 it puts code `i` of a 16-code group at bit
 `b(i) = 16 * (i // 8) + 4 * (i % 4) + 2 * ((i % 8) // 4)`, a bijection onto the
@@ -119,7 +119,7 @@ same answer as `k_pool_permuted`.
 
 ## Resolver entry points
 
-`cutedsl_decode.pool` owns the orders and the builders that apply them.
+`fosca.pool` owns the orders and the builders that apply them.
 
 | Entry point | Returns |
 |---|---|
@@ -131,9 +131,9 @@ same answer as `k_pool_permuted`.
 | `_check_v_store_perm(perm)` | raises unless `perm` is a permutation of its own index range |
 | `check_k_store_perm_f4()`, `check_k_store_perm_i4()` | the operand-word oracles described under Validation |
 
-`build_pools_lut`, `pack_pools_lut` and `build_pools_flex` take the arrays as
+`build_pools`, `pack_pools` and `build_pools_flex` take the arrays as
 `k_store_perm=` and `v_store_perm=` and apply them before packing, with `None`
-meaning logical order. `dequant_pools_lut` and `dequant_pools_flex` take the same
+meaning logical order. `dequant_pools` and `dequant_pools_flex` take the same
 arrays to invert the order. `PagedDecodeWrapper.run(k_pool_order=...)` takes
 `"permuted"` or `"logical"` where the kernel reads a permuted pool and accepts
 `None` only where it reads logical order. The declaration is checked against the
@@ -145,7 +145,7 @@ arrays directly:
 
 ```python
 import torch
-from cutedsl_decode import pool
+from fosca import pool
 
 NP, HKV, bits = 4, 2, 2
 k_codes = torch.randint(0, 2**bits, (NP, HKV, 64, 128), dtype=torch.uint8)
@@ -154,12 +154,12 @@ v_codes = torch.randint(0, 2**bits, (NP, HKV, 64, 128), dtype=torch.uint8)
 k_store = pool.k_store_perm_sm100_f4(bits)   # (128,): stored slot -> logical channel
 v_store = pool.v_store_perm_sm100_f4(bits)   # (8192,): flat channel-major position
 
-k_pool = pool.pack_rows_lut(k_codes[..., k_store], bits)          # [NP, HKV, 64, 32]
+k_pool = pool.pack_rows(k_codes[..., k_store], bits)          # [NP, HKV, 64, 32]
 
 v_t = v_codes.transpose(-1, -2).contiguous()                      # [NP, HKV, 128, 64]
 lead = v_t.shape[:-2]
 v_t = v_t.reshape(*lead, 128 * 64)[..., v_store].reshape(*lead, 128, 64)
-v_pool = pool.pack_rows_lut(v_t, bits)                            # [NP, HKV, 128, 16]
+v_pool = pool.pack_rows(v_t, bits)                            # [NP, HKV, 128, 16]
 
 assert pool.check_k_store_perm_f4() is True
 assert pool.check_k_store_perm_i4() is True

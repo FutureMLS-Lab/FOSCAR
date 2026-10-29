@@ -1,5 +1,5 @@
 # tests/test_public_api.py
-import cutedsl_decode as cd
+import fosca as cd
 
 
 def test_public_surface():

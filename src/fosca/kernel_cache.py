@@ -43,7 +43,7 @@ WHEN IT STANDS ASIDE. Whenever the DSL is asked to dump PTX, cubin or IR
 tiling report (``FOLD_TRACE_TILING``): those gates' evidence is the trace itself,
 and the variable's presence is what counts, not its value. Whenever
 ``cutedsl_profiling`` has been imported, because an instrumented kernel bakes
-session state into the object. Whenever ``CUTEDSL_DECODE_KERNEL_CACHE=0``, which a
+session state into the object. Whenever ``FOSCA_KERNEL_CACHE=0``, which a
 caller sets when its claim is that a configuration traces or that processes
 compile independently. And whenever the cache root cannot be created or locked,
 because a benchmark must not fail on a full or read-only disk. In every one of
@@ -80,11 +80,11 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 #: ``0`` (or ``false`` / ``off`` / ``no``) turns the on-disk layer off for the process.
-ENABLE_ENV = "CUTEDSL_DECODE_KERNEL_CACHE"
-#: Overrides the cache root. The default is ``$XDG_CACHE_HOME/cutedsl-decode/kernel-cache``
-#: or ``~/.cache/cutedsl-decode/kernel-cache``. Put it on local disk on a box whose home
+ENABLE_ENV = "FOSCA_KERNEL_CACHE"
+#: Overrides the cache root. The default is ``$XDG_CACHE_HOME/fosca/kernel-cache``
+#: or ``~/.cache/fosca/kernel-cache``. Put it on local disk on a box whose home
 #: is NFS.
-DIR_ENV = "CUTEDSL_DECODE_KERNEL_CACHE_DIR"
+DIR_ENV = "FOSCA_KERNEL_CACHE_DIR"
 #: Environment variables whose PRESENCE means the caller needs a real trace: the DSL
 #: dump and dry-run knobs, which a check on the emitted PTX depends on, and the SM100
 #: tiling report, which is printed from inside the trace.
@@ -146,7 +146,7 @@ PROFILING_MODULE = "cutedsl_profiling"
 #: artifact reads as a miss rather than as a hit with a different meaning.
 FORMAT_VERSION = 2
 #: The package this module belongs to; the source closure never leaves it.
-PACKAGE = "cutedsl_decode"
+PACKAGE = "fosca"
 PACKAGE_DIR = Path(__file__).resolve().parent
 
 
@@ -187,14 +187,14 @@ def default_root() -> Path:
     if override:
         return Path(override).expanduser()
     base = os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache")
-    return Path(base).expanduser() / "cutedsl-decode" / "kernel-cache"
+    return Path(base).expanduser() / "fosca" / "kernel-cache"
 
 
 def status() -> dict:
     """Whether this process may use the disk cache, and why not if not.
 
     Read at every call rather than once at import, so a gate that sets
-    ``CUTEDSL_DECODE_KERNEL_CACHE=0`` after importing the package is still honoured.
+    ``FOSCA_KERNEL_CACHE=0`` after importing the package is still honoured.
     A bypass variable counts as set when it is present, whatever its value: an empty
     ``CUTE_DSL_KEEP`` still tells the DSL to keep something.
     """
@@ -539,7 +539,7 @@ def compile_or_load(*, kind: str, compile_fn: Callable[[], Any], sources: dict[s
     root = Path(state["root"]) / kind
     object_path = root / f"{key}.o"
     sidecar_path = root / f"{key}.json"
-    symbol = f"cutedsl_decode_{kind}_{key[:16]}"
+    symbol = f"fosca_{kind}_{key[:16]}"
     loader = _loader or _load
 
     try:

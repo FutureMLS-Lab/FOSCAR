@@ -3,8 +3,8 @@ import math
 import pytest
 import torch
 
-from cutedsl_decode.wrapper import PagedDecodeWrapper
-from cutedsl_decode._utils import is_supported
+from fosca.wrapper import PagedDecodeWrapper
+from fosca._utils import is_supported
 
 pytestmark = pytest.mark.skipif(not is_supported(), reason="needs SM90 or SM100 GPU")
 DEV = torch.device("cuda")
@@ -67,7 +67,7 @@ def test_quant_flex_args_rejected_without_bits():
 
 
 def test_capabilities_advertise_quantized_bits():
-    from cutedsl_decode import get_capabilities
+    from fosca import get_capabilities
 
     caps = get_capabilities()
     assert caps["quantized_bits"] == [2, 4]

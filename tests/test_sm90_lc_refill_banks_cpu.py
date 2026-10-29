@@ -42,7 +42,7 @@ import pytest
 from ._smem_banks import wavefronts
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-KERNEL = ROOT / "src/cutedsl_decode/_sm90/int_decode_pingpong.py"
+KERNEL = ROOT / "src/fosca/_sm90/int_decode_pingpong.py"
 HELPERS = ("_lc_factor_layout", "_lc_factor_words")
 
 PAGE = 64            # the one page size both kernels accept (kernel_contract.validate_problem)

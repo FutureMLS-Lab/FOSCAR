@@ -85,7 +85,7 @@ def _plane_unpack_u32(w, bits):
     return torch.stack(out, -1).to(torch.uint8)
 
 
-def pack_rows(codes, bits):
+def _pack_rows_plane(codes, bits):
     """codes [..., R, E] (E elems per row) -> uint8 [..., R, E*bits//8] plane-word rows."""
     G = 32 // bits
     *lead, R, E = codes.shape
@@ -94,22 +94,22 @@ def pack_rows(codes, bits):
     return w.view(torch.uint8).reshape(*lead, R, E * bits // 8)
 
 
-def unpack_rows(packed, bits, E):
+def _unpack_rows_plane(packed, bits, E):
     G = 32 // bits
     *lead, R, B = packed.shape
     w = packed.reshape(*lead, R, B // 4, 4).view(torch.uint32).squeeze(-1)
     return _plane_unpack_u32(w, bits).reshape(*lead, R, E)
 
 
-def build_pools(k, v, bits):
+def _build_pools_plane(k, v, bits):
     """k, v: [NP, PS, HKV, D] bf16 (paged, physical pages). Returns (mKq, mVq, mScale).
     Pools are physical-page-indexed; the block table only matters at read time."""
     NP, ps, HKV, d = k.shape
     assert ps == PS and d == D
     qk, sk, zk = quant_tokenwise(k.permute(0, 2, 1, 3), bits)   # [NP,HKV,PS,D]
     qv, sv, zv = quant_tokenwise(v.permute(0, 2, 1, 3), bits)
-    mKq = pack_rows(qk, bits).contiguous()                       # [NP,HKV,PS,D*bits//8]
-    mVq = pack_rows(qv.transpose(-1, -2).contiguous(), bits).contiguous()  # [NP,HKV,D,PS*bits//8]
+    mKq = _pack_rows_plane(qk, bits).contiguous()                       # [NP,HKV,PS,D*bits//8]
+    mVq = _pack_rows_plane(qv.transpose(-1, -2).contiguous(), bits).contiguous()  # [NP,HKV,D,PS*bits//8]
     mScale = torch.stack([sk, zk, sv, zv], -1).float().contiguous()        # [NP,HKV,PS,4]
     # Byte contract the GPU kernel depends on: contiguous pools, 16B-aligned code rows.
     assert mKq.is_contiguous() and mVq.is_contiguous() and mScale.is_contiguous()
@@ -118,17 +118,17 @@ def build_pools(k, v, bits):
     return mKq, mVq, mScale
 
 
-def dequant_pools(mKq, mVq, mScale, bits):
-    """Inverse of build_pools -> (k_hat, v_hat) [NP,HKV,PS,D] f32 (STORAGE-MATCHED values)."""
-    qk = unpack_rows(mKq, bits, D).float()
-    qv = unpack_rows(mVq, bits, PS).float().transpose(-1, -2)   # back to [NP,HKV,PS,D]
+def _dequant_pools_plane(mKq, mVq, mScale, bits):
+    """Inverse of _build_pools_plane -> (k_hat, v_hat) [NP,HKV,PS,D] f32 (STORAGE-MATCHED values)."""
+    qk = _unpack_rows_plane(mKq, bits, D).float()
+    qv = _unpack_rows_plane(mVq, bits, PS).float().transpose(-1, -2)   # back to [NP,HKV,PS,D]
     sk, zk, sv, zv = mScale.unbind(-1)
     k_hat = qk * sk[..., None] + zk[..., None]
     v_hat = qv * sv[..., None] + zv[..., None]
     return k_hat, v_hat
 
 
-def pack_rows_lut(codes, bits):
+def pack_rows(codes, bits):
     """codes [..., R, E] (E % 16 == 0) -> uint8 [..., R, E*bits//8], LUT byte order.
     The bit layout is fixed by the kernel's byte-lane extraction and is checked by
     `check_k_store_perm_f4` and `check_k_store_perm_i4`; do not change it without
@@ -139,9 +139,9 @@ def pack_rows_lut(codes, bits):
       int2: code a of each 16-code group sits at bit 16*(a//8) + 4*(a%4) + 2*((a%8)//4) of a
             u32, so (w >> (16*(a//2)+2*(a%2))) & 0x3333 gathers codes 4a..4a+3 one per nibble
             (the OR-magic int2 dequant's selector nibbles).
-    The probe's `pack_lut` takes a flat [R, E] tensor; this wrapper flattens any leading batch
+    The packer takes a flat [R, E] tensor; this wrapper flattens any leading batch
     dims together with R (the packing is per-row, batch-independent) so it drops into
-    `build_pools_lut` the same way `pack_rows` drops into `build_pools`.
+    `build_pools` the same way `_pack_rows_plane` drops into `_build_pools_plane`.
     """
     *lead, R, E = codes.shape
     assert E % 16 == 0, E
@@ -170,8 +170,8 @@ def pack_rows_lut(codes, bits):
     return packed.reshape(*lead, R, E * bits // 8)
 
 
-def unpack_rows_lut(packed, bits, E):
-    """Inverse of `pack_rows_lut`. The round trip is exact at both widths."""
+def unpack_rows(packed, bits, E):
+    """Inverse of `pack_rows`. The round trip is exact at both widths."""
     *lead, R, B = packed.shape
     flat = packed.reshape(-1, B)
     if bits == 4:
@@ -198,10 +198,10 @@ def v_store_perm_sm100(bits):
     as 4x STS.128 (MN-major stage: dims contiguous). So stored flat code position
     j = col*128 + d must hold q[dim=d, tok=col] -> token-major: p[j] = (j%D)*PS + j//D.
 
-    int2 extra: `pack_rows_lut` puts input slot i of each 16-code group at bit
-    b_lut(i) = 16*(i//8) + 4*(i%4) + 2*((i%8)//4); the kernel's OR-magic
+    int2 extra: `pack_rows` puts input slot i of each 16-code group at bit
+    b(i) = 16*(i//8) + 4*(i%4) + 2*((i%8)//4); the kernel's OR-magic
     (w >> 2m) & 0x03030303 reads byte lane l from bits 8l+2m and assigns it local dim
-    delta = 4m + l. Solving b_lut(i) = 8l + 2m gives delta(i) = 4*((b%8)//2) + b//8,
+    delta = 4m + l. Solving b(i) = 8l + 2m gives delta(i) = 4*((b%8)//2) + b//8,
     i.e. input slot i must hold the code of local dim delta(i):
     delta = [0,8,1,9,4,12,5,13,2,10,3,11,6,14,7,15]. Verified byte-exact on host
     (all 128 threads x both paths) and on-GPU by the G3 stage dumps."""
@@ -246,7 +246,7 @@ def v_store_perm_sm100_f4(bits):
     int2 (dequant_int2_to_f4): dim-major runs (dim d's 64 tokens = one
     16B LDS.128), pre-interleaved so the kernel's 2->4 expand is
     lo = w & 0x33333333 (tokens 16w..16w+7), hi = (w >> 2) & 0x33333333 (16w+8..15).
-    Composed against pack_rows_lut's int2 slot->bit map b(i) via the self-inverse
+    Composed against pack_rows's int2 slot->bit map b(i) via the self-inverse
     16-slot sub-perm sigma(i) = (i&3) | ((i&4)<<1) | ((i&8)>>1). A pool built with
     this permutation is valid only for kernels compiled with
     ``dequant_int2_to_f4=1``. ``check_k_store_perm_f4`` is the enforcing oracle;
@@ -258,7 +258,7 @@ def v_store_perm_sm100_f4(bits):
     INT4 pool without changing its shape: old pools MUST be rebuilt.
     Checked by `_gate_i4_v_perm` below.
 
-    Source frame (checked by `_gate_f4_v_perm` against `build_pools_lut`'s V leg): the array
+    Source frame (checked by `_gate_f4_v_perm` against `build_pools`'s V leg): the array
     this perm indexes into is the DIM-MAJOR flat V view
     `qv_t.reshape(D * PS)` (qv_t = q^T, shape [D, PS], i.e. flat position k = d*PS + tok)
     -- the SAME frame `v_store_perm_sm100` composes against. So the closed form's flat
@@ -278,7 +278,7 @@ def k_store_perm_sm100_f4(bits):
     pages, TMA boxes and the block table are untouched; only which channel
     each packed slot holds changes.
 
-    WHY IT WORKS. `pack_rows_lut` puts code i of a u32 at
+    WHY IT WORKS. `pack_rows` puts code i of a u32 at
     b(i) = 16*(i//8) + 4*(i%4) + 2*((i%8)//4), a bijection onto the even bits
     0..30. The b4x16_p64 K image wants out0 nibble j = code j and out1 nibble
     j = code 8+j. Reading `w & 0x33333333` leaves each kept pair in place, so
@@ -320,9 +320,9 @@ def check_k_store_perm_f4():
 
     def deposits(codes):
         """(gather from the logical pool, masks from the permuted pool), per group."""
-        wp = (pack_rows_lut(codes.reshape(1, 1, D), 2).reshape(-1)
+        wp = (pack_rows(codes.reshape(1, 1, D), 2).reshape(-1)
               .view(torch.int32).to(torch.int64) & 0xFFFFFFFF)
-        wq = (pack_rows_lut(codes[:, perm].reshape(1, 1, D), 2).reshape(-1)
+        wq = (pack_rows(codes[:, perm].reshape(1, 1, D), 2).reshape(-1)
               .view(torch.int32).to(torch.int64) & 0xFFFFFFFF)
         out = []
         for grp in range(D // 16):
@@ -346,9 +346,9 @@ def check_k_store_perm_f4():
     g = torch.Generator().manual_seed(0)
     for _ in range(64):
         codes = torch.randint(0, 4, (1, D), generator=g, dtype=torch.uint8)
-        wp = (pack_rows_lut(codes.reshape(1, 1, D), 2).reshape(-1)
+        wp = (pack_rows(codes.reshape(1, 1, D), 2).reshape(-1)
               .view(torch.int32).to(torch.int64) & 0xFFFFFFFF)
-        wq = (pack_rows_lut(codes[:, perm].reshape(1, 1, D), 2).reshape(-1)
+        wq = (pack_rows(codes[:, perm].reshape(1, 1, D), 2).reshape(-1)
               .view(torch.int32).to(torch.int64) & 0xFFFFFFFF)
         for grp in range(D // 16):
             a, b = int(wp[grp]), int(wq[grp])
@@ -381,9 +381,9 @@ def check_k_store_perm_i4():
     def deposits(codes):
         """(5-op compaction from the logical pool, masks from the permuted
         pool), per 8-code word."""
-        wp = (pack_rows_lut(codes.reshape(1, 1, D), 4).reshape(-1)
+        wp = (pack_rows(codes.reshape(1, 1, D), 4).reshape(-1)
               .view(torch.int32).to(torch.int64) & 0xFFFFFFFF)
-        wq = (pack_rows_lut(codes[:, perm].reshape(1, 1, D), 4).reshape(-1)
+        wq = (pack_rows(codes[:, perm].reshape(1, 1, D), 4).reshape(-1)
               .view(torch.int32).to(torch.int64) & 0xFFFFFFFF)
         out = []
         for grp in range(D // 8):
@@ -444,16 +444,26 @@ def _k_store_perm_inverse(k_store_perm, bits=2):
     return inv
 
 
-def build_pools_lut(k, v, bits, v_store_perm=None, k_store_perm=None):
-    """LUT-order `build_pools`: identical pool shapes and dtypes, code bytes packed with
-    `pack_rows_lut` (SASS-validated dequant path) instead of the plane-interleaved order.
-    `k_store_perm` (default None = identity = K rows token-major and unpermuted)
+def build_pools(k, v, bits, v_store_perm=None, k_store_perm=None):
+    """Pack a bf16 KV cache into the pools the SM100 kernel reads.
+
+    ``k`` and ``v`` are ``[pages, page_size, kv_heads, head_dim]`` and are
+    quantized token-wise, one scale and offset per token over the head dimension.
+    The returned ``(codes_k, codes_v, scales)`` are what ``run()`` takes as
+    ``k_cache``, ``v_cache`` and ``scale_pool``.
+
+    The integer values are stored in an order the kernel's byte-lane extraction
+    requires and the pool bytes do not reveal, so pass the permutations rather
+    than reproducing them: ``k_store_perm=k_store_perm_sm100_f4(bits)`` and
+    ``v_store_perm=v_store_perm_sm100_f4(bits)``. ``dequant_pools`` inverts them.
+
+    ``k_store_perm`` (default None = identity = K rows token-major and unpermuted)
     reorders the K CHANNEL positions before packing, which is what the mask
     deposits read (int2 f4 at either K axis; int4 everywhere since
     see `k_store_perm_sm100_f4` and ask
     `IntDecodeSm100.k_pool_is_permuted` whether a given configuration needs it.
     `v_store_perm` (default None = identity = plain
-    dim-major V^T rows) reorders the V code positions BEFORE `pack_rows_lut`:
+    dim-major V^T rows) reorders the V code positions BEFORE `pack_rows`:
       - (PS,) tensor: token-axis permutation within each V row (kept for the
         plumbing regression);
       - (D*PS,) tensor: full per-page code-position permutation — stored flat position j
@@ -464,12 +474,12 @@ def build_pools_lut(k, v, bits, v_store_perm=None, k_store_perm=None):
     assert ps == PS and d == D
     qk, sk, zk = quant_tokenwise(k.permute(0, 2, 1, 3), bits)   # [NP,HKV,PS,D]
     qv, sv, zv = quant_tokenwise(v.permute(0, 2, 1, 3), bits)
-    return pack_pools_lut(qk, (sk, zk), qv, (sv, zv), bits,
+    return pack_pools(qk, (sk, zk), qv, (sv, zv), bits,
                           v_store_perm=v_store_perm, k_store_perm=k_store_perm)
 
 
-def pack_pools_lut(qk, k_sz, qv, v_sz, bits, v_store_perm=None, k_store_perm=None):
-    """The packing half of `build_pools_lut`, from codes already quantised.
+def pack_pools(qk, k_sz, qv, v_sz, bits, v_store_perm=None, k_store_perm=None):
+    """The packing half of `build_pools`, from codes already quantised.
 
     `qk`/`qv` are uint8 codes [NP,HKV,PS,D] and `k_sz`/`v_sz` the (s, z) pairs
     `quant_tokenwise` returned for them. Everything here is a permutation, an integer
@@ -493,8 +503,8 @@ def pack_pools_lut(qk, k_sz, qv, v_sz, bits, v_store_perm=None, k_store_perm=Non
     if k_store_perm is not None:
         _check_k_store_perm(k_store_perm, bits)
         qk = qk[..., k_store_perm.long().to(dev)]
-    mKq = pack_rows_lut(qk, bits).contiguous()                   # [NP,HKV,PS,D*bits//8]
-    mVq = pack_rows_lut(qv_t, bits).contiguous()                 # [NP,HKV,D,PS*bits//8]
+    mKq = pack_rows(qk, bits).contiguous()                   # [NP,HKV,PS,D*bits//8]
+    mVq = pack_rows(qv_t, bits).contiguous()                 # [NP,HKV,D,PS*bits//8]
     mScale = (torch.stack([sk, zk, sv, zv], -1).float().contiguous()
               .to(dev))                                          # [NP,HKV,PS,4]
     assert mKq.is_contiguous() and mVq.is_contiguous() and mScale.is_contiguous()
@@ -511,15 +521,16 @@ def _check_v_store_perm(p):
     assert torch.equal(torch.sort(p.long()).values, torch.arange(n)), "not a permutation"
 
 
-def dequant_pools_lut(mKq, mVq, mScale, bits, v_store_perm=None,
+def dequant_pools(mKq, mVq, mScale, bits, v_store_perm=None,
                       k_store_perm=None):
-    """Inverse of `build_pools_lut` -> (k_hat, v_hat) [NP,HKV,PS,D] f32 (STORAGE-MATCHED
-    values). `v_store_perm` must match the permutation `build_pools_lut` was called with
+    """Invert `build_pools`: (k_hat, v_hat) ``[pages, kv_heads, page_size, head_dim]``
+    f32, the values the kernel reads. ``v_store_perm`` must match what `build_pools`
+    was called with
     (default None = identity)."""
-    qk = unpack_rows_lut(mKq, bits, D).float()
+    qk = unpack_rows(mKq, bits, D).float()
     if k_store_perm is not None:
         qk = qk[..., _k_store_perm_inverse(k_store_perm).long()]
-    qv_t = unpack_rows_lut(mVq, bits, PS).float()                # [NP,HKV,D,PS], perm order
+    qv_t = unpack_rows(mVq, bits, PS).float()                # [NP,HKV,D,PS], perm order
     if v_store_perm is not None:
         _check_v_store_perm(v_store_perm)
         inv = torch.empty_like(v_store_perm)
@@ -540,9 +551,9 @@ def dequant_pools_lut(mKq, mVq, mScale, bits, v_store_perm=None,
 # ---------------------------------------------------------------------------
 # Quant-granularity flex pools: per-tensor (axis, group)
 # configs — token-wise {D, D/2} / channel-wise token-groups {64, 128, 256},
-# K and V independent. Codes keep the LUT pack (pack_rows_lut; v_store_perm
+# K and V independent. Codes keep the LUT pack (pack_rows; v_store_perm
 # applies unchanged); the scale pool becomes the SECTIONED flat block of
-# cutedsl_decode.quant_layout.quant_block_offsets:
+# fosca.quant_layout.quant_block_offsets:
 #   [K ring | V ring | K channel | V channel] per (page, kv-head), sdtype.
 # Ring sections: ("token", D) -> [N,2] (s,z)/token; ("token", D/2) -> [N,4]
 # (s_lo,z_lo,s_hi,z_hi)/token (lo = d < D/2). Channel sections: [2,D] row-0
@@ -551,7 +562,7 @@ def dequant_pools_lut(mKq, mVq, mScale, bits, v_store_perm=None,
 # the storage-matched flex reference page-local — see dequant_pools_flex).
 # Channel-wise quantization does NOT commute with the page scatter (a group
 # spans Gt logical tokens), so the flex builder takes LOGICAL page streams
-# and scatters itself, unlike build_pools_lut's physical-page contract.
+# and scatters itself, unlike build_pools's physical-page contract.
 # ---------------------------------------------------------------------------
 
 
@@ -577,7 +588,7 @@ def build_scale_block_flex(k_sz, v_sz, k_quant, v_quant, sdtype=torch.float32):
       ("token", D/2):  s/z [B,HKV,S_pad,2]  ([..., 0] = lo half d < D/2)
       ("channel", Gt): s/z [B,HKV,S_pad//Gt,D]
     Layout mirrors _sm90.serving_cache.make_serving_cache_flex exactly."""
-    from cutedsl_decode.quant_layout import quant_block_offsets
+    from fosca.quant_layout import quant_block_offsets
 
     off = quant_block_offsets(k_quant, v_quant, N=PS, D=D)
     s_ref = (k_sz if k_quant[0] == "token" else v_sz)[0]
@@ -634,8 +645,8 @@ def build_pools_flex(k_log, v_log, bits, k_quant=("token", 128),
     """Flex-granularity pool builder. `k_log`/`v_log`: [B, NT, PS, HKV, D]
     bf16 LOGICAL page streams (padded to whole pages; NT * PS must be a
     multiple of every channel token-group in use). Quantizes the logical
-    stream per (axis, group), packs codes per page with `pack_rows_lut`
-    (V through `v_store_perm`, same contract as `build_pools_lut`), builds
+    stream per (axis, group), packs codes per page with `pack_rows`
+    (V through `v_store_perm`, same contract as `build_pools`), builds
     the sectioned scale blocks, and scatters pages into a physical pool via
     `perm` (default: fresh randperm over B*NT).
 
@@ -681,8 +692,8 @@ def build_pools_flex(k_log, v_log, bits, k_quant=("token", 128),
             lead = qv_p.shape[:-2]
             qv_p = (qv_p.reshape(*lead, D * PS)[..., v_store_perm.long().to(dev)]
                     .reshape(*lead, D, PS))
-    kq_pages = pack_rows_lut(qk_p, bits)            # [B,HKV,NT,PS,kb]
-    vq_pages = pack_rows_lut(qv_p, bits)            # [B,HKV,NT,D,vb]
+    kq_pages = pack_rows(qk_p, bits)            # [B,HKV,NT,PS,kb]
+    vq_pages = pack_rows(qv_p, bits)            # [B,HKV,NT,D,vb]
 
     NP = B * NT
     if perm is None:
@@ -712,17 +723,17 @@ def dequant_pools_flex(mKq, mVq, mScale, bits, k_quant, v_quant,
     logical-stream dequant exactly; scales are read back at pool precision
     (a bf16 pool dequantizes with the bf16-ROUNDED values — the reference
     convention the flex gates need)."""
-    from cutedsl_decode.quant_layout import quant_block_offsets
+    from fosca.quant_layout import quant_block_offsets
 
     off = quant_block_offsets(k_quant, v_quant, N=PS, D=D)
     if off["legacy"]:
-        return dequant_pools_lut(mKq, mVq, mScale.reshape(*mScale.shape[:2], PS, 4).float(),
+        return dequant_pools(mKq, mVq, mScale.reshape(*mScale.shape[:2], PS, 4).float(),
                                  bits, v_store_perm=v_store_perm,
                                  k_store_perm=k_store_perm)
-    qk = unpack_rows_lut(mKq, bits, D).float()
+    qk = unpack_rows(mKq, bits, D).float()
     if k_store_perm is not None:
         qk = qk[..., _k_store_perm_inverse(k_store_perm).long()]
-    qv_t = unpack_rows_lut(mVq, bits, PS).float()
+    qv_t = unpack_rows(mVq, bits, PS).float()
     if v_store_perm is not None:
         _check_v_store_perm(v_store_perm)
         inv = torch.empty_like(v_store_perm)
@@ -873,7 +884,7 @@ def ref_paged_attention_fp8q(q_fp8, q_scale, mKq, mVq, mScale, bits, block_table
     """fp8-Q storage-matched paged reference: Q_eff = q_fp8.float()/q_scale
     (q_scale is `quantize_q_fp8`'s MULTIPLY-scale qs = 448/amax; the DIVIDE here matches
     the kernel's dequant direction exactly), KV dequantized
-    from the LUT pools (`build_pools_lut`/`unpack_rows_lut`), fp32 attention, paged via
+    from the LUT pools (`build_pools`/`unpack_rows`), fp32 attention, paged via
     block_table/seq_lens with ragged tails. Mirrors `ref_paged_attention`'s structure
     exactly, swapping in the LUT dequant and the fp8 Q.
 
@@ -893,7 +904,7 @@ def ref_paged_attention_fp8q(q_fp8, q_scale, mKq, mVq, mScale, bits, block_table
     assert d == D
     assert kv_round in (None, "e4m3", "bf16_fma"), kv_round
     q = q_fp8.float() / q_scale
-    k_hat, v_hat = dequant_pools_lut(mKq, mVq, mScale, bits,
+    k_hat, v_hat = dequant_pools(mKq, mVq, mScale, bits,
                                      v_store_perm=v_store_perm,
                                      k_store_perm=k_store_perm)
     if kv_round == "e4m3":
@@ -903,12 +914,12 @@ def ref_paged_attention_fp8q(q_fp8, q_scale, mKq, mVq, mScale, bits, block_table
         # rebuild from the CODES: the operand model needs (q, s, z) separately,
         # not the already-dequantized value (see dequant_bf16_fma_e4m3)
         sk, zk, sv, zv = mScale.unbind(-1)
-        qk = unpack_rows_lut(mKq, bits, D).float()
+        qk = unpack_rows(mKq, bits, D).float()
         # This branch rebuilds from the CODES, so it must undo the K order
-        # itself: the `dequant_pools_lut` call above is not on this path.
+        # itself: the `dequant_pools` call above is not on this path.
         if k_store_perm is not None:
             qk = qk[..., _k_store_perm_inverse(k_store_perm).long()]
-        qv_t = unpack_rows_lut(mVq, bits, PS).float()
+        qv_t = unpack_rows(mVq, bits, PS).float()
         if v_store_perm is not None:
             _check_v_store_perm(v_store_perm)
             inv = torch.empty_like(v_store_perm)
@@ -951,7 +962,7 @@ def ref_paged_attention_fp8q_fast(q_fp8, q_scale, mKq, mVq, mScale, bits, block_
     B, HQ, d = q_fp8.shape
     assert d == D
     q = q_fp8.float() / q_scale
-    k_hat, v_hat = dequant_pools_lut(mKq, mVq, mScale, bits,
+    k_hat, v_hat = dequant_pools(mKq, mVq, mScale, bits,
                                      v_store_perm=v_store_perm,
                                      k_store_perm=k_store_perm)
     HKV = k_hat.shape[1]
@@ -972,7 +983,7 @@ def ref_paged_attention(q, mKq, mVq, mScale, bits, block_table, seq_lens, sm_sca
     """q [B,HQ,D] -> o [B,HQ,D] f32, over the same pools the kernel reads."""
     B, HQ, d = q.shape
     assert d == D
-    k_hat, v_hat = dequant_pools(mKq, mVq, mScale, bits)
+    k_hat, v_hat = _dequant_pools_plane(mKq, mVq, mScale, bits)
     HKV = k_hat.shape[1]
     g = HQ // HKV
     o = torch.zeros(B, HQ, D)
@@ -1005,8 +1016,8 @@ def _gate_f4_v_perm(bits=2, NP=3, seed=0):
     perm = v_store_perm_sm100_f4(bits)
     for p in range(NP):
         qv_flat = q[p].t().contiguous().reshape(-1)              # SAME source frame as
-        stored = qv_flat[perm]                                   # build_pools_lut's V leg
-        words = _words_of(pack_rows_lut(stored.reshape(D, PS), bits).reshape(-1))
+        stored = qv_flat[perm]                                   # build_pools's V leg
+        words = _words_of(pack_rows(stored.reshape(D, PS), bits).reshape(-1))
         words = words.reshape(D, PS // 16)                       # 4 u32 per dim run
         lo = words & 0x33333333
         hi = (words >> 2) & 0x33333333
@@ -1031,7 +1042,7 @@ def _gate_i4_v_perm(NP=3, seed=0):
     for p in range(NP):
         qv_flat = q[p].t().contiguous().reshape(-1)             # dim-major source frame
         stored = qv_flat[perm]
-        words = _words_of(pack_rows_lut(stored.reshape(D, PS), 4).reshape(-1))
+        words = _words_of(pack_rows(stored.reshape(D, PS), 4).reshape(-1))
         words = words.reshape(D, PS // 8)                       # 8 u32 per channel row
         lo = words & 0x0F0F0F0F
         hi = (words >> 4) & 0x0F0F0F0F
@@ -1117,7 +1128,7 @@ FLEX_GATE_CONFIGS = [
 
 def _gate_flex_pools(seed=3):
     """Self-gates for the flex pool builders.
-    G1g-legacy: build_pools_flex at the legacy config == build_pools_lut on
+    G1g-legacy: build_pools_flex at the legacy config == build_pools on
     the SAME data through the SAME page perm, byte-identical (mKq/mVq/mScale).
     G1g-rt: per flex config, page-local dequant of the built pool gathered
     through the block table == quantize+dequantize of the LOGICAL stream
@@ -1141,7 +1152,7 @@ def _gate_flex_pools(seed=3):
         v_scat = torch.empty_like(v_phys)
         k_scat[perm] = k_phys
         v_scat[perm] = v_phys
-        mKq_l, mVq_l, mScale_l = build_pools_lut(k_scat, v_scat, bits,
+        mKq_l, mVq_l, mScale_l = build_pools(k_scat, v_scat, bits,
                                                  v_store_perm=vperm)
         mKq_f, mVq_f, mScale_f, bt, _ = build_pools_flex(
             k_log, v_log, bits, ("token", 128), ("token", 128),
@@ -1150,7 +1161,7 @@ def _gate_flex_pools(seed=3):
                  and torch.equal(mScale_f, mScale_l.reshape(NP, HKV, -1))
                  and torch.equal(bt.reshape(-1).long(), perm))
         ok &= g_leg
-        print(f"[G1g-legacy bits={bits}] flex builder == build_pools_lut "
+        print(f"[G1g-legacy bits={bits}] flex builder == build_pools "
               f"byte-identical: {'OK' if g_leg else 'FAIL'}")
 
         # G1g-rt per config
@@ -1187,20 +1198,20 @@ def main():
     for bits in (4, 2):
         # G1a: pack<->unpack bit-exact
         codes = torch.randint(0, 2**bits, (3, 2, PS, D), dtype=torch.uint8)
-        rt_ok = bool((unpack_rows(pack_rows(codes, bits), bits, D) == codes).all())
+        rt_ok = bool((_unpack_rows_plane(_pack_rows_plane(codes, bits), bits, D) == codes).all())
         ok &= rt_ok
         print(f"[G1a bits={bits}] pack round-trip: {'OK' if rt_ok else 'FAIL'}")
 
-        # G1a-lut: pack_rows_lut<->unpack_rows_lut bit-exact (LUT order, both K-shaped E=D
+        # G1a-lut: pack_rows<->unpack_rows bit-exact (LUT order, both K-shaped E=D
         # rows and V-shaped E=PS rows, since the two row shapes hit different reshape paths).
         # k-order: logical -- a pack/unpack round trip over codes this block just
         # generated, so there is no stored order to invert on either side.
-        rt_ok_k = bool((unpack_rows_lut(pack_rows_lut(codes, bits), bits, D) == codes).all())
+        rt_ok_k = bool((unpack_rows(pack_rows(codes, bits), bits, D) == codes).all())
         codes_v = torch.randint(0, 2**bits, (3, 2, D, PS), dtype=torch.uint8)
-        rt_ok_v = bool((unpack_rows_lut(pack_rows_lut(codes_v, bits), bits, PS) == codes_v).all())
+        rt_ok_v = bool((unpack_rows(pack_rows(codes_v, bits), bits, PS) == codes_v).all())
         rt_ok_lut = rt_ok_k and rt_ok_v
         ok &= rt_ok_lut
-        print(f"[G1a-lut bits={bits}] pack_rows_lut round-trip (K-shape/V-shape): "
+        print(f"[G1a-lut bits={bits}] pack_rows round-trip (K-shape/V-shape): "
               f"{'OK' if rt_ok_lut else 'FAIL'}")
 
 
@@ -1219,7 +1230,7 @@ def main():
         v_phys = torch.empty_like(k_phys)
         k_phys[bt.reshape(-1).long()] = k_log.reshape(NP, PS, HKV, D)
         v_phys[bt.reshape(-1).long()] = v_log.reshape(NP, PS, HKV, D)
-        mKq, mVq, mScale = build_pools(k_phys, v_phys, bits)
+        mKq, mVq, mScale = _build_pools_plane(k_phys, v_phys, bits)
         o1 = ref_paged_attention(q, mKq, mVq, mScale, bits, bt, sl, D**-0.5)
         # independent path: quantize+dequantize the LOGICAL stream directly
         # (no pack/unpack, no pools, no block table, no gather code shared with o1)
@@ -1243,7 +1254,7 @@ def main():
 
         # G1b-lut: same independence structure as G1b (fresh scrambled table, reuse the
         # G1b logical KV/Q so this exercises the identical inputs the legacy gate does), but
-        # LUT pools (build_pools_lut/pack_rows_lut) + the fp8-Q reference
+        # LUT pools (build_pools/pack_rows) + the fp8-Q reference
         # (ref_paged_attention_fp8q), with the SAME q_fp8/q_scale fed to BOTH sides.
         bt_lut = torch.randperm(NP).to(torch.int32).reshape(B, NPB)  # independent scramble
         k_phys_lut = torch.empty(NP, PS, HKV, D, dtype=torch.bfloat16)
@@ -1251,7 +1262,7 @@ def main():
         k_phys_lut[bt_lut.reshape(-1).long()] = k_log.reshape(NP, PS, HKV, D)
         v_phys_lut[bt_lut.reshape(-1).long()] = v_log.reshape(NP, PS, HKV, D)
         q_fp8, q_scale = quantize_q_fp8(q)
-        mKq_l, mVq_l, mScale_l = build_pools_lut(k_phys_lut, v_phys_lut, bits)
+        mKq_l, mVq_l, mScale_l = build_pools(k_phys_lut, v_phys_lut, bits)
         o1_l = ref_paged_attention_fp8q(q_fp8, q_scale, mKq_l, mVq_l, mScale_l, bits,
                                         bt_lut, sl, D**-0.5)
         # independent path: quantize+dequantize the LOGICAL stream directly, fp8-Q applied to
@@ -1280,14 +1291,14 @@ def main():
         # with the SAME permutation, must equal the identity-perm dequant exactly; the
         # permuted mVq bytes must differ (perm applied, not a no-op) and mKq/mScale must be
         # untouched. Proves the invert-reapply logic before Task 3 wires the real perm.
-        kh_i, vh_i = dequant_pools_lut(mKq_l, mVq_l, mScale_l, bits)
+        kh_i, vh_i = dequant_pools(mKq_l, mVq_l, mScale_l, bits)
         g1e = True
         for tag, perm in (("rand-token", torch.randperm(PS)),
                           ("rand-full", torch.randperm(D * PS)),
                           ("sm100", v_store_perm_sm100(bits))):
-            mKq_p, mVq_p, mScale_p = build_pools_lut(k_phys_lut, v_phys_lut, bits,
+            mKq_p, mVq_p, mScale_p = build_pools(k_phys_lut, v_phys_lut, bits,
                                                      v_store_perm=perm)
-            kh_p, vh_p = dequant_pools_lut(mKq_p, mVq_p, mScale_p, bits, v_store_perm=perm)
+            kh_p, vh_p = dequant_pools(mKq_p, mVq_p, mScale_p, bits, v_store_perm=perm)
             g1e &= (torch.equal(kh_p, kh_i) and torch.equal(vh_p, vh_i)
                     and not torch.equal(mVq_p, mVq_l)      # perm really changed V bytes
                     and torch.equal(mKq_p, mKq_l) and torch.equal(mScale_p, mScale_l))
@@ -1315,7 +1326,7 @@ def main():
         # q = round(0/s) = 0 everywhere, dequant = z = the constant. 0 error required.
         kc = torch.randn(NP, PS, HKV, 1, dtype=torch.bfloat16).expand(NP, PS, HKV, D).contiguous()
         vc = torch.randn(NP, PS, HKV, 1, dtype=torch.bfloat16).expand(NP, PS, HKV, D).contiguous()
-        kc_hat, vc_hat = dequant_pools(*build_pools(kc, vc, bits), bits)
+        kc_hat, vc_hat = _dequant_pools_plane(*_build_pools_plane(kc, vc, bits), bits)
         err = max((kc_hat - kc.permute(0, 2, 1, 3).float()).abs().max().item(),
                   (vc_hat - vc.permute(0, 2, 1, 3).float()).abs().max().item())
         g1c = err == 0.0

@@ -13,7 +13,7 @@ import pathlib
 
 import pytest
 
-_SM100 = pathlib.Path(__file__).resolve().parents[1] / "src" / "cutedsl_decode" / "_sm100"
+_SM100 = pathlib.Path(__file__).resolve().parents[1] / "src" / "fosca" / "_sm100"
 
 
 def _codes(rel):

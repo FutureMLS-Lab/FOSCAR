@@ -96,7 +96,7 @@ def _prmt_r(a, b, c, *, loc=None, ip=None):
 def _fma2_bf16(a, b, c, *, loc=None, ip=None):
     # d = fma.rn per bf16 lane on .b32-packed bf16x2 words: ONE rounding of the
     # exact a*b + c into bf16, which is what lets the host expectation replay it
-    # by rounding an f64 product-sum once (`cutedsl_decode.pool.dequant_bf16_fma_e4m3`).
+    # by rounding an f64 product-sum once (`fosca.pool.dequant_bf16_fma_e4m3`).
     return Int32(llvm.inline_asm(
         T.i32(),
         [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip),

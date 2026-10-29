@@ -242,10 +242,10 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu.tcgen05.helpers import smem_descriptor_to_int
 import cutlass.utils.hopper_helpers as sm90u
-from cutedsl_decode.kernel_contract import GQAPagedDecode, normalize_sdtype
-from cutedsl_decode._vendor.quack import sm90_utils
-from cutedsl_decode._vendor.flash_attn.cute import copy_utils
-from cutedsl_decode._sm90.serving_cache import (
+from fosca.kernel_contract import GQAPagedDecode, normalize_sdtype
+from fosca._vendor.quack import sm90_utils
+from fosca._vendor.flash_attn.cute import copy_utils
+from fosca._sm90.serving_cache import (
     CODE_CHUNK_BYTES, code_block_word_strides, code_row_bytes, code_row_chunks,
     code_v_half_bytes, require_code_pool)
 from cutlass.pipeline import PipelineTmaAsync, make_pipeline_state
