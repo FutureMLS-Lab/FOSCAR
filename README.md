@@ -50,9 +50,12 @@ k_log = torch.randn(batch, pages_per_seq, page_size, kv_heads, head_dim,
                     device=device, dtype=torch.bfloat16)
 v_log = torch.randn_like(k_log)
 
-# Build the packed pools and the physical block table.
+# Build the packed pools and the physical block table. K and V are quantized
+# token-wise: one scale and offset per token, over the whole head dimension.
 k_pool, v_pool, scale_pool, block_table, _aux = pool.build_pools_flex(
-    k_log, v_log, bits, k_store_perm=pool.k_store_perm_sm100_f4(bits),
+    k_log, v_log, bits,
+    k_quant=("token", head_dim), v_quant=("token", head_dim),
+    k_store_perm=pool.k_store_perm_sm100_f4(bits),
     v_store_perm=pool.v_store_perm_sm100_f4(bits))
 
 # Page-table inputs.
@@ -68,7 +71,8 @@ w = PagedDecodeWrapper(torch.empty(256 * 1024 * 1024, dtype=torch.uint8,
                                    device=device))
 w.plan(indptr, indices, seq_lens,
        num_qo_heads=q_heads, num_kv_heads=kv_heads, head_dim=head_dim,
-       page_size=page_size, q_data_type=q_dtype, bits=bits)
+       page_size=page_size, q_data_type=q_dtype, bits=bits,
+       k_quant=("token", head_dim), v_quant=("token", head_dim))
 
 out = w.run(q, k_pool, v_pool, scale_pool=scale_pool,
             k_pool_order="permuted")     # [batch, q_heads, head_dim]
@@ -76,9 +80,10 @@ out = w.run(q, k_pool, v_pool, scale_pool=scale_pool,
 
 ### Quantization granularity
 
-The quickstart above uses the default: one scale and offset per token, over the
-whole head dimension. Granularity is chosen per tensor by an `(axis, group)`
-pair, and the pool builder and `plan()` must be given the same pair.
+The quickstart above asks for token-wise K and V: one scale and offset per
+token, over the whole head dimension, which is also the default. Granularity is
+chosen per tensor by an `(axis, group)` pair, and the pool builder and `plan()`
+must be given the same pair.
 
 ```python
 k_pool, v_pool, scale_pool, block_table, _aux = pool.build_pools_flex(

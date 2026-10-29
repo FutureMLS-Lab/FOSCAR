@@ -657,7 +657,9 @@ def build_pools_flex(k_log, v_log, bits, k_quant=("token", 128),
 
     Returns (mKq, mVq, mScale, block_table, aux):
       mKq  uint8 [NP,HKV,PS,D*bits//8], mVq uint8 [NP,HKV,D,PS*bits//8]
-      mScale sdtype [NP,HKV,block_tot]  (flat sectioned block)
+      mScale sdtype [NP,HKV,PS,4] when both pairs are ("token", D) -- the
+                    interleaved per-token block `run()` checks for -- and
+                    [NP,HKV,block_tot] otherwise
       block_table int32 [B, NT]         (logical page -> physical page)
       aux = dict(k_sz=..., v_sz=..., qk=..., qv=...) for references."""
     B, NT, ps, HKV, d = k_log.shape
@@ -672,6 +674,9 @@ def build_pools_flex(k_log, v_log, bits, k_quant=("token", 128),
     qk, k_sz = _grouped_sz(x_k, bits, k_quant)
     qv, v_sz = _grouped_sz(x_v, bits, v_quant)
 
+    from fosca.quant_layout import quant_block_offsets
+
+    legacy = quant_block_offsets(k_quant, v_quant, N=PS, D=D)["legacy"]
     block = build_scale_block_flex(k_sz, v_sz, k_quant, v_quant, sdtype=sdtype)
     assert block.shape[2] == NT, (block.shape, NT)
 
@@ -705,10 +710,21 @@ def build_pools_flex(k_log, v_log, bits, k_quant=("token", 128),
     perm_dev = perm.to(dev)
     mKq = torch.empty(NP, HKV, PS, kq_pages.shape[-1], dtype=torch.uint8, device=dev)
     mVq = torch.empty(NP, HKV, D, vq_pages.shape[-1], dtype=torch.uint8, device=dev)
-    mScale = torch.empty(NP, HKV, block.shape[-1], dtype=sdtype, device=dev)
     mKq[perm_dev] = kq_pages.permute(0, 2, 1, 3, 4).reshape(NP, HKV, PS, -1)
     mVq[perm_dev] = vq_pages.permute(0, 2, 1, 3, 4).reshape(NP, HKV, D, -1)
-    mScale[perm_dev] = block.permute(0, 2, 1, 3).reshape(NP, HKV, -1).to(dev)
+    if legacy:
+        # The default token pair uses the interleaved per-token block, which is
+        # what `run()` checks for at that granularity; every other pair uses the
+        # sectioned one.
+        sk, zk = k_sz
+        sv, zv = v_sz
+        interleaved = (torch.stack([sk, zk, sv, zv], -1).to(sdtype)
+                       .reshape(B, HKV, NT, PS, 4).permute(0, 2, 1, 3, 4))
+        mScale = torch.empty(NP, HKV, PS, 4, dtype=sdtype, device=dev)
+        mScale[perm_dev] = interleaved.reshape(NP, HKV, PS, 4).to(dev)
+    else:
+        mScale = torch.empty(NP, HKV, block.shape[-1], dtype=sdtype, device=dev)
+        mScale[perm_dev] = block.permute(0, 2, 1, 3).reshape(NP, HKV, -1).to(dev)
     block_table = perm.reshape(B, NT).to(torch.int32)
     aux = dict(k_sz=k_sz, v_sz=v_sz, qk=qk, qv=qv)
     return (mKq.contiguous(), mVq.contiguous(), mScale.contiguous(),
