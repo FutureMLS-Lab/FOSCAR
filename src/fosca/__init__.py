@@ -10,6 +10,6 @@ from ._utils import get_capabilities, is_supported
 from .kv_cache import QuantKVCache, QuantKVLayout
 from .wrapper import PagedDecodeWrapper, graph_workspace_bytes
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["PagedDecodeWrapper", "QuantKVCache", "QuantKVLayout", "get_capabilities",
            "graph_workspace_bytes", "is_supported", "__version__"]
