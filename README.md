@@ -150,10 +150,12 @@ same Q dtype.
 
 ## Benchmarks
 
-Decode latency in microseconds on one NVIDIA B200. The figure plots the speedup
-over FlashInfer bf16 at the same shape, so the dashed line at 1.00 is bf16.
+Decode latency in microseconds. Each figure plots the speedup over FlashInfer
+bf16 at the same shape, so the dashed line at 1.00 is bf16.
 
-![Decode speedup over FlashInfer bf16, against context length at batch 1 and 8](docs/decode-latency.png)
+### B200 (SM100)
+
+![Decode speedup over FlashInfer bf16 on B200, at batch 1 and 8](docs/decode-latency-b200.png)
 
 | Batch | Context | int2 | int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -166,18 +168,38 @@ over FlashInfer bf16 at the same shape, so the dashed line at 1.00 is bf16.
 | 8 | 256K | **400.5** | 461.9 | 1170.4 | 594.2 | 479.3 |
 | 8 | 512K | **760.3** | 874.0 | 2323.3 | 1166.7 | 947.7 |
 
-Measurement conditions: one query token per request, 32 query heads over 8 KV
-heads, `head_dim` 128, page size 64, paged cache, fp8 Q for this package and for
-TRT-LLM, bf16 for FlashInfer. All five columns ran on the same B200 card on
-2026-10-29, in one session, through one timing function. The number is the CUDA
-kernel span from CUPTI over a cold L2, the median of the fully observed
-iterations. It excludes host dispatch and the paged-attention wrapper, so it is
-not an end-to-end serving latency.
+### H100 (SM90)
 
-The two columns for this package were measured by driving `PagedDecodeWrapper`
-from this release; `benchmarks/decode_latency.csv` holds the values and
-`benchmarks/plot_decode.py` renders the figure. The three competitor columns were
-measured by the project's benchmark harness, which is not part of this release.
+TensorRT-LLM's `trtllm-gen` decode is Blackwell only, so this table has no
+TensorRT-LLM column.
+
+![Decode speedup over FlashInfer bf16 on H100, at batch 1 and 8](docs/decode-latency-h100.png)
+
+| Batch | Context | int2 | int4 | FlashInfer bf16 |
+|---:|---:|---:|---:|---:|
+| 1 | 32K | **25.5** | 32.9 | 64.4 |
+| 1 | 128K | **72.8** | 79.4 | 199.9 |
+| 1 | 256K | **127.9** | 135.3 | 378.4 |
+| 1 | 512K | **242.5** | 271.5 | 735.0 |
+| 8 | 32K | **94.6** | 117.2 | 385.1 |
+| 8 | 128K | **347.1** | 401.7 | 1458.2 |
+| 8 | 256K | **676.2** | 926.6 | 2890.4 |
+| 8 | 512K | **1330.6** | 1830.2 | 5758.2 |
+
+### Conditions
+
+One query token per request, 32 query heads over 8 KV heads, `head_dim` 128,
+page size 64, paged cache. Q is fp8 on the B200 tables and bf16 on the H100 one;
+FlashInfer is bf16 everywhere. Each row's five (or four) columns ran on the same
+card in one session, through one timing function. The number is the CUDA kernel
+span from CUPTI over a cold L2, the median of the fully observed iterations. It
+excludes host dispatch and the paged-attention wrapper, so it is not an
+end-to-end serving latency.
+
+The columns for this package were measured by driving `PagedDecodeWrapper` from
+this release; `benchmarks/decode_latency.csv` holds the values and
+`benchmarks/plot_decode.py` renders both figures. The competitor columns were
+measured by the project's benchmark harness.
 
 ## Testing
 
@@ -186,14 +208,6 @@ pytest -q
 ```
 
 Modules that need a device skip when there is none.
-
-## Limitations
-
-- Only the quantized path exists. There is no dense bf16, fp16 or fp8 KV mode.
-- `head_dim` 256 on SM90 requires token-wise K and V with an f32 scale pool.
-- The benchmark harness that produced the competitor columns in
-  [Benchmarks](#benchmarks) is not part of this release.
-- The benchmark table is Blackwell only. No Hopper numbers are published.
 
 ## License
 

@@ -227,17 +227,39 @@ def build_pools_sm90(k_log, v_log, bits, *, seq_lens, k_quant=None, v_quant=None
     Returns the `ServingCache` the kernel reads: ``codes_k``, ``codes_v``,
     ``scales`` and the block table. ``sdtype`` is the scale-pool element type and
     must match what ``plan()`` compiles for.
+
+    One request is quantized and repacked at a time. The intermediate integer
+    values are four bytes each, so a batch at a long context would otherwise need
+    several times the cache's own footprint; the loop bounds that to one request.
     """
     head_dim = k_log.shape[-1]
     k_quant = k_quant or ("token", head_dim)
     v_quant = v_quant or ("token", head_dim)
     maps = frag_maps(head_dim)
 
-    qk, sk, zk = _quantize(k_log, bits, k_quant, sdtype)
-    qv, sv, zv = _quantize(v_log, bits, v_quant, sdtype)
-    # The repacker works in [batch, kv_len, kv_heads, head_dim].
-    kq = repack_K_rs(qk.permute(0, 2, 1, 3).to(torch.uint8), maps["A_qk"], bits, order=order)
-    vq = repack_V_rs(qv.permute(0, 2, 1, 3).to(torch.uint8), maps["A_pv"], bits, order=order)
+    kq_parts, vq_parts = [], []
+    sk_parts, zk_parts, sv_parts, zv_parts = [], [], [], []
+    for b in range(k_log.shape[0]):
+        qk, sk, zk = _quantize(k_log[b:b + 1], bits, k_quant, sdtype)
+        kq_parts.append(repack_K_rs(qk.permute(0, 2, 1, 3).to(torch.uint8),
+                                    maps["A_qk"], bits, order=order))
+        sk_parts.append(sk)
+        zk_parts.append(zk)
+        del qk
+
+        qv, sv, zv = _quantize(v_log[b:b + 1], bits, v_quant, sdtype)
+        vq_parts.append(repack_V_rs(qv.permute(0, 2, 1, 3).to(torch.uint8),
+                                    maps["A_pv"], bits, order=order))
+        sv_parts.append(sv)
+        zv_parts.append(zv)
+        del qv
+
+    kq = torch.cat(kq_parts, dim=0)
+    vq = torch.cat(vq_parts, dim=0)
+    sk = torch.cat(sk_parts, dim=0)
+    zk = torch.cat(zk_parts, dim=0)
+    sv = torch.cat(sv_parts, dim=0)
+    zv = torch.cat(zv_parts, dim=0)
 
     return make_serving_cache_flex(
         kq, vq, (sk, zk), (sv, zv), seq_lens,
