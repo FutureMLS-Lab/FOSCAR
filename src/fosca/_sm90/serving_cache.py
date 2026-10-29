@@ -1,10 +1,8 @@
-# Copyright 2026 Donglin Zhuang
-# SPDX-License-Identifier: Apache-2.0
 """ServingCache — the batch-free GLOBAL paged quantized-KV pool that the SM90 decode kernel reads.
 
-This is the host fixture (used by the SM90 numerics gates, benches and harnesses) that builds the
-serving-readiness contract from per-request inputs: a single pooled set of fragment-order code
-pages + ONE interleaved paged scale pool, addressed through a global block table.
+This is the host fixture that builds the pool from per-request inputs: a single pooled set of
+fragment-order code pages plus ONE interleaved paged scale pool, addressed through a global block
+table.
 
 CONTRACT (the four tensors the kernel reads):
   codes_k / codes_v   uint8     [NP, HKV, <block>]     # NP = total physical pages; page = one
@@ -26,22 +24,23 @@ CONTRACT (the four tensors the kernel reads):
   seq_lens            int32     [B]                     # per-request kv length (ragged).
 
 The page id `block_table[b, gt]` is a free coordinate on the GLOBAL page (NP) dim for BOTH codes
-and scales, so two requests whose block table entries point at the same page read identical bytes.
-That is the pooling this layout provides.
+and scales — two requests whose block tables point at the same page read identical bytes, a
+sharing property a per-request (B-replicated) pool cannot express.
 
 CODE POOL GEOMETRY.  Everything about where a code byte sits is computed here and nowhere else:
 `code_row_bytes` gives the `per` of the K and V rows, `code_row_chunks` their 16-byte chunk count
 C, `code_block_shape` / `code_pool_shape` the block and pool shape in either order, and
 `code_block_word_strides` / `code_chunk_offset` where row word w, or chunk c of thread t, sits in
-a block, and `code_word_offset` where row word w sits in a whole pool, with the page widened to
-64 bits before it is multiplied.  The pingpong kernel, IntAppend, the pool writers and
-this module's own checks call these, so a head dimension or width has one formula.  They are
+a block, `code_word_offset` where row word w sits in a whole pool, with the page widened to
+64 bits before it is multiplied, and `code_field` which (token, channel) a field of a row word
+holds.  The pingpong kernel, the serving writer (`quant_append.QuantAppendSm90`) and this
+module's own checks call these, so a head dimension or width has one formula.  They are
 generic in the head dimension D: the layout is defined for any D whose rows are whole chunks
 (D = 128 and 256 at both widths), and the pingpong kernel reads both: at D=256 its grouped body
 copies one 128-channel group of a row at a time (`IntPingPongDecodeSm90._code_group_words`).
 
 CODE POOL ORDERS.  Thread t's plane-word A-fragment row holds `per` bytes (`code_row_bytes`:
-32 int4 / 16 int2 at D=128, 64 / 32 at D=256; the pool writers define the bytes).
+32 int4 / 16 int2 at D=128, 64 / 32 at D=256).
 A (page, kv-head) block stores the 128 rows in one of two orders, and the READER decides which:
   "row"      [128, per]           row t contiguous.  No kernel reads this order; it is the
                                   thread-row layout the packers produce and the pool shape
@@ -60,17 +59,20 @@ and a row pool reshaped to the chunk16 shape (a `view`, not `code_rows_to_order`
 and read wrong; every writer therefore asks the reader's predicate and converts with
 `code_rows_to_order`.
 `code_block_word_strides` says where each row word sits in a block of either order; the
-pingpong kernel's shared-memory view and IntAppend's scatter are both derived from it and
-from the kernel's `code_pool_order`, so reader and serving writer cannot disagree.
+pingpong kernel's shared-memory view and the serving writer's stores are both derived from it
+and from the kernel's `code_pool_order`, so reader and serving writer cannot disagree.
 
 Per-request inputs to `make_serving_cache`:
   per_req_codes_k : uint8 [B, NT, HKV, <block_k>]     (repack_K_rs output, either order)
   per_req_codes_v : uint8 [B, NT, HKV, <block_v>]     (repack_V_rs output, the same order)
   per_req_scales  : f32   [B, HKV, S_pad, 4]          (s_k, z_k, s_v, z_v) per LOGICAL token,
                                                        S_pad % N == 0 (every staged tile covered;
-                                                       tail values masked downstream but FINITE).
+                                                       tail values weigh zero downstream, so they
+                                                       must be values a quantizer under the 2^64
+                                                       input envelope could produce).
 """
 import dataclasses
+import functools
 
 import torch
 
@@ -158,7 +160,7 @@ def code_block_word_strides(order, per):
     Word 4c + w (w < 4) of thread t's row sits at word t*thread + c*chunk + w of the block, in
     either order: both keep a 16-byte chunk's four words together, and they differ only in
     what is adjacent to a chunk.  The pingpong kernel's shared-memory view of a stage and the
-    serving append's scatter are both built from this, so each follows whatever order
+    serving writer's stores are both built from this, so each follows whatever order
     `IntPingPongDecodeSm90.code_pool_order` names rather than restating chunk16."""
     code_block_shape(order, per)
     words = CODE_CHUNK_BYTES // 4
@@ -186,8 +188,8 @@ def code_word_offset(order, per, num_kv_heads, page, kv_head, thread, word, *, w
     A pool holds NP * HKV * 32 * per words, which passes 2^31 once the pool passes 8 GiB (page
     262,144 at int4 with HKV = 8), so a 32-bit product of the page wraps negative and the
     address lands before the pool. `wide` converts the caller's page to a 64-bit integer, and
-    it is applied to the page BEFORE the page is multiplied: cutlass.Int64 in IntAppend's
-    kernel, a torch int64 conversion in the host tests. It is required because nothing else
+    it is applied to the page BEFORE the page is multiplied: cutlass.Int64 in the serving
+    writer's kernel, a torch int64 conversion in the host tests. It is required because nothing else
     here knows the caller's integer type. The in-block part stays in the caller's type, since
     it is below 32 * per words."""
     thread_words, chunk_words = code_block_word_strides(order, per)
@@ -196,17 +198,101 @@ def code_word_offset(order, per, num_kv_heads, page, kv_head, thread, word, *, w
     return (wide(page) * num_kv_heads + kv_head) * block_words + in_block
 
 
-def scatter_map_file(head_dim):
-    """The file name of IntAppend's scatter map at `head_dim`.
+def _wgmma_a_coords(thread, k_step, element):
+    """(m, k) of fragment element `element` of k-step `k_step` that warpgroup thread `thread`
+    holds in an RS wgmma m64nNk16 A operand, in plain integer arithmetic, so a kernel can trace
+    it with Int32 and a test can call it with ints."""
+    m = 16 * (thread // 32) + (thread % 32) // 4 + 8 * ((element // 2) % 2)
+    k = 16 * k_step + 2 * (thread % 4) + 8 * (element // 4) + element % 2
+    return m, k
 
-    The map inverts the packer's fragment gather at one head dimension, so each head dimension
-    has its own file: `frag_scatter_k16.pt` at 128 and `frag_scatter_k16_d<D>.pt` at any other.
-    The map generator writes it under its byte-exact inverse gate, and IntAppend reads it; both
-    take the name from here."""
-    if head_dim <= 0 or head_dim % CODE_V_HALF_CHANNELS:
-        raise ValueError(f"no scatter map at head_dim={head_dim}: the code pool is defined for "
-                         f"whole {CODE_V_HALF_CHANNELS}-channel V halves")
-    return "frag_scatter_k16.pt" if head_dim == 128 else f"frag_scatter_k16_d{head_dim}.pt"
+
+def code_field(tensor, bits, thread, word, field):
+    """(token, channel) of the quantized value in field `field` of row word `word` of thread
+    `thread`'s row, in a (page, kv-head) block of the K or V code pool.
+
+    Field f of a word is its bits [bits*f, bits*f + bits), so a word holds 32 // bits fields.
+    This is the plane-word packing read backwards: the low 16 bits of a word hold
+    the even fragment elements and the high 16 bits the odd ones, and within a half, field p
+    holds pair p of the word's k-steps (one k-step per word at int4, two at int2), so
+    element = 2 * (p % 4) + half and k-step = (4 // bits) * word + p // 4. The fragment map then
+    gives (m, k) = (token, channel) for K and (channel in the output half, token) for V^T, whose
+    row stacks head_dim / 64 output halves of `code_v_half_bytes(64, bits)` bytes each.
+    `tensor` and `bits` select the formula at trace time; `thread`, `word` and `field` may be
+    ints, torch tensors or traced integers. The serving writer calls this to build each word it
+    stores, and `tests/test_sm90_dequant_banks_cpu.py` checks that `code_position` inverts it at
+    both widths and both head dimensions."""
+    if tensor not in ("K", "V") or bits not in (2, 4):
+        raise ValueError(f"code_field takes tensor 'K' or 'V' and bits 2 or 4; "
+                         f"got {tensor!r}, {bits}")
+    half_fields = 16 // bits
+    half, pair = field // half_fields, field % half_fields
+    element = 2 * (pair % 4) + half
+    steps_per_word = 4 // bits
+    if tensor == "K":
+        return _wgmma_a_coords(thread, steps_per_word * word + pair // 4, element)
+    words_per_half = code_v_half_bytes(64, bits) // 4
+    channel, token = _wgmma_a_coords(
+        thread, steps_per_word * (word % words_per_half) + pair // 4, element)
+    return token, CODE_V_HALF_CHANNELS * (word // words_per_half) + channel
+
+
+def code_position(tensor, bits, token, channel):
+    """(thread, word, field) of the quantized value of (token, channel) in a (page, kv-head) block
+    of the K or V code pool: `code_field` read backwards, in plain integer arithmetic (the
+    kernel traces it with Int32). `tests/test_sm90_dequant_banks_cpu.py` checks it against
+    `code_field` at both widths and both head dimensions."""
+    if tensor not in ("K", "V") or bits not in (2, 4):
+        raise ValueError(f"code_position takes tensor 'K' or 'V' and bits 2 or 4; "
+                         f"got {tensor!r}, {bits}")
+    if tensor == "K":
+        m, k = token, channel
+    else:
+        m, k = channel % CODE_V_HALF_CHANNELS, token
+    thread = 32 * (m // 16) + 4 * (m % 8) + (k % 8) // 2
+    element = 4 * ((k % 16) // 8) + 2 * ((m % 16) // 8) + k % 2
+    steps_per_word = 4 // bits
+    k_step = k // 16
+    field = (element % 2) * (16 // bits) + 4 * (k_step % steps_per_word) + element // 2
+    word = k_step // steps_per_word
+    if tensor == "V":
+        word = word + (channel // CODE_V_HALF_CHANNELS) * (code_v_half_bytes(64, bits) // 4)
+    return thread, word, field
+
+
+def dequant_stage_word(tensor, thread, word):
+    """Word index of row word `word` of thread row `thread` in the shared-memory copy of one
+    (page, kv-head) code block that the Hopper dequantize gathers from: the chunk16 placement
+    (4 * thread + 512 * chunk + word % 4) with the row XOR-swizzled by the chunk, by 2 * chunk
+    in K and by (thread >> 5) ^ 4 * (chunk % 2) in V, and in V the word inside its 16-byte
+    chunk by chunk // 2. Each swizzle only permutes the 16-byte slots of one 128-byte line, or
+    the words of one slot, so a thread still stores each chunk with one 16-byte store, and every
+    gather of a unit's values meets one word per bank (`tests/test_sm90_dequant_banks_cpu.py`)."""
+    chunk = word // 4
+    if tensor == "K":
+        return 4 * (thread ^ (2 * chunk)) + 512 * chunk + word % 4
+    return (4 * (thread ^ (thread >> 5) ^ (4 * (chunk % 2))) + 512 * chunk
+            + ((word % 4) ^ (chunk // 2)))
+
+
+@functools.cache
+def dequant_unit_gathers(tensor, bits, head_dim):
+    """Where the Hopper dequantize finds the eight channels 8u to 8u + 7 of one token: a tuple of
+    (d_thread, d_word, d_field) per channel, relative to code_position(tensor, bits, token, 8u),
+    the same for every token and unit, which is checked here. In K the channel pairs (2i, 2i + 1)
+    share a word (fields f and f + 16 / bits), so the eight channels are four words of four
+    consecutive rows; in V each channel is a field of its own row."""
+    deltas = None
+    for token in range(64):
+        for unit in range(head_dim // 8):
+            r0, w0, f0 = code_position(tensor, bits, token, 8 * unit)
+            got = tuple((r - r0, w - w0, f - f0) for r, w, f in
+                        (code_position(tensor, bits, token, 8 * unit + c) for c in range(8)))
+            if deltas not in (None, got):
+                raise AssertionError(f"{tensor} int{bits} D={head_dim}: unit {unit} of token "
+                                     f"{token} breaks the gather structure")
+            deltas = got
+    return deltas
 
 
 def code_rows_to_order(rows, order):
@@ -271,7 +357,7 @@ def require_code_pool(name, shape, order, per=None, stride=None):
     raise ValueError(
         f"{name} has shape {got}, which is {what}; this kernel reads the {order!r} "
         f"code-pool order, [num_pages, num_kv_heads, {want}]. Build it with "
-        f"repack_rs.repack_K_rs / repack_V_rs(order={order!r}), or convert thread rows "
+        f"QuantKVCache.append or append_quantized, or convert thread rows "
         f"with serving_cache.code_rows_to_order(rows, {order!r}). Do not view or reshape "
         f"a pool into that shape: the orders hold the same bytes in different places, so "
         f"a reshaped pool passes this check and decodes wrong at int4.")
@@ -313,8 +399,8 @@ def make_serving_cache(per_req_codes_k, per_req_codes_v, per_req_scales, seq_len
     NP = sum_b pages_per[b] physical pages via torch.randperm (shuffle=True) so a wrong page-id
     read lands in another request's data; block_table[b, gt] records the global page id.
 
-    identity_block_table=True (or shuffle=False) lays pages out as base_b + gt (no permutation),
-    the contiguous stand-in case, i.e. an identity block table.
+    identity_block_table=True (or shuffle=False) lays pages out as base_b + gt (no permutation) —
+    the contiguous-stand-in case: an identity block table.
     identity_block_table forces no shuffle.
 
     Returns a ServingCache.
@@ -370,24 +456,23 @@ def make_serving_cache(per_req_codes_k, per_req_codes_v, per_req_scales, seq_len
 # ---------------------------------------------------------------------------------------------
 # Flexible-granularity pool (per-tensor quant configs) — consumed by IntPingPongDecodeSm90's
 # k_quant/v_quant modes.  The scale-block layout is NOT defined here, and must not be
-# copied here: it is the same contract both decode kernels read, and a second copy needs
-# a drift check to stay honest.  See `fosca/quant_layout.py` for the sectioned
-# layout it describes.
+# copied here: it is the same contract both decode kernels read, and two copies are free
+# to drift.  See `quant_layout.py` for the sectioned layout it describes.
 # ---------------------------------------------------------------------------------------------
 from ..quant_layout import quant_block_offsets  # noqa: F401  (re-exported for callers)
 def make_serving_cache_flex(per_req_codes_k, per_req_codes_v, k_sz, v_sz, seq_lens,
                             k_quant=None, v_quant=None, N=64, *, D,
                             sdtype=torch.float32, shuffle=True, identity_block_table=False):
     """Build a flexible-granularity ServingCache. k_sz and v_sz are the (scale, zero) tensors
-    of quant_ref.quantize_grouped in LOGICAL token order, padded to whole pages, shaped by pair:
+    of the reference quantizer in LOGICAL token order, padded to whole pages, shaped by pair:
       ("token", D):   [B, HKV, S_pad]           per token
       ("token", D/2): [B, HKV, S_pad, 2]        per token x {lo, hi} channel half
       ("channel", Gt):[B, HKV, S_pad//Gt, D]    per channel x token-group
     `D` is the head dimension, and it is required because a stale default would silently select
     the half-group branch for a full-D pool. A `None` pair is ("token", D), the kernel's own
-    default. The code tensors are repack_rs outputs in either code pool order, copied as they
-    are. The returned `scales` pool is make_serving_cache's [NP, HKV, N, 4] interleave when both
-    pairs are ("token", D), and otherwise the sectioned block of quant_block_offsets."""
+    default. The code tensors are the serving writer's outputs in either code pool order, copied
+    as they are. The returned `scales` pool is make_serving_cache's [NP, HKV, N, 4] interleave
+    when both pairs are ("token", D), and otherwise the sectioned block of quant_block_offsets."""
     if k_quant is None:
         k_quant = ("token", D)
     if v_quant is None:

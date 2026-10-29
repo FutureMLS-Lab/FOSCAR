@@ -36,7 +36,7 @@ than producing a wrong result.
 
 ```python
 import torch
-from fosca import PagedDecodeWrapper, get_capabilities, pool
+from fosca import PagedDecodeWrapper, QuantKVLayout, get_capabilities
 
 device = "cuda"
 arch = get_capabilities()["arch"]                 # "sm90" or "sm100"
@@ -45,22 +45,22 @@ q_dtype = torch.float8_e4m3fn if arch == "sm100" else torch.bfloat16
 batch, kv_heads, q_heads, head_dim, page_size = 8, 8, 32, 128, 64
 pages_per_seq, bits = 64, 2
 
-# A logical KV cache: [batch, pages, page_size, kv_heads, head_dim], bf16.
-k_log = torch.randn(batch, pages_per_seq, page_size, kv_heads, head_dim,
-                    device=device, dtype=torch.bfloat16)
-v_log = torch.randn_like(k_log)
+# One layer's cache layout, resolved against the reader that will decode it.
+layout = QuantKVLayout.create(bits=bits, head_dim=head_dim,
+                              num_kv_heads=kv_heads, device=device)
+cache = layout.allocate(batch * pages_per_seq)
 
-# Build the packed pools and the physical block table. K and V are quantized
-# token-wise: one scale and offset per token, over the whole head dimension.
-k_pool, v_pool, scale_pool, block_table, _aux = pool.build_pools_flex(
-    k_log, v_log, bits,
-    k_quant=("token", head_dim), v_quant=("token", head_dim),
-    k_store_perm=pool.k_store_perm_sm100_f4(bits),
-    v_store_perm=pool.v_store_perm_sm100_f4(bits))
+# Write a token per request into the cache. k/v are bf16 [tokens, kv_heads, head_dim]
+# and slot_mapping is int64: token t goes to page slot // 64, position slot % 64.
+k = torch.randn(batch, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+v = torch.randn_like(k)
+slot_mapping = (torch.arange(batch, device=device, dtype=torch.int64)
+                * (pages_per_seq * page_size))
+cache.append(k, v, slot_mapping)
 
 # Page-table inputs.
 indptr = torch.arange(batch + 1, device=device, dtype=torch.int32) * pages_per_seq
-indices = block_table.reshape(-1).to(torch.int32)
+indices = torch.arange(batch * pages_per_seq, device=device, dtype=torch.int32)
 seq_lens = torch.full((batch,), pages_per_seq * page_size, device=device,
                       dtype=torch.int32)
 
@@ -69,32 +69,32 @@ q = torch.randn(batch, q_heads, head_dim, device=device,
 
 w = PagedDecodeWrapper(torch.empty(256 * 1024 * 1024, dtype=torch.uint8,
                                    device=device))
-w.plan(indptr, indices, seq_lens,
-       num_qo_heads=q_heads, num_kv_heads=kv_heads, head_dim=head_dim,
-       page_size=page_size, q_data_type=q_dtype, bits=bits,
-       k_quant=("token", head_dim), v_quant=("token", head_dim))
+w.plan(indptr, indices, seq_lens, num_qo_heads=q_heads, layout=layout)
 
-out = w.run(q, k_pool, v_pool, scale_pool=scale_pool,
-            k_pool_order="permuted")     # [batch, q_heads, head_dim]
+out = torch.empty(batch, q_heads, head_dim, device=device, dtype=torch.bfloat16)
+w.run(q, cache, out=out)                    # [batch, q_heads, head_dim]
 ```
+
+`plan()` compiles the kernel for one static configuration and is called when the
+page table or the sequence lengths change. `run()` is called every decode step
+and is graph-capturable. Call `plan()` once at model load to pay the JIT cost
+before the first request.
+
+The cache object carries the pool orders, the scale dtype and the granularity, so
+`run()` takes no declaration of them: a cache built for a different layout is
+refused.
 
 ### Quantization granularity
 
-The quickstart above asks for token-wise K and V: one scale and offset per
-token, over the whole head dimension, which is also the default. Granularity is
-chosen per tensor by an `(axis, group)` pair, and the pool builder and `plan()`
-must be given the same pair.
+The quickstart asks for token-wise K and V: one scale and offset per token, over
+the whole head dimension, which is the default. Granularity is chosen per tensor
+by an `(axis, group)` pair on the layout, and the cache is written by that layout.
 
 ```python
-k_pool, v_pool, scale_pool, block_table, _aux = pool.build_pools_flex(
-    k_log, v_log, bits,
-    k_quant=("channel", 128),      # one scale per channel, per 128-token group
-    v_quant=("token", 128),        # one scale per token over the head dimension
-    k_store_perm=pool.k_store_perm_sm100_f4(bits),
-    v_store_perm=pool.v_store_perm_sm100_f4(bits))
-
-w.plan(indptr, indices, seq_lens, ..., bits=bits,
-       k_quant=("channel", 128), v_quant=("token", 128))
+layout = QuantKVLayout.create(bits=2, head_dim=128, num_kv_heads=8,
+                              k_quant=("channel", 128),   # per channel, per 128 tokens
+                              v_quant=("token", 128),     # per token over the head dim
+                              device=device)
 ```
 
 Accepted pairs, at `head_dim` 128:
@@ -104,20 +104,8 @@ Accepted pairs, at `head_dim` 128:
 | K | group `D` (default) or `D/2` | token group 64, 128 or 256 |
 | V | group `D` only | token group 64, 128 or 256 |
 
-Channel-wise K is the setting that helps most when a few channels dominate.
-`build_pools` (as opposed to `build_pools_flex`) always builds the default
-token-wise pools, so use `build_pools_flex` whenever the granularity differs.
-K at group `D/2` additionally needs a bf16 scale pool: pass `sdtype=torch.bfloat16`
-to the builder and `kernel_kwargs={"sdtype": torch.bfloat16}` to `plan()`.
-
-`plan()` compiles the kernel for one static configuration and is called when the
-page table or the sequence lengths change. `run()` is called every decode step
-and is graph-capturable. Call `plan()` once at model load to pay the JIT cost
-before the first request.
-
-Two arguments in `run()` are worth hoisting out of the hot path: passing `out=`
-avoids an allocation per call, and passing `pscale_lp=w.pscale_lp(scale_pool)`
-avoids a device synchronisation per call.
+`QuantKVCache.append` writes token-wise layouts. A channel-wise layout is written
+one complete quantization group at a time, through `append_quantized`.
 
 ## Support matrix
 
@@ -127,62 +115,24 @@ avoids a device synchronisation per call.
 | `bits` | 2, 4 | 2, 4 |
 | Q dtype | bf16 | fp8 e4m3 |
 | K/V | packed uint8 pools + scale pool | packed uint8 pools + scale pool |
-| head_dim | 128; 256 with token-wise K and V and an f32 scale pool | 128 |
+| head_dim | 128, 256 | 128, 256 |
 | page_size | 64 | 64 |
 | reductions | none, kernel (split-K with LSE merge) | none, kernel (split-K with LSE merge) |
-| GQA group size | up to 8 | up to 8 |
+| KV heads | 1 to 128 at 128 query heads | 1 to 128 at 128 query heads |
 | quantized granularity | token 128/64, channel 64/128/256 | token 128/64, channel 64/128/256 |
 
 `get_capabilities()` reports the same set for the running device. Requesting a
 configuration outside it raises `ValueError` or `NotImplementedError` naming what
 is supported.
 
-## Building pools
+## Writing the cache
 
-Both architectures ship a builder that turns a bf16 KV cache into the packed
-pools their kernel reads.
+`QuantKVCache.append` quantizes and writes tokens on the device, one launch for K
+and V. `append_quantized` takes integer values an engine has already quantized.
+`dequantize` reads rows back as bf16.
 
-On Blackwell, `fosca.pool` packs the pools and also carries a reference
-implementation of the same attention, so a kernel run can be checked against a
-storage-matched oracle:
-
-```python
-from fosca import pool
-
-k_pool, v_pool, scale_pool = pool.build_pools(
-    k, v, bits,                                  # k, v: [pages, 64, kv_heads, dim]
-    k_store_perm=pool.k_store_perm_sm100_f4(bits),
-    v_store_perm=pool.v_store_perm_sm100_f4(bits))
-```
-
-On Hopper, `fosca.pool_sm90` quantizes and repacks into the chunk-major
-pools the SM90 kernel reads, and lays the pages out as one global pool behind a
-block table:
-
-```python
-from fosca import pool_sm90
-
-cache = pool_sm90.build_pools_sm90(
-    k, v, bits,                                  # k, v: [batch, kv_heads, kv_len, dim]
-    seq_lens=seq_lens)                           # -> codes_k, codes_v, scales, block_table
-```
-
-The stored integer values are permuted in a way the kernel requires and the bytes
-do not reveal. Ask the builder for the permutation rather than reproducing it:
-`k_store_perm_sm100_f4` / `v_store_perm_sm100_f4` on Blackwell, and the
-`order=` argument on Hopper, which defaults to the `chunk16` order the SM90
-kernel reads. On Blackwell, `run()` refuses a K pool whose order the caller has
-not declared through `k_pool_order`.
-
-## Accuracy
-
-`baselines`-style end-to-end scoring is not part of this release. What the
-package ships is the reference implementation in `fosca.pool`, whose
-`dequant_pools_flex` inverts a pool and `ref_paged_attention_fp8q_flex` scores
-attention over the dequantized logical stream through the block table. Comparing
-a kernel run against that reference measures the kernel's own error, because
-both sides consume the same integer values, the same scale and offset, and the
-same Q dtype.
+Every use of a page must begin with a write at position 0, and no decode of the
+layer may run concurrently with an append on another stream.
 
 ## Benchmarks
 

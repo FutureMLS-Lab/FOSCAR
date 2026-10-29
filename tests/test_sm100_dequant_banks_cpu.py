@@ -9,7 +9,8 @@ stream warp, for INT2 and INT4, K and V, at head tiles 4 and 8, at all eight ope
 rows (address bits 7-9, the bits a K-major swizzle reads) and all eight code-ring placements
 modulo 1,024, and costs each one in `tests/_smem_banks.py`, the suite's measured bank model.
 
-THE RULE IT ENFORCES. Every code load and every deposit is at ncu's ideal, with one documented
+THE RULE IT ENFORCES (`docs/kernel/int_fold_decode.md`, "Shared-memory bank conflicts in the
+dequant streams"). Every code load and every deposit is at ncu's ideal, with one documented
 floor: the INT2 deposits write the padded e2m1 operand the `kind::f8f6f4` MMA reads from shared
 memory, 8 payload bytes in every 16, so their payload reaches only 16 of the 32 banks, a
 wavefront carries at most 64 payload bytes, and a warp's 256 payload bytes take 4 wavefronts
@@ -22,32 +23,39 @@ source is read instead:
   executed from the source, called with the arguments `_dequant_warpgroup` passes it;
 - every code-load address is evaluated from the kernel's own `load_src` calls: the code view
   each call passes, the index each stream thread slices that view with (`dq_tidx`, `i4vt`,
-  `v_dims`, `v_pans`, each from its own assignment), the run or slot index of the call, the
+  `vt`, each from its own assignment), the run or slot index of the call, the
   `[None, code_idx]` slice `load_src` reads from, and the word count it reads. Every call on a
   shipped stream's view is costed, so a changed slice index changes the costed addresses;
 - every INT2 deposit address is evaluated from the kernel's own `sKf4b[...]` and `sVf4b[...]`
   store subscripts: each index is the kernel's expression, the thread's slots (`sf_rows`,
-  `sf_pan0`, `v_dims`, `v_pans`) come from their own assignments, the page (`pm`, `pk`) from
+  `sf_pan0`, `v_row0`, `v_pan00`) come from their own assignments, the page (`pm`, `pk`) from
   the tile loop's own unpacking of `j`, the stage from the operand-ring handle the store
   indexes, and the width from the `cute.make_layout` the store is issued through. Every
   subscript of either view is a costed store, so a changed store index changes the costed
   addresses;
 - every other quantity (chunk sizes, run counts, page and run offsets) and every view stride
-  (`codeKfS4_w`, `codeVfS4_w`, `codeKfS_w`, `codeVf4_dm`, `sKf4b`, `sVf4b`) is the expression
+  (`codeKfS4_w`, `codeVfS4_w`, `codeKfS_w`, `codeVfS_w`, `sKf4b`, `sVf4b`) is the expression
   in `_dequant_warpgroup`, evaluated at the kernel's one page size (64) and head_dim 128 from
   the inputs `kernel` hands it;
 - `_dequant_warpgroup` does not read `q_head_tile`, so the maps cannot depend on the head tile.
-  Both tiles are still enumerated, because a head-tile-keyed INT4 V map (full channel rows at
-  tile 8) costs 8/4 and the rule must exclude it.
+  Both tiles are still enumerated, because the head-tile-keyed INT4 V map (full channel rows at
+  tile 8, whose loads measured 8/4) is exactly what this rule retired.
+
+THE ALIGNED K/V LAYOUT. On the main feeds V is stored exactly like K, so the V stream runs the
+K stream's map over its own rings: the same code view shape, the same chunk ownership
+`t + 64 q`, and at INT4 the same `deposit_lane_offsets` geometry into an MN_SW128 V stage whose
+bytes and swizzle are K_SW128's. The tests below hold the V stream to K's geometry rather than
+to a second one.
 
 WHAT IT DOES NOT COVER. The INT2/E4M3 ablation (`dequant_int2_to_f4=0`, which the fold
 ablation also takes) is not a shipped path: its V stream reads token columns at a 32-byte
 stride, which this model costs at 8/4, and nothing here enforces it. The softmax warpgroup's
 scale-record reads are not dequant-stream instructions.
 
-THE MODEL IS ANCHORED BELOW, in both directions: the half-row V deposit on the 128-byte V image
-costs 8/4 at exactly the ring rows where ncu measures 8/4 (and 4/4 at row 6, the token-128
-pair), and the full-row V load costs 8/4 as ncu measures.
+THE MODEL IS ANCHORED BELOW, in both directions: the half-row V deposit on the retired
+128-byte V image costs 8/4 at exactly the ring rows where ncu measured 8/4 (and 4/4 at row 6,
+the paper configuration's), the retired full-row V load costs 8/4 as ncu measured, and the
+pre-#95 token-row V load (one 64-byte token row per thread) costs 16/4 as ncu measured.
 """
 from __future__ import annotations
 
@@ -81,7 +89,7 @@ INPUTS = {
 }
 
 #: Operand-ring starts: each of the eight rows, and the four starts production allocates
-#: (0x700, 0x780, 0x980 and 0x1180).
+#: (0x700, 0x780, 0x980 and 0x1180 in `_anchor_fold_outputs.INT4_OPERAND_RING_START`).
 OPERAND_RING_STARTS = [0x400 + 128 * r for r in range(8)] + [0x700, 0x780, 0x980, 0x1180]
 #: Code-ring starts: TMA-filled, so 128-byte aligned; each placement modulo 1,024.
 CODE_RING_STARTS = [0x20000 + 128 * r for r in range(8)]
@@ -141,10 +149,9 @@ def _eval(node, env):
 
 #: The scalars `_dequant_warpgroup` derives, in the order it derives them.
 DERIVED = ("words", "words_pt", "out_bytes", "stage_words", "kf_chunk_words", "kf_runs",
-           "kf_cpr", "kf_out_bytes", "dep_bytes", "i4s_threads", "stream_threads",
-           "panels_pp", "chunks_ptv")
-INT4_DERIVED = ("vf_chunk_words", "vf_runs", "vf_out_bytes", "vf_cpr", "kf_row_bytes",
-                "k_page_off", "k_run_off", "vf_row_bytes", "v_page_off", "v_run_off")
+           "kf_cpr", "kf_out_bytes", "dep_bytes", "i4s_threads", "stream_threads")
+INT4_DERIVED = ("kf_row_bytes", "k_page_off", "k_run_off", "vf_row_bytes", "v_page_off",
+                "v_run_off")
 
 
 def _geometry(dequant, bits):
@@ -174,7 +181,7 @@ def _sw(x, bits):
 #: The code view each shipped stream loads from, and the (width, tensor) it serves. The one
 #: other view `load_src` reads, `codeV_w`, is the INT2/E4M3 ablation's (module docstring).
 LOAD_VIEWS = {"codeKfS4_w": (4, "K"), "codeVfS4_w": (4, "V"),
-              "codeKfS_w": (2, "K"), "codeVf4_dm": (2, "V")}
+              "codeKfS_w": (2, "K"), "codeVfS_w": (2, "V")}
 ABLATION_LOAD_VIEWS = {"codeV_w"}
 #: Each code view's base: the code ring for K, and the V ring past the K ring's stages.
 CODE_VIEW_BASES = {"K": "sCode_w", "V": "sCode_w + self.code_stages_k * stage_words"}
@@ -202,8 +209,8 @@ def _one(index, name):
 
 class _Scope(dict):
     """The names a kernel expression reads: the ones given, and any other from its one
-    assignment in `_dequant_warpgroup`, evaluated on first use. A V thread's `i4vt`, `v_dims`
-    and `v_pans` are therefore the kernel's own expressions of its `dq_tidx`. A name in `local`
+    assignment in `_dequant_warpgroup`, evaluated on first use. A V thread's `i4vt`, `vt`
+    and `v_row0` are therefore the kernel's own expressions of its `dq_tidx`. A name in `local`
     (a store's per-iteration names, `_loop_bindings`) is evaluated from that binding instead."""
 
     def __init__(self, index, names, local=None):
@@ -388,7 +395,7 @@ def _int4_maps(dequant, helper):
     # The page and run offsets each deposit adds, and the uniform offsets the helper checks.
     assert args["K"] == [g["kf_row_bytes"], g["kf_out_bytes"],
                          (g["kv_stage_bytes"], g["k_page_off"], g["k_run_off"])]
-    assert args["V"] == [g["vf_row_bytes"], g["vf_out_bytes"],
+    assert args["V"] == [g["vf_row_bytes"], g["kf_out_bytes"],
                          (g["kv_stage_bytes"], g["k_stages"] * g["kv_stage_bytes"],
                           g["v_page_off"], g["v_run_off"])]
     return g, args
@@ -402,7 +409,7 @@ def _enumerate_int4(dequant, helper, head_tile):
     for ring in OPERAND_RING_STARTS:
         for tensor, runs, base in (
                 ("K", 2 * g["kf_runs"], ring),
-                ("V", g["vf_runs"], ring + g["k_stages"] * g["kv_stage_bytes"])):
+                ("V", 2 * g["kf_runs"], ring + g["k_stages"] * g["kv_stage_bytes"])):
             row_bytes, run_bytes, uniform = args[tensor]
             page_off = g["k_page_off"] if tensor == "K" else g["v_page_off"]
             run_off = g["k_run_off"] if tensor == "K" else g["v_run_off"]
@@ -646,14 +653,25 @@ def test_the_int2_floor_is_the_physical_minimum_of_the_padded_format():
 
 def test_the_dequant_streams_do_not_read_the_head_tile(dequant):
     """What makes the two head tiles run one map: the dequant warpgroup never reads
-    `q_head_tile`."""
+    `q_head_tile`. Until 2026-09-30 it chose the INT4 V map by it."""
     reads = [n.lineno for n in ast.walk(dequant) if isinstance(n, ast.Attribute)
              and n.attr == "q_head_tile"]
     assert reads == []
 
 
-def test_the_v_stream_takes_the_k_streams_chunk_map(dequant):
-    assert ast.unparse(_assignment(dequant, "vf_chunk_words").value) == "kf_chunk_words"
+def test_the_v_stream_takes_the_k_streams_map(dequant, helper):
+    """V stored like K means the V stream runs K's map: each width's V code view has the K
+    view's shape and strides over its own ring, and the INT4 V deposit has K's row, run, page
+    and run-offset geometry."""
+    index = _assignments(dequant)
+    for k_view, v_view in (("codeKfS4_w", "codeVfS4_w"), ("codeKfS_w", "codeVfS_w")):
+        k_layout, v_layout = (_one(index, n).args[1] for n in (k_view, v_view))
+        k_text = ast.unparse(k_layout).replace("code_stages", "self.code_stages_v")
+        assert ast.unparse(v_layout) == k_text, (k_view, v_view)
+    g, args = _int4_maps(dequant, helper)
+    assert args["V"][:2] == args["K"][:2]
+    assert (g["vf_row_bytes"], g["v_page_off"], g["v_run_off"]) == (
+        g["kf_row_bytes"], g["k_page_off"], g["k_run_off"])
 
 
 def test_each_code_page_is_loaded_once(dequant):
@@ -671,13 +689,13 @@ def test_each_code_page_is_loaded_once(dequant):
                 assert off == table[(t, 0, lv)] + s * stage_b, (bits, site.line, t, s, lv)
 
 
-#: The INT2 operand image, the canonical K-major panel image the `kind::f8f6f4` MMA reads: the
-#: 16-byte chunk of (operand row r, 16-byte panel c) sits at byte 2048 c + 16 r of the stage.
-#: K's rows are tokens and its panels head-dim channels; V's rows are channels and its panels
-#: tokens, 16 to a panel. Page p of an operand block holds tokens [64 p, 64 p + 64).
+#: The INT2 operand image the `kind::f8f6f4` MMA reads: the 16-byte chunk of (token row r,
+#: 16-channel panel c) sits at byte 2048 c + 16 r of the stage, for K (the K-major panel image)
+#: and for V (the same bytes read MN-major, V stored like K). Page p of an operand block holds
+#: tokens [64 p, 64 p + 64).
 INT2_PAGE_CHUNKS = {
-    "K": lambda p: [2048 * c + 16 * (64 * p + r) for r in range(64) for c in range(8)],
-    "V": lambda p: [2048 * (4 * p + c) + 16 * r for r in range(128) for c in range(4)],
+    t: (lambda p: [2048 * c + 16 * (64 * p + r) for r in range(64) for c in range(8)])
+    for t in ("K", "V")
 }
 
 
@@ -713,11 +731,12 @@ def test_each_int2_code_page_deposits_its_slice_of_the_operand_image_once(dequan
 #: The operand byte of (row r, byte b of the page's slice of that row) in page p of a stage,
 #: as each DSL layout places it (printed on B200): K_SW128
 #: `((128,32),1,4,S):((128,1),0,32,16384)` puts token row 64 p + r at 128 (64 p + r) + b, and
-#: K_SW64 tiled rows first, `((128,32),1,(2,2),S):((64,1),0,(32,8192),16384)`, puts head-dim
-#: row r of page p at 8192 p + 64 r + b. The swizzle is taken on the absolute address.
+#: the V layout, MN_SW128 (`make_smem_layout_a` for the MN-major V operand),
+#: `((128,32),1,4,S):((1,128),0,4096,16384)`, puts channel b of token 64 p + r at the same
+#: byte. The swizzle is taken on the absolute address.
 LOGICAL = {
     "K": (3, lambda p, r, b: 128 * (64 * p + r) + b),
-    "V": (2, lambda p, r, b: 8192 * p + 64 * r + b),
+    "V": (3, lambda p, r, b: 128 * (64 * p + r) + b),
 }
 
 
@@ -734,7 +753,7 @@ def test_each_int4_deposit_lands_where_the_operand_layout_puts_its_byte(
     cpr = row_bytes // run_bytes
     page_off = g["k_page_off"] if tensor == "K" else g["v_page_off"]
     run_off = g["k_run_off"] if tensor == "K" else g["v_run_off"]
-    runs = 2 * g["kf_runs"] if tensor == "K" else g["vf_runs"]
+    runs = 2 * g["kf_runs"]
     n = 0
     for ring in OPERAND_RING_STARTS:
         for t in range(64):
@@ -759,7 +778,7 @@ def test_one_pages_int4_deposits_write_its_slice_once(dequant, helper, tensor):
     row_bytes, run_bytes, uniform = args[tensor]
     run_off = g["k_run_off"] if tensor == "K" else g["v_run_off"]
     page_off = g["k_page_off"] if tensor == "K" else g["v_page_off"]
-    runs = 2 * g["kf_runs"] if tensor == "K" else g["vf_runs"]
+    runs = 2 * g["kf_runs"]
     for ring in OPERAND_RING_STARTS:
         units = collections.Counter(
             (ring + run_off * q + off) // 16
@@ -801,30 +820,35 @@ def test_the_deposits_add_the_offsets_the_helper_was_checked_against(dequant):
         "v_ring + k_stages * kv_stage_bytes")
 
 
-def test_the_int4_v_stages_take_the_64_byte_swizzle_on_the_host_and_on_the_device():
-    """The image the helper addresses is the one the MMA reads: the host builds the INT4 V
-    layout from the K_SW64 atom, and the device recasts the V view onto that layout's swizzle
-    and asserts it."""
+def test_the_int4_v_stages_take_the_layouts_own_swizzle_on_the_host_and_on_the_device(
+        dequant):
+    """The image the helper addresses is the one the MMA reads: the host builds the V layout
+    with `make_smem_layout_a` alone (MN_SW128 for the MN-major V operand, no override), the
+    device's V view keeps the ring's 128-byte swizzle and asserts that it is the layout's, and
+    the V deposit asserts that this swizzle spans the token row it addresses."""
     source = KERNEL.read_text()
-    assert source.count("tcgen05.SmemLayoutAtomKind.K_SW64, mma_dtype") == 1
+    assert "K_SW64" not in source
     kernel = _method("kernel")
-    recasts = [n for n in ast.walk(kernel) if isinstance(n, ast.Assign)
-               and ast.unparse(n.targets[0]) == "tAsV"]
-    assert len(recasts) == 2
-    assert "smem_layout_v_mma.inner, dtype=mma_dtype" in ast.unparse(recasts[1].value)
+    views = [n for n in ast.walk(kernel) if isinstance(n, ast.Assign)
+             and ast.unparse(n.targets[0]) == "tAsV"]
+    assert len(views) == 1
+    assert ast.unparse(views[0].value) == "cute.make_tensor(tAsK.iterator, smem_layout_v_mma.outer)"
     asserts = [ast.unparse(n.test) for n in ast.walk(kernel) if isinstance(n, ast.Assert)]
     assert ("tAsV.iterator.type.swizzle_type == smem_layout_v_mma.inner.type" in asserts)
+    deq_asserts = [ast.unparse(n.test) for n in ast.walk(dequant) if isinstance(n, ast.Assert)]
+    assert any("16 << swz_v.num_bits == vf_row_bytes" in a for a in deq_asserts)
 
 
 # ---------------------------------------------------------------------------------------------
-# Negative controls: the model sees the conflicts ncu measures
+# Negative controls: the model sees the conflicts ncu measured before this rule
 # ---------------------------------------------------------------------------------------------
 
 def test_the_retired_half_row_map_on_the_128_byte_v_image_conflicts_where_ncu_measured():
-    """The chunk map that puts row c // 2, token half c % 2 on 128-byte rows with the page at
-    byte 64 pk is 8/4 at ring rows 0, 1, 3, 4, 5 and 7, and 4/4 at rows 2 and 6. ncu measures
-    8/4 in the six INT4 pairs whose ring starts at rows 0, 1, 3, 4 and 7, and 4/4 at row 6 (the
-    token-128 pair)."""
+    """Before 2026-09-30 the INT4 V stage carried the 128-byte swizzle. The same chunk map
+    (row c // 2, token half c % 2, 128-byte rows with the page at byte 64 pk) is 8/4 at ring
+    rows 0, 1, 3, 4, 5 and 7, and 4/4 at rows 2 and 6. ncu measured 8/4 in the six INT4 pairs
+    whose ring starts at rows 0, 1, 3, 4 and 7, and 4/4 at row 6 (the token-128 pair, the
+    paper configuration)."""
     conflicted = set()
     for row in range(8):
         av = 0x10000 + 128 * row
@@ -845,9 +869,9 @@ def test_the_retired_half_row_map_on_the_128_byte_v_image_conflicts_where_ncu_me
 
 
 def test_the_retired_full_row_v_load_is_8_over_4():
-    """A head-tile-8 V map that loads channel row t' + 64 q whole, 32 bytes as two 16-byte
-    loads, reads 256 bytes at a 32-byte stride in each quarter warp: 8/4 at every code
-    placement, as ncu measures in all 20 INT4 pairs at head tile 8."""
+    """The retired head-tile-8 V map loaded channel row t' + 64 q whole, 32 bytes as two
+    16-byte loads, so each quarter warp read 256 bytes at a 32-byte stride: 8/4 at every code
+    placement, as ncu measured in all 20 INT4 pairs at head tile 8."""
     for code in CODE_RING_STARTS:
         for warp in (0, 1):
             for q in (0, 1):
@@ -855,6 +879,21 @@ def test_the_retired_full_row_v_load_is_8_over_4():
                     acc = [(ln, code + 32 * (32 * warp + ln + 64 * q) + 16 * h)
                            for ln in range(32)]
                     assert wavefronts(acc, 16, "ld") == (8, 4)
+
+
+def test_the_pre_95_token_row_v_load_is_16_over_4():
+    """Before #95 the MN-major INT4 V stream gave each thread one whole 64-byte token row,
+    loaded as four 16-byte loads, so each quarter warp read 16 bytes at a 64-byte lane stride,
+    on 2 of the 8 16-byte bank groups: 16/4 at every code placement. ncu measured exactly
+    that, 16 wavefronts per execution against 4 at each of the 16 V-stream LDS.128 sites of
+    the pre-#95 kernel (`fecfff3`), on 2026-09-25. The aligned layout reads the same token
+    rows with the K stream's chunk ownership, which `test_every_int4_load_and_deposit_is_at_
+    its_ideal` holds at 4/4."""
+    for code in CODE_RING_STARTS:
+        for warp in (0, 1):
+            for h in range(4):
+                acc = [(ln, code + 64 * (32 * warp + ln) + 16 * h) for ln in range(32)]
+                assert wavefronts(acc, 16, "ld") == (16, 4)
 
 
 def test_a_swizzle_key_taken_from_the_ring_start_misplaces_the_deposits(dequant, helper):

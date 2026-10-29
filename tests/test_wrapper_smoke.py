@@ -1,8 +1,7 @@
-# tests/test_wrapper_smoke.py
-import math
 import pytest
 import torch
 
+from fosca import QuantKVLayout, get_capabilities
 from fosca.wrapper import PagedDecodeWrapper
 from fosca._utils import is_supported
 
@@ -10,12 +9,14 @@ pytestmark = pytest.mark.skipif(not is_supported(), reason="needs SM90 or SM100 
 DEV = torch.device("cuda")
 
 # ---------------------------------------------------------------------------
-# ARGUMENT-CONTRACT tests only.
+# ARGUMENT-CONTRACT tests only, on the real device.
 #
-# These deliberately stop before any cute.compile, because an IntDecodeSm100
-# trace is ~40 s, which does not belong in a unit-test suite. This file pins the
-# errors a caller can hit without a GPU-minute; the numerical bitwise gate is a
-# separate run.
+# These deliberately stop before any cute.compile: an IntDecodeSm100 trace is
+# ~40 s, which does not belong in a unit-test suite. The numerical gate is a
+# separate on-device run that compares the quantized path bitwise against the
+# dequantized reference; `tests/test_public_api.py` holds the host-side plan()
+# and run() contract. This file pins what needs the device itself: the
+# architecture that a layout and a plan resolve from it.
 # ---------------------------------------------------------------------------
 
 
@@ -23,52 +24,37 @@ def _ws():
     return PagedDecodeWrapper(torch.empty(1 << 20, dtype=torch.float32, device=DEV))
 
 
-def _dummy_plan_args(page_size=64):
+def _dummy_plan_args():
     b, kv = 2, 512
-    npages = kv // page_size
+    npages = kv // 64
     indptr = torch.arange(b + 1, dtype=torch.int32, device=DEV) * npages
     indices = torch.arange(b * npages, dtype=torch.int32, device=DEV)
     seq_lens = torch.full((b,), kv, dtype=torch.int32, device=DEV)
     return indptr, indices, seq_lens
 
 
-@pytest.mark.parametrize("bits", [1, 3, 8])
-def test_quant_rejects_unsupported_bits(bits):
-    indptr, indices, seq_lens = _dummy_plan_args()
-    with pytest.raises(ValueError, match="bits must be one of"):
-        _ws().plan(indptr, indices, seq_lens, 32, 8, 128, 64,
-                   q_data_type=torch.float8_e4m3fn, bits=bits)
+def test_the_layout_resolves_the_devices_reader():
+    layout = QuantKVLayout.create(bits=2, head_dim=128, num_kv_heads=8)
+    assert layout.arch == get_capabilities()["arch"]
+    assert layout.reader == {"sm90": "IntPingPongDecodeSm90",
+                             "sm100": "IntDecodeSm100"}[layout.arch]
 
 
-def test_quant_rejects_non_64_page_size():
-    indptr, indices, seq_lens = _dummy_plan_args(page_size=32)
-    with pytest.raises(ValueError, match="page_size == 64"):
-        _ws().plan(indptr, indices, seq_lens, 32, 8, 128, 32,
+def test_plan_refuses_the_retired_per_argument_form():
+    with pytest.raises(TypeError, match="retired call form"):
+        _ws().plan(*_dummy_plan_args(), 32, 8, 128, 64,
                    q_data_type=torch.float8_e4m3fn, bits=2)
 
 
-def test_plan_requires_bits():
-    # Omitting `bits` is an error rather than a silent fall-through to a bf16
-    # kernel.
-    indptr, indices, seq_lens = _dummy_plan_args()
-    with pytest.raises(ValueError, match="bits=2 or bits=4"):
-        _ws().plan(indptr, indices, seq_lens, 32, 8, 128, 64,
-                   q_data_type=torch.float8_e4m3fn)
-
-
-def test_quant_flex_args_rejected_without_bits():
-    # ORDERING TEST, not a duplicate of the one above: the k_quant/v_quant guard
-    # must keep firing BEFORE the missing-bits error, so a caller who passes
-    # flex args but forgets `bits` is told the specific thing that is wrong.
-    indptr, indices, seq_lens = _dummy_plan_args(page_size=16)
-    with pytest.raises(ValueError, match="quantized-mode"):
-        _ws().plan(indptr, indices, seq_lens, 32, 8, 128, 16,
-                   q_data_type=torch.bfloat16, k_quant=("channel", 128))
+def test_plan_refuses_a_layout_of_the_other_architecture():
+    other = {"sm90": "sm100", "sm100": "sm90"}[get_capabilities()["arch"]]
+    layout = QuantKVLayout._create(other, bits=2, head_dim=128, num_kv_heads=8)
+    with pytest.raises(ValueError, match=f"resolved for {other}"):
+        _ws().plan(*_dummy_plan_args(), 32, layout)
 
 
 def test_capabilities_advertise_quantized_bits():
-    from fosca import get_capabilities
-
     caps = get_capabilities()
     assert caps["quantized_bits"] == [2, 4]
     assert caps["quantized_page_sizes"] == [64]
+    assert caps["kv_layouts"] == ["QuantKVLayout"]

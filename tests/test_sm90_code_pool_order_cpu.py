@@ -5,11 +5,12 @@ IntPingPongDecodeSm90 reads the chunk16 order, and the row order is the packers'
 thread-row layout. Both hold the same bytes per (page, kv-head) block, so a pool in the
 wrong order decodes to finite, plausible values and raises nothing unless its SHAPE is
 checked. These tests pin the definition of the order, the refusal that names it, and that
-the pool builders copy whichever order they are given. The kernel-side read and the refusal
-inside `__call__` need an H100, so they are not exercised here.
+the pool builders copy whichever order they are given. The kernel-side read and the refusal inside `__call__`
+need an H100, and `scripts/test_pingpong_quant_flex.py` and
+`scripts/test_wrapper_quant_sm90_compile.py` gate those.
 
-`serving_cache.py` is loaded from its file with stub parent packages, because importing the
-package imports the DSL.
+`serving_cache.py` is loaded from its file with stub parent packages, the way
+`test_ours_flex_adapter_cpu.py` loads it, because importing the package imports the DSL.
 """
 import ast
 import importlib.util
@@ -69,7 +70,7 @@ def test_chunk_c_of_thread_t_is_row_bytes_16c_to_16c_plus_16(sc, per):
 def test_the_word_strides_say_where_each_row_word_is(sc, order, per):
     """Word 4c + w of thread t's row is at word t*thread + c*chunk + w of the block.
 
-    The pingpong kernel's shared-memory view and IntAppend's scatter are both built from
+    The pingpong kernel's shared-memory view and the serving writer's stores are both built from
     these strides, so this is the definition both of them read, checked against the pool
     that `code_rows_to_order` writes."""
     rows = _rows(3, per=per)
@@ -154,7 +155,7 @@ def test_a_transposed_pool_of_the_right_shape_is_refused_by_its_strides(sc):
 
 def test_the_page_dim_stride_counts_only_when_there_is_more_than_one_page(sc):
     """One page sliced out of a larger pool is dense, and torch agrees; every fifth page
-    is not. The page dim follows the same extent-1 rule as the others."""
+    is not. The page dim follows the same extent-1 rule as the others (review, 2026-09-25)."""
     big = sc.code_rows_to_order(_rows(10, 4, per=32), "chunk16")      # [10, 4, 2, 128, 16]
     one = big[3::10]
     assert one.shape[0] == 1 and one.is_contiguous() and one.stride()[0] != 4 * 2 * 128 * 16

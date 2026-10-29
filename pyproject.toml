@@ -23,7 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["torch>=2.4"]
+dependencies = ["torch>=2.4", "numpy>=1.21"]
 
 [project.optional-dependencies]
 cu12 = ["nvidia-cutlass-dsl==4.8.0", "cuda-python>=12.4,<13"]

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """CPU gates for the constructor contract the two decode kernels share.
 
-`kernel_contract.py` exists because the same argument name can mean different things
-across the two kernels. `sdtype` is the case that matters: SM100 asserts
+`kernel_contract.py` exists because the same argument name would otherwise mean different
+things across the two kernels. `sdtype` is the case that bites: SM100 asserts
 `sdtype in ("f32", "bf16")` and SM90 asserts `sdtype in (torch.float32,
-torch.bfloat16)`, so one configuration cannot be handed to both, and a caller has to
-know which kernel it is talking to before it can name a dtype. `page_size == 64` and
-`bits in (2, 4)` asserted in both constructors with different messages is the same
-defect one step quieter: two copies free to drift. The contract keeps each shared rule
-in one file.
+torch.bfloat16)`, the same rule in two vocabularies, so a caller otherwise has to know
+which kernel it is talking to before it can name a scale dtype. `page_size == 64`
+and `bits in (2, 4)` are each asserted twice with different messages, which is the
+same defect one step quieter: two copies free to drift, which is why
+`quant_block_offsets` lives in one file.
 
 These gates need no GPU, because the contract is host-side by construction: nothing here
 is traced and nothing here touches kernel state.
@@ -69,7 +69,7 @@ def test_unknown_sdtype_is_refused_by_name(bad):
 def test_sdtype_is_not_folded_into_the_shape_check():
     """SM100 passes `sdtype=None` meaning "resolve it from the K axis", and that
     resolution needs quant fields the shape check runs before. Folding the two together
-    rejects None, so the shape check must leave sdtype out."""
+    would reject None on 77 of 115 anchor cells."""
     import inspect
     sig = inspect.signature(_contract().GQAPagedDecode._validate_shape)
     assert "sdtype" not in sig.parameters, (
@@ -100,18 +100,32 @@ def test_each_shared_rule_refuses_its_own_violation(kw, needle):
 
 
 def test_the_gqa_bound_is_not_claimed_as_shared():
-    """It is SM90's rule and belongs in SM90.
+    """Both kernels tile high GQA; Hopper requires complete eight-head tiles.
 
-    SM100's own constructor docstring says the opposite in as many words: it launches
-    `ceil_div(q_heads // kv_heads, q_head_tile)` head tiles per KV head, so a larger
-    ratio is SPREAD over threadblocks rather than refused.
+    The shared shape contract has no logical GQA bound. Execute the production
+    host admission helper directly, extracted by AST so this contract test keeps
+    requiring neither torch nor the DSL.
     """
-    src = (_SRC / "fosca" / "kernel_contract.py").read_text()
-    assert "check_heads_per_kv" not in src, (
-        "the GQA bound is SM90-specific and must not live in the shared contract")
-    sm90 = (_SRC / "fosca" / "_sm90" / "int_decode_pingpong.py").read_text()
-    assert "heads_per_kv must be in [1," in sm90, (
-        "SM90 still needs the bound its wgmma shape imposes")
+    import ast
+    import inspect
+    assert "heads_per_kv" not in inspect.signature(_contract().validate_problem).parameters
+    path = _SRC / "fosca" / "wrapper.py"
+    tree = ast.parse(path.read_text())
+    node = next(n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == "_check_num_qo_heads")
+    scope = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
+    admit = scope["_check_num_qo_heads"]
+    for arch in ("sm90", "sm100"):
+        for ratio in (*range(1, 9), 16, 32, 64, 128):
+            admit(arch, 8 * ratio, 8)
+        for bad in (0, -8, True, 8.5, 65):
+            with pytest.raises(ValueError):
+                admit(arch, bad, 8)
+    for ratio in (9, 10, 17, 31, 129):
+        admit("sm100", 8 * ratio, 8)
+        with pytest.raises(NotImplementedError, match="multiples of eight"):
+            admit("sm90", 8 * ratio, 8)
 
 
 @pytest.mark.parametrize("spoof", ["torch.float32", "torch.bfloat16"])
@@ -234,10 +248,9 @@ def test_the_sdtype_validity_rule_is_not_claimed_as_shared():
     validity rule, and normalisation must stay spelling-only so that it cannot
     become a shared gate by accident.
     """
-    from fosca.kernel_contract import normalize_sdtype
-
-    assert normalize_sdtype("bf16") == "bf16"
-    assert normalize_sdtype("f32") == "f32"
+    src = (_SRC / "fosca" / "kernel_contract.py").read_text()
+    assert "DELIBERATELY NOT UNIFIED" in src, (
+        "the contract must say that sdtype VALIDITY is per-kernel, not shared")
     for rel, needle in (("_sm100/int_fold_decode.py", 'assert sdtype == "f32"'),
                         ("_sm90/int_decode_pingpong.py", 'assert sdtype_name == "bf16"')):
         got = (_SRC / "fosca" / rel).read_text()

@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: BSD-3-Clause
 
 import math
 from typing import Literal, Type, Tuple, cast
@@ -35,31 +35,33 @@ warp_threads = 32
 warpgroup_warps = 4
 warpgroup_threads = 128
 max_reduction_iters = 4  # log2(16)
+# The split reduction loads the first this-many splits' partial outputs into registers before
+# its wait, and stages the rest in shared memory (`reduction_kernel`)
+reduction_prefetch_splits = 16
 
 # Math helpers
 log2_e = math.log2(math.e)  # change exponential base
+ln_2 = math.log(2.0)  # a base-2 log-sum-exp times this is the natural-log one
 exp2 = partial(cute.math.exp2, fastmath=True)
 warp_fmax = partial(cute.arch.warp_redux_sync, kind="fmax", nan=True)
 smem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="cta")
-gmem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="gpu")
 
 
 class GroupedQueryAttentionDecode:
-    # This file holds the split-K reduction library that the quantized kernel
-    # imports. It is not a kernel itself.
+    # This class carries NO kernel body: it is the split-K reduction library that the
+    # quantized kernel imports, which is why it lives beside the kernel rather than
+    # inside it.
     #
     # int_fold_decode.py takes 11 module-level names from here, and uses this
     # CLASS as the namespace for the reduction members below, so neither the
     # module name nor the class name may change.
-    # Two dependencies are invisible to a grep of those import lists:
-    #   * `launch_reduction` reaches the kernel through a class-qualified
-    #     `GroupedQueryAttentionDecode.reduction_kernel(...)` call.
-    #   * `reduction_epilogue` resolves `gmem_fmax` as a MODULE GLOBAL rather
-    #     than taking it as an argument.
-    # Pruning either one fails at TRACE time, not at import time.
+    # One dependency is invisible to a grep of those import lists:
+    # `launch_reduction` reaches the kernel through a class-qualified
+    # `GroupedQueryAttentionDecode.reduction_kernel(...)` call. Pruning it fails
+    # at TRACE time, not at import time.
     #
-    # `can_implement` is called unbound with a caller-supplied `self`, since the
-    # fold kernels pass their own instance, so it is a plain method on a class
+    # `can_implement` is called UNBOUND with a foreign `self` -- the fold kernels
+    # pass their own instance -- which is why it stays a plain method on a class
     # that is never instantiated.
     ##############################
     # Launch helpers
@@ -165,24 +167,36 @@ class GroupedQueryAttentionDecode:
         sL: cute.Tensor,
         gL: Optional[cute.Tensor],
         scale_o: Float32,
+        lane_store_lse: bool,
     ):
+        """The unsplit build's final normalization, and with `gL` its natural-log LSE.
+
+        `sM` holds each column's m2 = log2(e) * max_j z_j and the four warps' `sL` sum to
+        l = sum_j exp2(log2(e) * z_j - m2), so the LSE is ln2 * (m2 + log2 l). It is stored
+        only by `lane_store_lse`, the lanes of the tile that are real query heads and tokens:
+        a GQA ratio that is not a power of two pads the tile, and a padded lane's slot is the
+        next KV head's first query head.
+
+        The LSE adds nothing before the arrive that releases the O epilogue: m2 is read where
+        the lane overwrites it with the normalization, so nothing is held across the barrier
+        waits, and l >= 1 (the maximum's own term is 1), so the one-instruction
+        lg2.approx.ftz is exact enough (an error of about 2^-22)."""
         store_lse = gL is not None
         colmax = Float32(0)
         colsum = Float32(0)
         sM_final_nbar.arrive_and_wait()
-        if cutlass.const_expr(store_lse):
-            if lane_store_max:
-                colmax = sM[lane_idx]
         sL_final_nbar.arrive_and_wait()
         if lane_store_max:
             sL_lane = sL[lane_idx, None]
             colsum = sL_lane[0] + sL_lane[1] + sL_lane[2] + sL_lane[3]
+            if cutlass.const_expr(store_lse):
+                colmax = sM[lane_idx]
             normalization = cute.arch.rcp_approx(colsum) * scale_o
             sM[lane_idx] = normalization
         sM_final_nbar.arrive()
         if cutlass.const_expr(store_lse):
-            if lane_store_max:
-                gL[lane_idx] = colmax + cute.math.log2(colsum)
+            if lane_store_lse:
+                gL[lane_idx] = (colmax + cute.math.log2(colsum, approx=True, ftz=True)) * ln_2
 
     @staticmethod
     @cute.jit
@@ -196,13 +210,12 @@ class GroupedQueryAttentionDecode:
         sL_final_nbar: nbar,
         sM: cute.Tensor,
         sL: cute.Tensor,
-        mM: cute.Tensor,
         mM_partial: cute.Tensor,
         mL_partial: cute.Tensor,
     ):
-        # get gmem colmax + colsum to store to
+        # get gmem colmax + colsum to store to. The reduction kernel takes the final
+        # colmax as the maximum of these per-split colmaxes.
         coord_h = (coord_hp, coord_hb, kv_split_idx)
-        gM = cute.local_tile(mM, (blk_tile_hp,), coord_h[:-1])
         gM_partial = cute.local_tile(mM_partial, (blk_tile_hp,), coord_h)
         gL_partial = cute.local_tile(mL_partial, (blk_tile_hp,), coord_h)
 
@@ -212,20 +225,18 @@ class GroupedQueryAttentionDecode:
         lane_store_max = blk_tile_n == warp_threads or lane_idx < blk_tile_n
 
         # gmem predication
-        grouped_heads, prediction = mM.shape[0]
-        cM = cute.make_identity_tensor(mM.shape[0])
+        grouped_heads, prediction = mM_partial.shape[0]
+        cM = cute.make_identity_tensor(mM_partial.shape[0])
         cM = cute.local_tile(cM, blk_tile_hp, coord_hp)
         idx_hg, idx_p = cM[lane_idx]
         lane_store_max &= idx_hg < grouped_heads
         lane_store_max &= idx_p < prediction
 
-        # Load partial colmax and reduce
+        # Store partial colmax
         cute.arch.fence_acq_rel_cta()  # Don't reorder partitioning after barrier
         sM_final_nbar.arrive_and_wait()
         if lane_store_max:
-            sM_lane = sM[lane_idx]
-            gM_partial[lane_idx] = sM_lane
-            gmem_fmax(gM.iterator + gM.layout(lane_idx), sM_lane)
+            gM_partial[lane_idx] = sM[lane_idx]
 
         # Load partial colsum and reduce
         sL_final_nbar.arrive_and_wait()
@@ -353,7 +364,9 @@ class GroupedQueryAttentionDecode:
         # Notify for final correction
         sM_final_nbar.arrive()
 
-        # Compute and store LSE
+        # Compute and store LSE. Base 2 and predicated on the tile alone, unlike the other two
+        # reductions' natural-log, head-predicated stores, which is why `compile_fold` refuses
+        # an LSE for the atomic reduction and nothing builds this block.
         if cutlass.const_expr(gL is not None):
             tRgL = thr_store_r.partition_D(gL)  # (CPY, #CPY=1)
             if kv_split_idx == 0 and is_reduction_lane:
@@ -368,15 +381,20 @@ class GroupedQueryAttentionDecode:
     def launch_reduction(
         d_per_blk: int,
         o_bshd: cute.Tensor,
-        l_bsh: Optional[cute.Tensor],  # LSE output (log2 base) or None
-        m_bsh: cute.Tensor,  # colmax_s, already computed
+        l_bsh: Optional[cute.Tensor],  # LSE output (natural log) or None
         o_partial_bshd: cute.Tensor,  # partial O per kv split
         l_partial_bsh: cute.Tensor,  # partial colsum_p per kv split
         m_partial_bsh: cute.Tensor,  # partial colmax_s per kv split
         scale_o: Float32,
         stream: cuda.CUstream,
         enable_pdl: bool = True,
+        split_counts: Optional[cute.Tensor] = None,  # int32 [b]: the graph split build's k
     ):
+        # `splits` is the partials' first extent: the split count of an eager split build, and
+        # in the graph split build (`split_counts`) the capacity S, the most chunks one request
+        # can get, while each request merges only its own k slots. Either way it sizes the
+        # shared memory and picks the staged or unstaged kernel, as the eager build picks by
+        # its split count.
         splits, b, s_q, h_q, d = o_partial_bshd.shape
 
         # Tile in head_dim first
@@ -387,7 +405,6 @@ class GroupedQueryAttentionDecode:
 
         o_dhsb = reverse(o_bshd)
         l_hsb = reverse(l_bsh) if l_bsh is not None else None
-        m_hsb = reverse(m_bsh)
         o_partial_dhsb = reverse(o_partial_bshd)
         l_partial_hsb = reverse(l_partial_bsh)
         m_partial_hsb = reverse(m_partial_bsh)
@@ -395,26 +412,52 @@ class GroupedQueryAttentionDecode:
         d_per_thr = 32 // o_bshd.dtype.width
         thr_per_blk = d_per_blk // d_per_thr
         d_blks = cute.ceil_div(d, d_per_blk)
-        smem_bytes = (splits * 2 + 1) * Float32.width // 8
-
-        GroupedQueryAttentionDecode.reduction_kernel(
-            (thr_per_blk, d_per_thr, d_per_blk),
-            o_dhsb,
-            l_hsb,
-            m_hsb,
-            o_partial_dhsb,
-            l_partial_hsb,
-            m_partial_hsb,
-            scale_o,
-        ).launch(
-            grid=[d_blks, h_q * s_q, b],
-            block=[thr_per_blk, 1, 1],
-            cluster=[1, 1, 1],
-            stream=stream,
-            smem=smem_bytes,
-            min_blocks_per_mp=1,
-            use_pdl=enable_pdl,
-        )
+        # Shared memory: every split's maximum and sum. Past `reduction_prefetch_splits` splits,
+        # also the partial outputs of the splits past the first that many, which that kernel
+        # stages there (`stage_tail`, `reduction_kernel`). At that many splits or fewer the launch
+        # takes the kernel compiled without the staging code: with it compiled in, the reduction
+        # at 2 to 16 splits, where it copies nothing, measured 1 to 7% slower on B200, while at
+        # 24 to 64 splits the staged form is 2 to 31% faster.
+        #
+        # The staged kernel's shared memory grows by d_per_blk fp32 values for every split past
+        # the first `reduction_prefetch_splits`, so it is taken only while the whole request fits
+        # one block's shared memory (`get_smem_capacity_in_bytes`, 232,448 bytes on SM100: up to
+        # 462 splits at d_per_blk = 128). Past that the launch takes the unstaged kernel, which
+        # reads every split's partial output from global memory and needs only the maxima and
+        # sums in shared memory.
+        f32_bytes = Float32.width // 8
+        smem_bytes = splits * 2 * f32_bytes
+        staged_max_splits = (
+            utils.get_smem_capacity_in_bytes("sm_100")
+            + reduction_prefetch_splits * d_per_blk * f32_bytes
+        ) // (2 * f32_bytes + d_per_blk * f32_bytes)
+        args = (o_dhsb, l_hsb, o_partial_dhsb, l_partial_hsb, m_partial_hsb, scale_o,
+                split_counts)
+        if splits > reduction_prefetch_splits and splits <= staged_max_splits:
+            GroupedQueryAttentionDecode.reduction_kernel(
+                (thr_per_blk, d_per_thr, d_per_blk, True), *args
+            ).launch(
+                grid=[d_blks, h_q * s_q, b],
+                block=[thr_per_blk, 1, 1],
+                cluster=[1, 1, 1],
+                stream=stream,
+                smem=smem_bytes
+                + (splits - reduction_prefetch_splits) * d_per_blk * f32_bytes,
+                min_blocks_per_mp=1,
+                use_pdl=enable_pdl,
+            )
+        else:
+            GroupedQueryAttentionDecode.reduction_kernel(
+                (thr_per_blk, d_per_thr, d_per_blk, False), *args
+            ).launch(
+                grid=[d_blks, h_q * s_q, b],
+                block=[thr_per_blk, 1, 1],
+                cluster=[1, 1, 1],
+                stream=stream,
+                smem=smem_bytes,
+                min_blocks_per_mp=1,
+                use_pdl=enable_pdl,
+            )
 
     @staticmethod
     @cute.kernel
@@ -422,13 +465,13 @@ class GroupedQueryAttentionDecode:
         tile_d: cute.Tile,
         o_dhsb: cute.Tensor,
         l_hsb: Optional[cute.Tensor],
-        m_hsb: cute.Tensor,
         o_partial_dhsb: cute.Tensor,
         l_partial_hsb: cute.Tensor,
         m_partial_hsb: cute.Tensor,
         scale_o: Float32,
+        split_counts: Optional[cute.Tensor],
     ):
-        thr_per_blk, d_per_thr, d_per_blk = tile_d
+        thr_per_blk, d_per_thr, d_per_blk, stage_tail = tile_d
         d, h_q, s_q, b, splits = o_partial_dhsb.shape
         d_blk_idx, coord_hs, coord_b = cute.arch.block_idx()
         coord_h, coord_s = cute.idx2crd(coord_hs, (h_q, s_q))
@@ -442,7 +485,6 @@ class GroupedQueryAttentionDecode:
         gO = cute.local_tile(o_dhsb, (d_per_blk,), coord_o[:-1])
         gO_partial = cute.local_tile(o_partial_dhsb, (d_per_blk,), coord_o)
 
-        gM = cute.local_tile(m_hsb, (1,), coord_o[1:-1])
         gM_partial = cute.local_tile(m_partial_hsb, (1,), coord_o[1:])
         gL_partial = cute.local_tile(l_partial_hsb, (1,), coord_o[1:])
         gM_partial_0 = gM_partial[None, tidx]
@@ -454,9 +496,6 @@ class GroupedQueryAttentionDecode:
         sL_partial = cute.make_tensor(smem_ptr + splits, partial_layout)
         sL_partial_0 = sL_partial[None, tidx]
         sM_partial_0 = sM_partial[None, tidx]
-
-        sM_layout = cute.make_layout(1)
-        sM = cute.make_tensor(smem_ptr + splits * 2, sM_layout)
 
         cpasync_atom = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), Float32, num_bits_per_copy=32
@@ -473,17 +512,103 @@ class GroupedQueryAttentionDecode:
         tCgO = tCgO[None, 0]  # (CPY)
         tCrO_final = cute.zeros_like(tCgO, Float32)
 
+        merge_args = (tile_d, splits, d, tidx, not_oob_d, smem_ptr, thr_copy,
+                      sM_partial, sL_partial, sM_partial_0, sL_partial_0,
+                      gM_partial, gL_partial, gM_partial_0, gL_partial_0, cpasync_atom,
+                      tCgO_partial, tCgO, tCrO_final, o_dhsb, l_hsb, d_blk_idx,
+                      coord_h, coord_s, coord_b, scale_o)
+        if cutlass.const_expr(split_counts is None):
+            GroupedQueryAttentionDecode.reduction_merge(*merge_args, splits)
+        else:
+            # THE GRAPH SPLIT BUILD: `splits` is the partials' capacity and the request
+            # merges its own k slots, `split_counts[b]`, which the host wrote before the
+            # graph replayed, so it is read before the dependent-launch wait. Slots k and
+            # above hold whatever an earlier step left there and are never read.
+            k_b = split_counts[coord_b]
+            if k_b == 1:
+                # One piece is the whole request: normalize slot 0 and store it, with none
+                # of the merge's staging or shared memory, as the merge of one split would.
+                # Its maximum, sum and output are loaded together, the output only where
+                # the d block is whole, as the merge prefetches.
+                cute.arch.fence_acq_rel_cta()  # Don't reorder partitioning after PDL wait
+                cute.arch.griddepcontrol_wait()
+                max_final = gM_partial[0, 0]
+                sum_0 = gL_partial[0, 0]
+                rO_0 = None
+                if cutlass.const_expr(d % d_per_blk == 0):
+                    rO_0 = tCgO_partial[None, 0].load()
+                sum_final = Float32(0)
+                if max_final > -Float32.inf and not_oob_d:
+                    sum_final = sum_0
+                    if cutlass.const_expr(rO_0 is not None):
+                        tCrO_final = rO_0
+                    else:
+                        tCrO_final = tCgO_partial[None, 0].load()
+                    tCrO_final *= cute.arch.rcp_approx(sum_final) * scale_o
+                if cutlass.const_expr(l_hsb is not None):
+                    # the merge's LSE, as `reduction_merge` forms and places it
+                    lse_final = (max_final
+                                 + cute.math.log2(sum_final, approx=True, ftz=True)) * ln_2
+                cute.arch.griddepcontrol_launch_dependents()
+                if not_oob_d:
+                    tCgO.store(tCrO_final.to(o_dhsb.dtype))
+                if cutlass.const_expr(l_hsb is not None):
+                    if d_blk_idx == 0 and tidx == 0:
+                        l_hsb[coord_h, coord_s, coord_b] = lse_final
+            else:
+                # The maximum's form follows the capacity (`stage_tail`), not k_b: choosing the
+                # one chain at k_b <= 16 inside the staged build measured 0.34% slower over 332
+                # B200 cells with k_b <= 16 < S, so it is not worth a second form.
+                GroupedQueryAttentionDecode.reduction_merge(*merge_args, k_b)
+        return
+
+    @staticmethod
+    @cute.jit
+    def reduction_merge(
+        tile_d,
+        splits,
+        d,
+        tidx,
+        not_oob_d,
+        smem_ptr,
+        thr_copy,
+        sM_partial,
+        sL_partial,
+        sM_partial_0,
+        sL_partial_0,
+        gM_partial,
+        gL_partial,
+        gM_partial_0,
+        gL_partial_0,
+        cpasync_atom,
+        tCgO_partial,
+        tCgO,
+        tCrO_final,
+        o_dhsb,
+        l_hsb,
+        d_blk_idx,
+        coord_h,
+        coord_s,
+        coord_b,
+        scale_o,
+        nsplit,
+    ):
+        """`reduction_kernel`'s merge of `nsplit` splits' partial outputs, after the set-up.
+
+        `splits` is the partials' first extent, which places the shared-memory arrays, and
+        `nsplit` the number merged: equal in an eager split build, and in the graph split
+        build `nsplit` is the request's k, at most `splits`. Every loop, clamp and copy below
+        is bounded by `nsplit`, so no slot at or past it is read."""
+        thr_per_blk, d_per_thr, d_per_blk, stage_tail = tile_d
+
         cute.arch.fence_acq_rel_cta()  # Don't reorder partitioning after PDL wait
         cute.arch.griddepcontrol_wait()
 
-        if tidx == 0:
-            cute.copy(cpasync_atom, gM, sM)
-
-        if tidx < splits:
+        if tidx < nsplit:
             cute.copy(cpasync_atom, gL_partial_0, sL_partial_0)
             cute.copy(cpasync_atom, gM_partial_0, sM_partial_0)
 
-        for split_idx in cutlass.range(thr_per_blk + tidx, splits, thr_per_blk):
+        for split_idx in cutlass.range(thr_per_blk + tidx, nsplit, thr_per_blk):
             gL_partial_n = gL_partial[None, split_idx]
             sL_partial_n = sL_partial[None, split_idx]
             cute.copy(cpasync_atom, gL_partial_n, sL_partial_n)
@@ -493,38 +618,142 @@ class GroupedQueryAttentionDecode:
             cute.copy(cpasync_atom, gM_partial_n, sM_partial_n)
 
         cute.arch.cp_async_commit_group()
-        # The first `o_pf` partial outputs are loaded here, before the barrier on
-        # the partial maxima and sums, so the two loads overlap instead of running
-        # one after the other. Each load reads an existing split (the index is
-        # clamped), so it is in bounds whether or not that split produced a row.
-        # The loop below still adds a split's contribution only when that split
-        # produced one, in the same order, so the result is unchanged. When d is
-        # not a whole multiple of the block, no prefetch is done (`o_pf` is zero).
-        o_pf = 16 if cutlass.const_expr(d % d_per_blk == 0) else 0
+        # The first `o_pf` splits' partial outputs are loaded here, before the wait for the
+        # partial maxima and sums, so the two loads overlap instead of following each
+        # other. Each load reads an existing split (the index is clamped), so it is in
+        # range whether or not that split produced a row; the loops below accumulate a
+        # split's output only where they did before, in the same order, so the result is
+        # unchanged. Without whole d blocks (`not_oob_d` dynamic) nothing is prefetched.
+        o_pf = reduction_prefetch_splits if cutlass.const_expr(d % d_per_blk == 0) else 0
         rO_pf = [
-            tCgO_partial[None, cutlass.min(Int32(j), splits - 1)].load()
+            tCgO_partial[None, cutlass.min(Int32(j), nsplit - 1)].load()
             for j in range(o_pf)
         ]
+        # Where the launch asks for it (`stage_tail`, more than `o_pf` splits), the partial
+        # outputs of every split past the first `o_pf` are copied to shared memory, each thread
+        # its own `d_per_thr` columns of each split, in a second asynchronous group that the one
+        # wait below completes together with the maxima and sums. The accumulation loop then
+        # reads them from shared memory instead of waiting on one global load after another:
+        # without the staging, each group of eight splits costs two dependent global round
+        # trips. Each thread reads back only what it copied, after its own wait.
+        tCsO_tail = None
+        if cutlass.const_expr(o_pf > 0 and stage_tail):
+            sO_tail = cute.make_tensor(
+                (smem_ptr + 2 * splits).align(4 * d_per_thr),
+                cute.make_layout((d_per_blk, splits), stride=(1, d_per_blk)),
+            )
+            tCsO_tail = thr_copy.partition_D(sO_tail)[None, 0, None]  # (CPY, splits)
+            cpasync_o_atom = cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(),
+                Float32,
+                num_bits_per_copy=d_per_thr * Float32.width,
+            )
+            for split_idx in cutlass.range(o_pf, nsplit):
+                # One copy of the thread's contiguous columns, through a flat view: the
+                # partition's value mode is (1, d_per_thr), which a copy atom this wide
+                # would split into d_per_thr overlapping copies
+                cute.copy(
+                    cpasync_o_atom,
+                    cute.make_tensor(
+                        tCgO_partial[None, split_idx].iterator.align(4 * d_per_thr),
+                        cute.make_layout(d_per_thr),
+                    ),
+                    cute.make_tensor(
+                        tCsO_tail[None, split_idx - o_pf].iterator.align(4 * d_per_thr),
+                        cute.make_layout(d_per_thr),
+                    ),
+                )
+            cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        max_final = sM[0]
+        # The final colmax is the maximum of the per-split colmaxes every split CTA
+        # stores (`reduction_epilogue`), loaded above, in the order a float atomic max on
+        # the bits would impose (`cute.arch.atomic_fmax`, an integer max on the bits), so
+        # that a NaN colmax, which the GPU produces as the positive canonical NaN, wins
+        # over every number. A row whose colmax is NaN, or -inf in every split, is written
+        # as zeros below.
+        max_final = -Float32.inf
+        if cutlass.const_expr(stage_tail):
+            # More than `o_pf` splits: four running maxima, split 4 i + r in chain r, then
+            # combined, with a dependent chain a quarter as long. Every step is the same
+            # NaN-first test, so the result is the maximum the one chain below would give,
+            # except for the sign of a zero maximum: when the split maxima include both -0
+            # and +0, the chain that sees each first decides the sign, so the four chains can
+            # return +0 where the one chain returns -0 (an integer-bit atomic maximum can differ
+            # the same way). The outputs are the same either way: exp2(m - max),
+            # the max > -inf test and max + log2(sum) read +0 and -0 alike. At `o_pf` splits
+            # or fewer the one chain measured faster on B200.
+            m_c0 = -Float32.inf
+            m_c1 = -Float32.inf
+            m_c2 = -Float32.inf
+            m_c3 = -Float32.inf
+            for q4 in cutlass.range(nsplit // 4, unroll=4):
+                a_c0 = sM_partial[0, 4 * q4]
+                a_c1 = sM_partial[0, 4 * q4 + 1]
+                a_c2 = sM_partial[0, 4 * q4 + 2]
+                a_c3 = sM_partial[0, 4 * q4 + 3]
+                if (a_c0 > m_c0) | (a_c0 != a_c0):
+                    m_c0 = a_c0
+                if (a_c1 > m_c1) | (a_c1 != a_c1):
+                    m_c1 = a_c1
+                if (a_c2 > m_c2) | (a_c2 != a_c2):
+                    m_c2 = a_c2
+                if (a_c3 > m_c3) | (a_c3 != a_c3):
+                    m_c3 = a_c3
+            r_c = (nsplit // 4) * 4
+            if r_c < nsplit:
+                b_c0 = sM_partial[0, r_c]
+                if (b_c0 > m_c0) | (b_c0 != b_c0):
+                    m_c0 = b_c0
+            if r_c + 1 < nsplit:
+                b_c1 = sM_partial[0, r_c + 1]
+                if (b_c1 > m_c1) | (b_c1 != b_c1):
+                    m_c1 = b_c1
+            if r_c + 2 < nsplit:
+                b_c2 = sM_partial[0, r_c + 2]
+                if (b_c2 > m_c2) | (b_c2 != b_c2):
+                    m_c2 = b_c2
+            if (m_c1 > m_c0) | (m_c1 != m_c1):
+                m_c0 = m_c1
+            if (m_c3 > m_c2) | (m_c3 != m_c3):
+                m_c2 = m_c3
+            max_final = m_c0
+            if (m_c2 > max_final) | (m_c2 != m_c2):
+                max_final = m_c2
+        else:
+            for split_idx in cutlass.range(nsplit, unroll=8):
+                max_partial = sM_partial[0, split_idx]
+                if (max_partial > max_final) | (max_partial != max_partial):
+                    max_final = max_partial
         sum_final = Float32(0)
         if max_final > -Float32.inf and not_oob_d:
             for j in cutlass.range_constexpr(o_pf):
-                if j < splits:
+                if j < nsplit:
                     max_partial = sM_partial[0, j]
                     if max_partial > -Float32.inf:
                         correction = exp2(max_partial - max_final)
                         sum_final += correction * sL_partial[0, j]
                         tCrO_final += correction * rO_pf[j]
-            for split_idx in cutlass.range(o_pf, splits, unroll=8):
+            for split_idx in cutlass.range(o_pf, nsplit, unroll=8):
                 max_partial = sM_partial[0, split_idx]
                 if max_partial > -Float32.inf:
                     correction = exp2(max_partial - max_final)
                     sum_final += correction * sL_partial[0, split_idx]
-                    tCrO_final += correction * tCgO_partial[None, split_idx].load()
+                    if cutlass.const_expr(tCsO_tail is not None):
+                        tCrO_final += correction * tCsO_tail[None, split_idx - o_pf].load()
+                    else:
+                        tCrO_final += correction * tCgO_partial[None, split_idx].load()
             tCrO_final *= cute.arch.rcp_approx(sum_final) * scale_o
+
+        if cutlass.const_expr(l_hsb is not None):
+            # The natural-log LSE: max_final and sum_final are the base-2 maximum and sum
+            # (`reduction_none` gives the convention). It is computed before the O store, so
+            # its latency overlaps that store's instead of following it, and one thread of the
+            # head's row stores it after. A real row's sum_final >= 1 (the maximum's own term),
+            # so the one-instruction lg2.approx.ftz is exact enough (an error of about 2^-22); an
+            # empty row reads -inf either way.
+            lse_final = (max_final + cute.math.log2(sum_final, approx=True, ftz=True)) * ln_2
 
         cute.arch.griddepcontrol_launch_dependents()
 
@@ -533,7 +762,4 @@ class GroupedQueryAttentionDecode:
 
         if cutlass.const_expr(l_hsb is not None):
             if d_blk_idx == 0 and tidx == 0:
-                l_hsb[coord_h, coord_s, coord_b] = max_final + cute.math.log2(sum_final)
-
-        return
-
+                l_hsb[coord_h, coord_s, coord_b] = lse_final

@@ -1,7 +1,5 @@
-# Copyright 2026 Donglin Zhuang
-# SPDX-License-Identifier: Apache-2.0
 # src/fosca/quant_layout.py
-"""The scale-block layout and quantization envelope, shared by both decode kernels.
+"""The scale-block layout and quantization envelope, shared by BOTH decode kernels.
 
 Torch-free, so the kernel modules can import it.  Per (page, kv-head) the scale
 block is SECTIONED, sdtype, contiguous:
@@ -16,33 +14,40 @@ channel sections (read per token-GROUP; ride the same per-page block):
                      duplicated per page when Gt > N (pages of one group carry
                      identical copies)
 
-When both tensors are ("token", D) the block uses the interleaved
-[N, 4] = (s_k, z_k, s_v, z_v) layout instead, which keeps the
-[NP, HKV, N, 4] f32 mScale contract of the fast path.
+The legacy interleaved [N, 4] = (s_k, z_k, s_v, z_v) layout is preserved
+EXACTLY when both tensors are ("token", D) — the shipped fast path keeps its
+[NP, HKV, N, 4] f32 mScale contract and compiles byte-identical.
 
-This file holds the single implementation of each rule, and a caller must not
-transcribe one elsewhere.  `quant_block_offsets` gives the layout,
-`validate_quant_flex` gives the envelope, and `sm90_wide_layouts` with
-`sm90_wide_refusal` gives the SM90 rule for a head dimension other than 128.
-Two copies need not disagree visibly to be wrong: spelled as separate constructor
-asserts, an envelope can admit a configuration in one check and refuse it in
-another below, and a reader who stops at the first check learns the wrong rule.
-`sm90_wide_refusal` returns its reason as a string so the constructor can raise
-`ValueError` under `python -O`; `sm90_wide_layouts` lists the layouts that head
-dimension accepts, for callers that generate configurations instead of validating
-them.
+THIS FILE IS THE ONE COPY, AND IT MUST STAY THAT WAY.  One implementation of
+`quant_block_offsets` is better than two that agree, because two copies are free
+to drift apart.
+
+`validate_quant_flex` is the same rule for the envelope, and duplicating it is
+worse than duplicating a layout, because the copies need not even disagree
+visibly: two inline constructor asserts can admit in one place what they refuse
+in another.  This function refuses a configuration once, where a reader looking
+for the envelope will find it.
+
+`sm90_wide_refusal` and `sm90_wide_layouts` are the SM90 decode's rule for a head
+dimension other than 128, an SM90 rule like SM100's own head-dimension rule.  They live
+here for the same reason: the constructor refuses with the first, and the admitted
+layouts are enumerated by the second, so a reader can see both from one place.
 """
 
 
 def _norm_pair(q, which):
     """Normalize one (axis, group) config to a plain `(str, int)` tuple.
 
-    Every entry point in this module normalizes through this function first, so a
-    list `["token", 128]` and a tuple `("token", 128)` name the same
-    configuration. That is the whole of the input contract: it reads `q[0]` and
-    `q[1]`, applies `int()` to the group, and adds no validation of its own, so
-    callers that pre-convert (`wrapper.py`, `fold_runtime.quant_cfg_of`) and
-    callers that do not agree on what a configuration means.
+    The point of normalizing HERE, once, is consistency: a config compared as
+    `k_quant == ("token", D)` would let a LIST `["token", 128]` fall through to the
+    sectioned path and take a DIFFERENT scale-pool layout for the same configuration.
+    Normalizing first is the whole of the input contract: `int()` on the group, exactly
+    as `validate_quant_flex` does, so callers that already pre-convert and callers that
+    do not agree on what a config means.
+
+    It reads `q[0]` and `q[1]` and converts, and adds no validation of its own: no
+    caller can produce an input that a shape or axis check would trip, so such a check
+    would only narrow the set of configs this accepts.
     """
     return (q[0], int(q[1]))
 
@@ -93,9 +98,9 @@ def sm90_wide_layouts(head_dim):
     The grouped body implements one layout: token-wise K and V over all `head_dim` channels, the
     fold, and an f32 scale pool, at each depth of `SM90_WIDE_STAGES`. `sdtype` is the normalized
     name `kernel_contract.normalize_sdtype` returns. The layout leaves the bit width,
-    `fused_combine`, `phase_lock` and `int2_fast_mantissa_injection` free, and the gate scripts
-    generate their rows at this head dimension from this list, crossed with the first three. The
-    GQA ratio is free too, and the gates sample it at 2, 4 and 8, as at head dimension 128."""
+    `fused_combine`, `phase_lock` and `int2_fast_mantissa_injection` free, and the coverage
+    matrix at this head dimension is generated from this list, crossed with the first three. The
+    GQA ratio is free too, and it is sampled at 2, 4 and 8, as at head dimension 128."""
     full = ("token", head_dim)
     return [dict(k_quant=full, v_quant=full, sdtype="f32", fold_scale_zero=True,
                  num_stages=stages) for stages in SM90_WIDE_STAGES]
@@ -129,8 +134,8 @@ def sm90_wide_refusal(head_dim, k_quant, v_quant, *, sdtype, fold_scale_zero, nu
 
 
 def validate_quant_flex(k_quant, v_quant, page_size, head_dim):
-    """Normalize and validate the per-tensor (axis, group) configs against the
-    SM100 fold kernel's envelope, at SM90 parity:
+    """Normalize + validate the per-tensor (axis, group) configs against the
+    SM100 fold kernel's envelope (SM90 IntPingPongDecodeSm90 parity):
       K: ("token", D), ("token", D//2), ("channel", Gt in {64, 128, 256})
       V: ("token", D), ("channel", Gt in {64, 128, 256})
     Returns (k_quant, v_quant) as plain tuples."""

@@ -1,19 +1,16 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
 """A persistent on-disk cache of compiled CuTe DSL kernels.
 
-``compile_or_load`` is the entry point: it returns a kernel from disk when an
-identical trace has already been exported, and compiles and exports it otherwise.
-``init_cuda_driver`` initializes the driver API before a trace. ``status``,
-``record_of``, ``provenance``, ``records`` and ``inventory`` report what happened
-to each compile request.
-
-WHY IT EXISTS. ``cute.compile`` forces ``compile_only=True`` and
-``no_cache=True`` (``base_dsl/compiler.py``, ``CompileCallable._compile``), so
-neither the DSL's in-memory JIT cache nor its file cache ever holds a
-``cute.compile`` result, and the only memoisation in this repository is per
-process. Tracing a kernel costs seconds, most of it Python-side IR generation,
-which no lowered-module cache can skip, so a benchmark that forks one process per
-measured configuration traces its kernels again in every process.
+WHY THIS EXISTS. ``cute.compile`` in nvidia-cutlass-dsl 4.5.2 and 4.8.0 forces
+``compile_only=True`` and ``no_cache=True`` (``base_dsl/compiler.py``,
+``CompileCallable._compile``), so neither the DSL's in-memory JIT cache nor its
+file cache ever holds a ``cute.compile`` result. The only memoisation in this
+repository is per process, and every benchmark that forks one process per cell
+or per column traces its kernels again. Measured with DSL 4.5.2:
+one trace of ``IntDecodeSm100`` costs 10 to 13 s on B200 and one trace of
+``IntPingPongDecodeSm90`` 7 to 8 s on H100, and 75 to 87 percent of that is the
+Python-side IR generation, which no lowered-module cache can skip. A configuration
+A/B measurement pays two of those traces; a roofline measurement pays four.
 
 WHAT IS CACHED. The object file ``export_to_c`` writes for a kernel compiled with
 ``--enable-tvm-ffi``. Reloading it with ``cute.runtime.load_module(...,
@@ -21,10 +18,10 @@ enable_tvm_ffi=True)`` takes a few milliseconds and hands back a
 ``tvm_ffi.Function`` with the same positional calling convention as the freshly
 compiled object. That is not an approximation: with ``--enable-tvm-ffi`` the DSL
 already builds the in-process function by exporting the module to an object and
-JIT-linking it, so the reloaded kernel runs the same machine code, with
-bitwise-identical outputs on every buffer and kernel time within noise on both
-architectures. flashinfer uses the same pair of calls and is the model for this
-module.
+JIT-linking it, so the reloaded kernel runs the same machine code. The probe that
+established it checks bitwise-identical outputs on every buffer, with kernel time
+within noise on both architectures. flashinfer's ``cute_dsl_core`` module uses the
+same pair of calls and is the model for this module.
 
 THE KEY. A cache hit must be the object the trace would have produced, so the key
 carries everything that shapes the trace: the DSL's own compile target
@@ -43,12 +40,12 @@ WHEN IT STANDS ASIDE. Whenever the DSL is asked to dump PTX, cubin or IR
 tiling report (``FOLD_TRACE_TILING``): those gates' evidence is the trace itself,
 and the variable's presence is what counts, not its value. Whenever
 ``cutedsl_profiling`` has been imported, because an instrumented kernel bakes
-session state into the object. Whenever ``FOSCA_KERNEL_CACHE=0``, which a
-caller sets when its claim is that a configuration traces or that processes
-compile independently. And whenever the cache root cannot be created or locked,
-because a benchmark must not fail on a full or read-only disk. In every one of
-those cases ``compile_or_load`` simply calls the compile function and records why
-it did not cache.
+session state into the object. Whenever ``CUTEDSL_DECODE_KERNEL_CACHE=0``, which a
+caller sets when its claim is that a configuration traces or that processes compile
+independently. And whenever the cache root cannot be created or locked, because a
+benchmark must not fail on a full or read-only disk. In every one of those cases
+``compile_or_load`` simply calls the compile function and records why it did not
+cache.
 
 WHAT A CALLER GETS BACK. On a hit, the reloaded function. On a miss, the freshly
 compiled object is exported and then reloaded from disk, so hit and miss hand back
@@ -59,9 +56,13 @@ is returned and the failure is recorded. ``record_of``, ``provenance``, ``record
 and ``inventory`` expose, per kernel, whether it was traced, loaded or left
 uncached, with the object's sha256, so a benchmark artifact can say which.
 
-WHAT THIS DOES NOT COVER. Callers that invoke ``cute.compile`` directly are not
-cached; they compile concrete tensor shapes per configuration and would need to
-compile through ``compile_constructed`` to benefit.
+WHAT THIS DOES NOT COVER. Callers that invoke ``cute.compile`` directly, such as the
+static-shape anchor and numerics scripts, are not
+cached; they compile concrete tensor shapes per cell and would need to compile through
+``compile_constructed`` to benefit. A benchmark sweep takes every kernel it
+times from this cache, an SM90 arm's through ``compile_constructed`` included. The SM90
+SASS census sets ``CUTE_DSL_KEEP``, which stands the cache aside, so that every kernel it
+compiles is traced and its PTX is written.
 """
 from __future__ import annotations
 
@@ -80,14 +81,14 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 #: ``0`` (or ``false`` / ``off`` / ``no``) turns the on-disk layer off for the process.
-ENABLE_ENV = "FOSCA_KERNEL_CACHE"
+ENABLE_ENV = "CUTEDSL_DECODE_KERNEL_CACHE"
 #: Overrides the cache root. The default is ``$XDG_CACHE_HOME/fosca/kernel-cache``
 #: or ``~/.cache/fosca/kernel-cache``. Put it on local disk on a box whose home
 #: is NFS.
-DIR_ENV = "FOSCA_KERNEL_CACHE_DIR"
+DIR_ENV = "CUTEDSL_DECODE_KERNEL_CACHE_DIR"
 #: Environment variables whose PRESENCE means the caller needs a real trace: the DSL
-#: dump and dry-run knobs, which a check on the emitted PTX depends on, and the SM100
-#: tiling report, which is printed from inside the trace.
+#: dump and dry-run knobs (the fingerprint gates fail closed on "no PTX written"), and
+#: the SM100 tiling report, which is printed from inside the trace.
 BYPASS_ENV = (
     "CUTE_DSL_KEEP",
     "CUTE_DSL_KEEP_PTX",
@@ -99,10 +100,10 @@ BYPASS_ENV = (
 )
 #: Environment variables that change the emitted object without changing the Python
 #: inputs of the trace. Their values are part of the key. The list is every variable that
-#: the DSL's env manager marks `affects_compile=True`, except `CUTE_DSL_ARCH`, keyed
-#: through `dsl_identity()`, and `CUTE_DSL_DRYRUN`, which is in BYPASS_ENV.
-#: `CUTE_DSL_DEBUG` turns LINEINFO on by default; the others select lowering passes,
-#: staging, diagnostics or emitted locations.
+#: nvidia-cutlass-dsl 4.8.0's env manager marks `affects_compile=True`, except
+#: `CUTE_DSL_ARCH`, keyed through `dsl_identity()`, and `CUTE_DSL_DRYRUN`, which
+#: is in BYPASS_ENV. `CUTE_DSL_DEBUG` turns LINEINFO on by default; the others select
+#: lowering passes, staging, diagnostics or emitted locations.
 KEYED_ENV = (
     "CUTE_DSL_LINEINFO",
     "CUTE_DSL_ENABLE_ASSERTIONS",
@@ -120,17 +121,17 @@ KEYED_ENV = (
 def init_cuda_driver() -> None:
     """Initialize the CUDA driver API before a kernel trace.
 
-    `compile_fold`, `compile_constructed` and `compile_splitk_combine` call it first in
-    their `_trace`. It lives here rather than in `_utils` because `_utils` imports the
-    wrapper, and every module a trace imports joins the kernel's source closure.
-    `IntAppend.__call__` and the standalone `splitk_combine.main` trace on their own and
-    do not call it, so a caller that traces either before touching CUDA initializes CUDA
-    itself.
+    `compile_fold`, `compile_constructed`, `compile_splitk_combine` and the cache
+    writers' compile (`_append_core`) call it first in their `_trace`. It lives here rather
+    than in `_utils` because `_utils` imports the wrapper, and every module a trace imports
+    joins the kernel's source closure. The standalone `splitk_combine.main` traces on its
+    own and does not call it, so a caller that runs it before touching CUDA initializes
+    CUDA itself.
 
-    The DSL reads a device attribute through the driver API
+    nvidia-cutlass-dsl 4.8.0 reads a device attribute through the driver API
     (`cuDeviceGet`) while it traces a kernel launch, and raises CUDA_ERROR_NOT_INITIALIZED
     in a process that has not touched CUDA yet, such as a warm-up compile issued before
-    any tensor exists. `cuInit` is idempotent.
+    any tensor exists; 4.5.2 did not. `cuInit` is idempotent.
     """
     import cuda.bindings.driver as cuda_driver
 
@@ -194,7 +195,7 @@ def status() -> dict:
     """Whether this process may use the disk cache, and why not if not.
 
     Read at every call rather than once at import, so a gate that sets
-    ``FOSCA_KERNEL_CACHE=0`` after importing the package is still honoured.
+    ``CUTEDSL_DECODE_KERNEL_CACHE=0`` after importing the package is still honoured.
     A bypass variable counts as set when it is present, whatever its value: an empty
     ``CUTE_DSL_KEEP`` still tells the DSL to keep something.
     """
@@ -623,7 +624,7 @@ def records() -> list[dict]:
 def inventory() -> dict:
     """What a benchmark artifact records: the switch state and every kernel's origin.
 
-    This is the worker's compilation and loading activity. It does not say which row
+    This is the process's compilation and loading activity. It does not say which row
     used which kernel; a cell's variants share kernels through the in-process memo, and
     the rows carry only whether the cache was on.
     """

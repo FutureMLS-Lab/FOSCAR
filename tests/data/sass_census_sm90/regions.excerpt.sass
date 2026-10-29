@@ -1,0 +1,102 @@
+	.headerflags	@"EF_CUDA_TEXMODE_UNIFIED EF_CUDA_64BIT_ADDRESS EF_CUDA_ACCELERATORS EF_CUDA_SM90 EF_CUDA_VIRTUAL_SM(EF_CUDA_SM90)"
+	.elftype	@"ET_EXEC"
+
+
+//--------------------- .text.regions_kernel      --------------------------
+	.section	.text.regions_kernel,"ax",@progbits
+	.align	128
+        .global         regions_kernel
+        .type           regions_kernel,@function
+        .size           regions_kernel,(.L_x_12 - regions_kernel)
+        .other          regions_kernel,@"STO_CUDA_ENTRY STV_DEFAULT"
+regions_kernel:
+.text.regions_kernel:
+        /*0000*/                   LDC R1, c[0x0][0x28] ;
+        /*0010*/                   IADD3 R1, R1, -0xf0, RZ ;
+        /*0020*/                   S2R R7, SR_TID.X ;
+        /*0030*/                   LDC.64 R2, c[0x0][0x210] ;
+        /*0040*/                   ULDC.64 UR6, c[0x0][0x208] ;
+        /*0050*/                   LDC.64 R4, c[0x0][0x218] ;
+        /*0060*/                   IMAD.WIDE R8, R7.reuse, 0x4, R2 ;
+        /*0070*/                   IADD3 R0, R7, 0x7f, RZ ;
+        /*0080*/                   IMAD.WIDE R2, R7, 0x4, R4 ;
+        /*0090*/                   ISETP.GE.U32.AND P0, PT, R0, 0xff, PT ;
+        /*00a0*/                   STL.64 [R1+0x70], R2 ;
+        /*00b0*/              @!P0 BRA `(.L_x_0) ;
+        /*00c0*/                   LOP3.LUT R0, R7, 0xffffff80, RZ, 0xc0, !PT ;
+        /*00d0*/                   ISETP.NE.AND P0, PT, R0, 0x80, PT ;
+        /*00e0*/              @!P0 BRA `(.L_x_1) ;
+.L_x_2:
+        /*00f0*/                   WARPSYNC.ALL ;
+        /*0100*/                   NOP ;
+        /*0110*/                   USETMAXREG.TRY_ALLOC.CTAPOOL UP0, 0x68 ;
+        /*0120*/                   PLOP3.LUT P0, PT, PT, PT, UP0, 0x80, 0x0 ;
+        /*0130*/              @!P0 BRA `(.L_x_2) ;
+        /*0140*/                   S2R R4, SR_TID.X ;
+        /*0150*/                   LDC.64 R6, c[0x0][0x210] ;
+        /*0160*/                   IMAD.WIDE R4, R4, 0x4, R6 ;
+        /*0a00*/                   LDL.LU.64 R2, [R1+0x80] ;
+        /*0a10*/                   LDL.LU R0, [R1+0x78] ;
+        /*0a20*/              @!P0 BRA `(.L_x_3) ;
+        /*0a30*/                   STL [R1+0x78], R0 ;
+        /*0a40*/                   LDL.LU R0, [R1+0x8] ;
+        /*0a50*/                   STL [R1+0x38], R0 ;
+        /*11a0*/                   STL [R1+0x38], R2 ;
+        /*11b0*/                   LDL R2, [R1+0x4] ;
+        /*11c0*/                   STL [R1+0x38], R13 ;
+        /*11d0*/                   LDL R13, [R1] ;
+.L_x_1:
+        /*2400*/                   WARPSYNC.ALL ;
+        /*2410*/                   NOP ;
+        /*2420*/                   USETMAXREG.TRY_ALLOC.CTAPOOL UP0, 0x68 ;
+        /*2430*/                   PLOP3.LUT P0, PT, PT, PT, UP0, 0x80, 0x0 ;
+        /*2440*/              @!P0 BRA `(.L_x_1) ;
+        /*2450*/                   S2R R4, SR_TID.X ;
+        /*2460*/                   LDC.64 R6, c[0x0][0x210] ;
+        /*2470*/                   IMAD.WIDE R4, R4, 0x4, R6 ;
+        /*2530*/                   STL [R1+0x78], R0 ;
+        /*2540*/                   STL.64 [R1+0x80], R2 ;
+        /*2f50*/                   STL [R1+0xdc], R83 ;
+        /*2f60*/                   LDL R83, [R1+0x20] ;
+        /*2f70*/                   STL [R1+0xd8], R84 ;
+        /*2f80*/                   LDL.LU R84, [R1+0x1c] ;
+        /*2f90*/                   STL [R1+0xd4], R85 ;
+.L_x_0:
+        /*4b40*/                   WARPSYNC.ALL ;
+        /*4b50*/                   NOP ;
+        /*4b60*/                   USETMAXREG.DEALLOC.CTAPOOL 0x20 ;
+        /*4b70*/                   S2R R4, SR_TID.X ;
+        /*4b80*/                   LDC.64 R6, c[0x0][0x210] ;
+        /*4b90*/                   IMAD.WIDE R4, R4, 0x4, R6 ;
+        /*4c10*/                   STL [R1+0x78], R0 ;
+        /*4c20*/                   STL.64 [R1+0x80], R2 ;
+        /*4c30*/                   MOV R2, R4 ;
+        /*4c40*/                   MOV R3, R5 ;
+        /*4ff0*/              @!P0 BRA `(.L_x_8) ;
+        /*5000*/                   STL [R1+0x7c], R2 ;
+        /*5010*/                   STL [R1+0x78], R0 ;
+        /*5020*/                   LDC R2, c[0x0][0x220] ;
+        /*5030*/                   LDL R0, [R1+0x68] ;
+        /*5040*/                   IADD3 R0, -R0, R2, RZ ;
+        /*5050*/                   LDL.LU R2, [R1+0x7c] ;
+        /*73b0*/                   FFMA R29, R0, 40, R29 ;
+        /*73c0*/                   STG.E desc[UR6][R2.64], R29 ;
+        /*73d0*/                   EXIT ;
+.L_x_11:
+        /*73e0*/                   BRA `(.L_x_11);
+        /*73f0*/                   NOP;
+        /*7400*/                   NOP;
+        /*7410*/                   NOP;
+        /*7420*/                   NOP;
+        /*7430*/                   NOP;
+        /*7440*/                   NOP;
+        /*7450*/                   NOP;
+        /*7460*/                   NOP;
+        /*7470*/                   NOP;
+.L_x_12:
+
+
+//--------------------- SYMBOLS --------------------------
+
+	.type		.nv.reservedSmem.offset0,@object
+	.size		.nv.reservedSmem.offset0,0x4

@@ -1,277 +1,274 @@
-# SGLang Integration Guide
+# Integrating fosca into a decode loop
 
-This page shows how to wire `fosca` into an SGLang-style attention backend.
-It covers the plan/run lifecycle, the page-table inputs `plan()` consumes, the arguments that belong outside the decode loop, CUDA graph capture, and the feature set the wrapper accepts.
-Read it if you are adding this package to an engine's decode path; install steps, the support matrix, and pool construction are in the [README](../README.md).
-The wrapper keeps the plan/run split of FlashInfer's paged-decode wrapper.
-
-Every decode path in the package is quantized.
-K and V live in the cache as packed 2-bit or 4-bit integer values plus a separate scale-and-offset block, and `plan()` requires `bits=2` or `bits=4`.
-There is no dense bf16, fp16, or fp8 KV mode.
+This page covers the plan/run lifecycle, the page-table inputs, writing the
+cache, what to keep out of the per-step path, and CUDA graph capture.
+Installation, the support matrix and the cache layout are in the
+[README](../README.md).
 
 ## Lifecycle
 
-`PagedDecodeWrapper` has two phases.
+`plan(indptr, indices, seq_lens, num_qo_heads=, layout=)` fixes one batch: the
+page table, the lengths, the split count and the compiled kernel.
+`run(q, cache, out=)` decodes one layer's cache for that batch.
 
-1. `plan()` compiles the kernel for one static configuration and records the page table.
-   Call it whenever the page table or the sequence lengths change.
-2. `run()` launches one decode step.
-   It is graph-capturable.
+One plan serves every layer of the batch, because the layers share the page
+table and differ only in the cache `run()` reads. Plan when the page table or
+the lengths change, or once for a static batch, and build one wrapper per device
+or worker.
 
-Allocate one wrapper per layer or per worker.
-`plan()` is transactional: it discards the previous plan before it starts, so a wrapper whose `plan()` raised must be planned again before `run()`.
-
-## Constructor
+`plan()` is transactional: it discards the previous plan before it starts, so a
+wrapper whose `plan()` raised must be planned again before `run()`.
 
 ```python
 import torch
-from fosca import PagedDecodeWrapper
+from fosca import PagedDecodeWrapper, QuantKVLayout
 
-workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+device = "cuda"
+batch, kv_heads, q_heads, head_dim, bits = 8, 8, 32, 128, 2
+pages_per_request = 16                     # 16 pages of 64 tokens
+
+layout = QuantKVLayout.create(bits=bits, head_dim=head_dim,
+                              num_kv_heads=kv_heads, device=device)
+cache = layout.allocate(batch * pages_per_request)
+
+workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
 wrapper = PagedDecodeWrapper(workspace)
 ```
 
-On SM100 the workspace holds the split-K partial results for `reduction="kernel"`.
-It is a flat `uint8` CUDA tensor, and the wrapper raises `RuntimeError` with the required byte count when it is too small.
-On SM90 the wrapper allocates its own partial buffers and the workspace stays unused.
+The workspace holds the split-K partial results on Blackwell, and the wrapper
+decodes on the workspace's device. Hopper allocates its own partial buffers and
+leaves the workspace unused. `plan()` raises `RuntimeError` with the byte count
+it needs when the workspace is too small.
 
-Graph capture needs no constructor flag; see [CUDA graph capture](#cuda-graph-capture).
+The tensor form `run(q, k_cache, v_cache, scale_pool=, pscale_lp=,
+k_pool_order=)` and the per-argument form of `plan(bits=, head_dim=,
+num_kv_heads=, page_size=, k_quant=, v_quant=, kernel_kwargs=)` are retired and
+raise `TypeError`; the layout carries those settings.
 
-## Page-table construction
+## Page-table inputs
 
-`plan()` takes the page table as three int32 tensors:
+Three int32 tensors describe the batch:
 
-- `indptr` is `[batch_size + 1]` and holds the prefix sum of each sequence's page count.
-- `indices` is `[num_pages_total]` and holds the physical page ids of every sequence, concatenated.
-- `seq_lens` is `[batch_size]` and holds each sequence's KV length in tokens.
+- `indptr` is `[batch_size + 1]`, the prefix sum of each request's page count.
+- `indices` is `[num_pages_total]`, the physical page ids of every request,
+  concatenated in logical order.
+- `seq_lens` is `[batch_size]`, each request's KV length in tokens. `plan()`
+  copies it to the device as int32, so int32 or int64 input works.
 
-A block table of shape `[batch_size, pages_per_seq]` converts as follows.
+The page size is 64 tokens and is fixed: one code block and one scale block per
+(page, KV head).
+
+A block table of shape `[batch_size, pages_per_row]` converts as follows.
 
 ```python
 def plan_inputs(block_table, seq_lens, page_size=64):
-    """block_table: int32 [batch_size, pages_per_seq] physical page ids."""
+    """block_table: int32 [batch_size, pages_per_row] physical page ids."""
     device = block_table.device
     counts = ((seq_lens + page_size - 1) // page_size).to(torch.int32)
     indptr = torch.zeros(seq_lens.numel() + 1, dtype=torch.int32, device=device)
     indptr[1:] = torch.cumsum(counts, dim=0)
-    indices = torch.cat(
-        [block_table[b, :n] for b, n in enumerate(counts.tolist())]
-    ).to(torch.int32)
-    return indptr, indices, seq_lens.to(torch.int32)
+    indices = torch.cat([block_table[b, :n] for b, n in enumerate(counts.tolist())])
+    return indptr, indices.to(torch.int32), seq_lens.to(torch.int32)
 ```
 
-A scheduler that tracks a last-page length instead of a token count obtains `seq_lens` from `(indptr.diff() - 1) * page_size + last_page_len`.
-
-The page size is 64.
-Each (page, kv-head) carries one code block and one scale block, so no other page size exists.
-
-## plan()
+A scheduler that tracks a last-page length instead of a token count gets
+`seq_lens` from `(indptr.diff() - 1) * 64 + last_page_len`.
 
 ```python
+# One page per request, one token written at position 0 of each.
+block_table = (torch.arange(batch, device=device, dtype=torch.int32)
+               * pages_per_request).view(batch, 1)
+seq_lens = torch.ones(batch, device=device, dtype=torch.int32)
+
 indptr, indices, seq_lens = plan_inputs(block_table, seq_lens)
 
 wrapper.plan(
     indptr,                  # int32 [batch_size + 1]
     indices,                 # int32 [num_pages_total]
     seq_lens,                # int32 [batch_size]
-    num_qo_heads=32,
-    num_kv_heads=8,
-    head_dim=128,
-    page_size=64,
-    q_data_type=torch.float8_e4m3fn,   # torch.bfloat16 on SM90
-    bits=2,
+    num_qo_heads=q_heads,
+    layout=layout,
+    max_kv_len=1,            # the batch's longest context
 )
 ```
 
-`num_qo_heads` must be a multiple of `num_kv_heads`, and the GQA ratio must be at most 8.
-`head_dim` is 128 on both architectures.
-SM90 also accepts 256, where the kernel builds the default token-wise K and V layout with an f32 scale pool and refuses every other layout and scale-pool precision.
+`num_qo_heads` must be a positive multiple of `layout.num_kv_heads`; on Hopper a
+ratio above eight must be a multiple of eight.
 
-`q_data_type` is `torch.bfloat16` on SM90 and `torch.float8_e4m3fn` on SM100.
-The SM100 kernel takes no Q scale, so fold the per-tensor Q descale into the softmax scale by passing `sm_scale=sm_scale / q_scale`.
-`sm_scale` defaults to `1 / sqrt(head_dim)`, and `o_data_type` defaults to `torch.bfloat16`.
+`max_kv_len` is the batch's longest context. Pass it: without it `plan()` reads
+`seq_lens.max()` and waits for the device. Hopper's plan also waits while it
+builds its block table.
 
-`kv_splits=None` lets the per-architecture cost model pick the split count; an explicit value overrides it.
-`reduction="auto"` follows the cost model, `"none"` requires `kv_splits == 1`, `"kernel"` is split-K with an LSE merge, and `"atomic"` raises `NotImplementedError`.
-On SM90 the reduction mode follows from the split count instead of being chosen: one split is `"none"` and more than one is `"kernel"`, and asking for the other pairing raises.
-
-`max_kv_len` is the batch's maximum KV length.
-Pass it explicitly; without it `plan()` reads `seq_lens.max()` and synchronizes the device.
+`sm_scale` defaults to `1 / sqrt(head_dim)` and `o_scale` to 1.0. Blackwell's
+query is fp8 and the kernel applies no query descale, so fold a per-tensor Q
+descale into `sm_scale` or pass it to `run(q_descale=)`. Leave `kv_splits=None`
+and `reduction="auto"` at their defaults; Hopper derives the reduction mode from
+the split count, where one split is `"none"` and more than one is `"kernel"`.
 `q_len_per_req` must be 1.
 
-For a static batch, with the same page table and sequence lengths across steps, one planned wrapper serves every step.
-
-### JIT warm-up
-
-The first `plan()` for a static configuration traces and compiles the kernel, and a trace costs seconds.
-Repeat calls with the same configuration reuse the in-process compile.
-The static configuration covers `bits`, the head counts, the quantization granularity, the scale-pool precision, the reduction and combine mode, the output dtype, and any `kernel_kwargs`.
-The on-disk kernel cache removes the trace cost for a configuration that any earlier process has compiled.
-Call `plan()` during model loading, with a small dummy batch, to keep it off the first real decode step:
+Then run, once per layer:
 
 ```python
-# During model initialization, not on the critical path.
-wrapper.plan(dummy_indptr, dummy_indices, dummy_seq_lens,
-             num_qo_heads=32, num_kv_heads=8, head_dim=128, page_size=64,
-             q_data_type=torch.float8_e4m3fn,   # torch.bfloat16 on SM90
-             bits=2)
+q_dtype = torch.float8_e4m3fn if layout.arch == "sm100" else torch.bfloat16
+q = torch.randn(batch, q_heads, head_dim, dtype=torch.bfloat16,
+                device=device).to(q_dtype)
+out = torch.empty(batch, q_heads, head_dim, dtype=torch.bfloat16, device=device)
+
+wrapper.run(q, cache, out=out)
 ```
 
-The cache lives under `$XDG_CACHE_HOME/fosca/kernel-cache`, or `~/.cache/fosca/kernel-cache` when `XDG_CACHE_HOME` is unset.
-`FOSCA_KERNEL_CACHE_DIR` moves it, and `FOSCA_KERNEL_CACHE=0` disables it.
+`q` is `[batch_size, num_qo_heads, head_dim]` or
+`[batch_size, 1, num_qo_heads, head_dim]`, C-contiguous, 16-byte aligned and in
+the planned dtype. A query sliced out of a fused projection is not contiguous,
+so pass `q.contiguous()`. The output matches the shape of `q`. `run()` also
+takes `lse=` and `q_descale=`, both fp32 `[batch_size, num_qo_heads]`: the
+natural-log log-sum-exp, and the query scale on Blackwell. Each compiles a
+variant on first use.
 
-`plan()` exposes what it decided as read-only properties: `kv_splits`, `reduction`, `bits`, and `scale_pool_dtype`.
+## Writing the cache
 
-## run()
+`QuantKVLayout.create()` resolves the stored bit width, head dimension, KV-head
+count, quantization granularity, scale dtype and pool byte orders against the
+device's decode kernel. Nothing else declares them, and `run()` refuses a cache
+of another layout, even one whose pools have the same shapes.
+
+`layout.allocate(num_pages)` allocates a cache. `layout.bind(buffer, num_pages)`
+wraps a `uint8` buffer the engine owns: C-contiguous, 16-byte aligned at its
+start, at least `num_pages * layout.bytes_per_page()` bytes. An engine's
+`[num_blocks, bytes_per_page]` tensor works. The pools inside it are
+region-major, so row `i` is not page `i`; go through the cache rather than
+copying blocks by index.
+
+`cache.append(k, v, slot_mapping)` quantizes bf16 tokens on the device, one
+launch for K and V. `k` and `v` are `[tokens, num_kv_heads, head_dim]` bf16 with
+the head dimension contiguous and every row 16-byte aligned. `slot_mapping` is
+int64 `[tokens]`: token `t` goes to page `slot // 64`, position `slot % 64`, and
+a negative slot is skipped.
 
 ```python
-out = wrapper.run(
-    q,                        # [batch_size, num_qo_heads, head_dim]
-    k_pool,                   # packed uint8 K code pool
-    v_pool,                   # packed uint8 V code pool
-    out=out_buffer,           # optional pre-allocated output
-    sm_scale=None,            # per-call override of the plan-time scale
-    o_scale=None,             # default 1.0
-    enable_pdl=True,
-    scale_pool=scale_pool,    # required
-    pscale_lp=None,           # SM100: precompute with wrapper.pscale_lp()
-    k_pool_order=None,        # SM100: "permuted" or "logical"
-)
+k = torch.randn(batch, kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+v = torch.randn_like(k)
+slot_mapping = (torch.arange(batch, device=device, dtype=torch.int64)
+                * (pages_per_request * 64))
+cache.append(k, v, slot_mapping)
 ```
 
-The output shape mirrors the input `q`: a 3-D `q` of shape `[batch_size, num_qo_heads, head_dim]` gives a 3-D output, and a 4-D `q` of shape `[batch_size, 1, num_qo_heads, head_dim]` gives a 4-D one.
-When `out=` is passed, `run()` writes into it and returns it.
+`cache.append_quantized(k_codes, k_scale, k_zero, v_codes, v_scale, v_zero,
+slot_mapping)` writes tokens the engine already quantized: uint8 integer values
+in `[tokens, num_kv_heads, head_dim]` with a float32 scale and zero point per
+token, or per half-head group when K is token-wise over `head_dim // 2`. A
+stored value is `s * q + z` per channel.
 
-`k_pool` and `v_pool` are the packed code pools: `uint8`, with one contiguous block per (page, kv-head).
-`scale_pool` is the per-(page, kv-head) affine block and is required.
-With the default `("token", head_dim)` granularity for both tensors it is the interleaved f32 pool `[num_pages, num_kv_heads, page_size, 4] = (s_k, z_k, s_v, z_v)`.
-With any other granularity it is the flat sectioned block `[num_pages, num_kv_heads, block_tot]` that `fosca.quant_layout.quant_block_offsets` describes.
-`run()` checks the pool's shape against the planned granularity and its dtype against the planned scale precision.
+`cache.dequantize(k_out, v_out, page_indptr, page_indices, seq_lens, out_indptr)`
+reads rows back as bf16, one launch for both tensors, from the page table in the
+form `plan()` takes and an `out_indptr` naming each request's first output row.
 
-On SM90 both code pools are chunk-major.
-Each (page, kv-head) block is `[per/16, 128, 16]` bytes, where `per` is one warpgroup thread's row of quantized values: 32 bytes at 4 bits and 16 at 2 bits at head_dim 128, and twice that at head_dim 256.
-Chunk c of thread t holds bytes `[16c, 16c + 16)` of that thread's row.
-The kernel names this order, and `run()` refuses a row-major `[num_pages, num_kv_heads, 128, per]` pool by its shape.
-Nothing in the bytes says which order a pool is in, so a row-major pool reshaped to the chunk-major shape passes that check and decodes to wrong values at 4 bits.
-At 2 bits at head_dim 128 a row is a single chunk, and the two orders are the same bytes.
-SM90 pool construction is not packaged; the [README](../README.md) names the builder the kernel reads from.
+Three rules the engine keeps:
 
-## Arguments to keep out of the decode loop
+- Every use of a page begins with a write at position 0. `append()` then clears
+  that page's other per-token scale records, so no stale scale is read past the
+  request's length.
+- No decode of a layer runs concurrently with an append to that layer, on any
+  stream. Stream order on one stream gives this; across streams the engine
+  orders them.
+- Bytes copied into the cache outside `append()` (swap-in, offload, transfer
+  between engines) move the Blackwell page maxima behind the count table the
+  decode reads. After such a copy, call `cache.recount_v_max()` before the next
+  decode of that layer.
 
-**`out=`** avoids one allocation per call.
-Pass a buffer of the planned output shape and dtype, and `run()` writes into it.
+Call `bind()` once per buffer, before any append, and never inside a capture.
+Duplicate valid slots in one append leave the whole page unspecified on Hopper
+and the duplicated slot unspecified on Blackwell, so route padding writes to a
+page no request uses. `append()`, `append_quantized()` and `dequantize()` handle
+token-wise layouts only and raise `NotImplementedError` for a channel-wise K or
+V.
 
-**`pscale_lp=`** is the SM100 launch-global P-scale exponent, `floor(log2(448 / max s_v))`.
-When omitted, `run()` derives it from `scale_pool` with a `.max().item()` device synchronization on every call.
-`wrapper.pscale_lp(scale_pool)` computes it once; recompute it only when the pool's maximum V scale changes.
+## What belongs outside the decode loop
 
-**`k_pool_order=`** is mandatory on SM100 wherever the plan reads a permuted K pool, which is 4 bits at every configuration and 2 bits with the default E2M1 feed.
-Declare `"permuted"` for a pool built with `pool.k_store_perm_sm100_f4(bits)`, and `"logical"` for a pool in plain `pack_rows` order, which the plan accepts only where it reads logical order.
-Nothing in the pool's bytes reveals the order, so an undeclared or contradictory declaration raises instead of being guessed.
-The store order an external writer has to meet is in [`K_STORE_PERM.md`](K_STORE_PERM.md).
-SM90 ignores this argument; its code-pool order is the chunk-major one described above, checked by shape.
+- **`out=`** avoids one allocation per call; `run()` writes into it and returns
+  it.
+- **`plan()`** runs once per page-table or length change, not once per layer.
+- **Kernel compilation.** The first `plan()` per configuration compiles the
+  decode and takes seconds; the on-disk kernel cache removes that for a
+  configuration an earlier process compiled. The first `run()` with `lse=` or
+  `q_descale=` compiles a variant. Warm both at model load, before serving and
+  before any capture.
+- **`sm_scale` and `o_scale`.** Set them at `plan()` and pass them per call only
+  when a request overrides the planned value.
+- **The cache writes.** `append()` is its own launch, ordered before the decode
+  on the same stream.
 
-**`sm_scale=` and `o_scale=`** are per-call constants.
-Set them at `plan()` and pass them only when a request overrides the planned value.
-`o_scale` is folded into the reduction epilogue, so it costs no extra kernel pass.
-
-**`enable_pdl=`** enables programmatic dependent launch on SM100 and defaults to `True`.
-SM90 ignores it.
-
-## Routing with get_capabilities()
-
-`get_capabilities()` describes the running device without planning anything.
-Every key is present on an unsupported device, with empty or `False` values, so a caller can read any key without a `KeyError`.
-
-```python
-from fosca import get_capabilities
-
-caps = get_capabilities()
-q_len_per_req = 1                       # this request's query length
-routable = caps["paged"] and q_len_per_req == 1
-```
-
-`routable` is false on an unsupported device and for any query length other than one; send those requests to another backend.
-`is_supported()` is the same check as `caps["paged"]`.
-
-The keys that matter for routing are `arch` (`"sm90"`, `"sm100"`, or `"unsupported"`), `paged`, `dtypes` (the Q dtype), `head_dims` (a comma-joined string), `page_sizes` (`[64]`), `reductions` (`["none", "kernel"]`), `quantized_bits` (`[2, 4]`), and `kv_layouts` (`["NHD"]`).
-`speculative`, `atomic_reduction`, and `skip_softmax` are `False` on both architectures.
-`plan()` raises `NotImplementedError` for `q_len_per_req > 1` or `reduction="atomic"`, and `run()` raises `NotImplementedError` for `lse=` or `skip_softmax_threshold_scale_factor=`.
-
-## Quantization granularity
-
-`k_quant` and `v_quant` select an `(axis, group)` pair for K and V independently.
-The default for both is `("token", head_dim)`, which is the shipped fast path.
-K also accepts `("token", head_dim // 2)` and `("channel", G)`, and V accepts `("token", head_dim)` and `("channel", G)`.
-`G` is one of 64, 128, or 256 and must be a multiple of the page size.
-The scale pool layout follows the pair and is given by `fosca.quant_layout.quant_block_offsets`.
-Pass the granularity through `k_quant` and `v_quant`; naming it in `kernel_kwargs` raises.
-
-At head_dim 256, which only SM90 accepts, the kernel builds the default pair with an f32 scale pool and nothing else.
-`plan()` raises `ValueError` for every other pair or pool precision.
-
-K token-64 needs a bfloat16 scale pool.
-On SM90, build the pool with `fosca._sm90.serving_cache.make_serving_cache_flex(..., D=head_dim, sdtype=torch.bfloat16)` and pass `kernel_kwargs={"sdtype": torch.bfloat16}` to `plan()`; a mismatch raises an error naming both arguments.
-On SM100, K token-64 selects the bfloat16 pool by default, and `wrapper.scale_pool_dtype` reports the dtype the plan compiled for.
-
-`kernel_kwargs=` is an advanced escape hatch.
-On SM100 it forwards constructor knobs to the kernel, and any value set there overrides the per-bits tuning the plan promotes.
-On SM90 it accepts only `fused_combine`, which selects the in-kernel split-K merge over the external combine, and `sdtype`.
+`run()` allocates nothing when `out=` is passed and reads no device value. On
+Blackwell with token-wise V, the P-scale exponent comes from the cache's own
+page-maximum count table, so `run()` needs no host-derived value and no per-call
+synchronization.
 
 ## CUDA graph capture
 
-`run()` is graph-capturable, and a replay returns exactly what the eager call
-returned: `tests/test_graph_gpu.py` captures and replays on both architectures
-and asserts the two outputs are equal. Both launch paths bind the kernel to
-torch's current stream, so no stream setup is needed around the call.
+Graph mode is a separate implementation, selected at construction:
+`PagedDecodeWrapper(workspace, use_cuda_graph=True)`. One such wrapper serves one
+captured batch size, a bucket, for its whole life and plans the step's split
+count on the host, because a captured graph freezes every launch argument.
+
+`graph_workspace_bytes(max_batch, num_qo_heads, layout, max_kv_len=)` returns the
+bytes that the buckets of every batch size up to `max_batch` share. Buckets share
+it because no two of their graphs run at the same time; an engine that overlaps
+two batches gives each stream its own workspace.
 
 ```python
-static_out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-lp = wrapper.pscale_lp(scale_pool)          # SM100: compute before capture
+from fosca import graph_workspace_bytes
 
-wrapper.run(q, k_pool, v_pool, out=static_out, scale_pool=scale_pool,
-            pscale_lp=lp, k_pool_order="permuted")
+max_kv_len = 1024
+page_table = torch.zeros(batch, pages_per_request, dtype=torch.int32, device=device)
+page_table[:, 0] = (torch.arange(batch, device=device, dtype=torch.int32)
+                    * pages_per_request)
+engine_seq_lens = torch.ones(batch, dtype=torch.int32, device=device)
+
+workspace = torch.empty(
+    graph_workspace_bytes(batch, q_heads, layout, max_kv_len=max_kv_len,
+                          device=device),
+    dtype=torch.uint8, device=device)
+gw = PagedDecodeWrapper(workspace, use_cuda_graph=True)
+gw.plan(page_table=page_table, seq_lens=engine_seq_lens, num_qo_heads=q_heads,
+        layout=layout, max_kv_len=max_kv_len)
+```
+
+`page_table` is int32 `[batch_size, max_pages]`, row-major, on the wrapper's
+device, and `seq_lens` is int32 `[batch_size]`. Both are the engine's own
+buffers, kept in step with the lengths passed to `update()`. The plan records
+their addresses and reads no value from them. `max_kv_len` is the bucket's
+longest context, and every `update()` length stays within it.
+
+Capture once per layer:
+
+```python
+out = torch.empty(batch, q_heads, head_dim, dtype=torch.bfloat16, device=device)
+gw.run(q, cache, out=out)                 # warm-up, outside the graph
 torch.cuda.synchronize()
 
 graph = torch.cuda.CUDAGraph()
 with torch.cuda.graph(graph):
-    wrapper.run(q, k_pool, v_pool, out=static_out, scale_pool=scale_pool,
-                pscale_lp=lp, k_pool_order="permuted")
+    gw.run(q, cache, out=out)
+```
 
+Then once per step, on the host and outside the graph:
+
+```python
+lengths = [1] * batch
+engine_seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+gw.update(lengths)
 graph.replay()
 ```
 
-Under capture on SM100 you must pass `pscale_lp=` explicitly, because deriving it reads `scale_pool.max().item()`, a device-to-host synchronization that is illegal during capture.
-Pass a static `out=` so the graph writes into a buffer you own.
-The `k_pool_order` value shown matches a plan that reads a permuted K pool, and SM90 ignores both `pscale_lp` and `k_pool_order`.
+`update(lengths)` takes one integer per request of the bucket, as a list, a
+numpy array or a CPU tensor, each in `[1, max_kv_len]`, and copies the step's
+work list to the device. It runs on the stream the graph replays on, the same
+stream at every call, and never waits for the device as a whole. One update
+serves every layer of the step, so update once and replay every layer's graph.
 
-## Feature reference
+Graph mode requires `out=` on every `run()`, and the call must pass exactly the
+`lse` and `q_descale` variants the plan declared, because those are the builds it
+compiled. A second `plan()` on the same wrapper raises.
 
-| `plan()` parameter | Default | Notes |
-|---|---|---|
-| `bits=` | none | required: `2` or `4`, the stored bit width |
-| `page_size=` | none | must be `64` |
-| `head_dim=` | none | `128`; `256` on SM90 with token-wise K and V and an f32 scale pool |
-| `q_data_type=` | `torch.bfloat16` | SM90: bfloat16 only. SM100: `torch.float8_e4m3fn` only |
-| `o_data_type=` | `torch.bfloat16` | output dtype |
-| `sm_scale=` | `1 / sqrt(head_dim)` | softmax scale |
-| `kv_splits=` | `None` | `None`: the cost model picks; an integer overrides |
-| `reduction=` | `"auto"` | `"none"` requires `kv_splits == 1`; `"kernel"` is split-K with an LSE merge; `"atomic"` raises |
-| `q_len_per_req=` | `1` | must be `1` |
-| `max_kv_len=` | `None` | `None` reads `seq_lens.max()` and synchronizes the device |
-| `non_blocking=` | `True` | asynchronous copies of the plan-time integer buffers |
-| `k_quant=`, `v_quant=` | `("token", head_dim)` | per-tensor `(axis, group)` granularity |
-| `kernel_kwargs=` | `None` | advanced; see [Quantization granularity](#quantization-granularity) |
-
-| `run()` parameter | Default | Notes |
-|---|---|---|
-| `q` | none | required; `[batch_size, num_qo_heads, head_dim]` or `[batch_size, 1, num_qo_heads, head_dim]` |
-| `k_cache`, `v_cache` | none | required; packed `uint8` code pools |
-| `scale_pool=` | `None` | required: the affine scale-and-offset block |
-| `out=` | `None` | allocates per call when omitted |
-| `sm_scale=` | the planned value | per-call override |
-| `o_scale=` | `1.0` | folded into the reduction epilogue |
-| `enable_pdl=` | `True` | SM100 only; SM90 ignores it |
-| `pscale_lp=` | `None` | SM100: derived from `scale_pool` with a device synchronization unless passed |
-| `k_pool_order=` | `None` | SM100: required wherever the plan reads a permuted K pool |
-| `lse=`, `skip_softmax_threshold_scale_factor=` | `None` | not supported; passing either raises |
+Blackwell graphs take head_dim 128 and GQA ratios 3 to 8; Hopper takes ratios 1
+to 8. A ratio outside that range runs in eager mode only.

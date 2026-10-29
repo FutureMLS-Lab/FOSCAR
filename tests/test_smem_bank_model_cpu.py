@@ -2,12 +2,12 @@
 """The suite's shared-memory bank model, `tests/_smem_banks.py`, against measured lane patterns.
 
 Every CPU test that costs a shared-memory lane map uses that one model, so this file pins a
-handful of the lane patterns it is fitted to, with their measured wavefronts. The model's
-docstring describes the lane-pattern microbenchmark they come from, which runs each pattern as
-one warp-wide load and one warp-wide store under ncu on B200 and on H100 and gives the same
-counts on both GPUs. The fixtures cover every part of the rule, and their negative controls are
-the conflicted 16-byte patterns: the operand deposit lane map at start row 0 and the 32-byte
-lane stride, both at 8 wavefronts against an ideal of 4.
+handful of the lane patterns it was fitted to, with their measured wavefronts. They come from the
+2026-09-29 lane-pattern microbenchmark that the model's docstring describes, which ran each
+pattern as one warp-wide load and one warp-wide store under ncu on B200 and on H100 and measured
+the same counts on both GPUs. The fixtures cover every part of the rule, and their negative
+controls are the conflicted 16-byte patterns: the operand deposit lane map at start row 0 and
+the 32-byte lane stride, both at 8 wavefronts against an ideal of 4.
 
 Nothing here runs on a GPU, and nothing here reads kernel source.
 """
@@ -45,7 +45,7 @@ def _sw128(a):
 
 
 def _deposit(start_row):
-    """The operand deposit lane map: lane l writes the 16-byte unit at byte 32 (l % 2) of
+    """The operand deposit lane map (F1): lane l writes the 16-byte unit at byte 32 (l % 2) of
     128-byte row start_row + l // 2 from a 1024-byte-aligned base, through the 128-byte
     swizzle."""
     return lambda lane: _sw128(128 * (start_row + lane // 2) + 32 * (lane % 2))

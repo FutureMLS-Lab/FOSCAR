@@ -1,0 +1,48 @@
+	.headerflags	@"EF_CUDA_TEXMODE_UNIFIED EF_CUDA_64BIT_ADDRESS EF_CUDA_ACCELERATORS EF_CUDA_SM90 EF_CUDA_VIRTUAL_SM(EF_CUDA_SM90)"
+	.elftype	@"ET_EXEC"
+
+
+//--------------------- .text.call_kernel         --------------------------
+	.section	.text.call_kernel,"ax",@progbits
+	.align	128
+        .global         call_kernel
+        .type           call_kernel,@function
+        .size           call_kernel,(.L_x_1 - call_kernel)
+        .other          call_kernel,@"STO_CUDA_ENTRY STV_DEFAULT"
+call_kernel:
+.text.call_kernel:
+        /*0000*/                   LDC R1, c[0x0][0x28] ;
+        /*0010*/                   S2R R5, SR_TID.X ;
+        /*0020*/                   LDC.64 R2, c[0x0][0x210] ;
+        /*0030*/                   ULDC.64 UR4, c[0x0][0x208] ;
+        /*0040*/                   IMAD.WIDE.U32 R2, R5, 0x4, R2 ;
+        /*0050*/                   LDG.E R0, desc[UR4][R2.64] ;
+        /*0060*/                   MOV R4, 0x80 ;
+        /*0070*/                   CALL.REL.NOINC `($call_kernel$R12) ;
+        /*0080*/                   STG.E desc[UR4][R2.64], R7 ;
+        /*0090*/                   EXIT ;
+        .type           $call_kernel$R12,@function
+        .size           $call_kernel$R12,(.L_x_1 - $call_kernel$R12)
+$call_kernel$R12:
+        /*00a0*/                   HFMA2.MMA R5, -RZ, RZ, 0, 0 ;
+        /*00b0*/                   FFMA R7, R0, R0, 1 ;
+        /*00c0*/                   RET.REL.NODEC R4 `(call_kernel) ;
+.L_x_0:
+        /*00d0*/                   BRA `(.L_x_0);
+        /*00e0*/                   NOP;
+        /*00f0*/                   NOP;
+        /*0100*/                   NOP;
+        /*0110*/                   NOP;
+        /*0120*/                   NOP;
+        /*0130*/                   NOP;
+        /*0140*/                   NOP;
+        /*0150*/                   NOP;
+        /*0160*/                   NOP;
+        /*0170*/                   NOP;
+.L_x_1:
+
+
+//--------------------- SYMBOLS --------------------------
+
+	.type		.nv.reservedSmem.offset0,@object
+	.size		.nv.reservedSmem.offset0,0x4

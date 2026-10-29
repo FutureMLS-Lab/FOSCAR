@@ -20,29 +20,35 @@ upstream change has to be merged by hand.
 
 ```
 src/fosca/
-├── __init__.py                 public API: PagedDecodeWrapper, get_capabilities, is_supported, pool
-├── wrapper.py                  PagedDecodeWrapper: plan/run, arch dispatch, feature gating
+├── __init__.py                 public API: PagedDecodeWrapper, QuantKVCache, QuantKVLayout
+├── wrapper.py                  plan/run, arch dispatch, feature gating, graph mode
+├── kv_cache.py                 the cache layout and the cache object a decode reads
+├── graph_plan.py               graph-mode buckets and their host work list
+├── _append_core.py             the quantize-and-write kernel both architectures share
+├── _dequant_core.py            the paged read-back kernel both architectures share
 ├── _utils.py                   device detection and the capability descriptor
-├── quant_layout.py             per-(page, kv-head) scale-block layout and quantization envelope
+├── quant_layout.py             per-(page, kv-head) scale-block layout and the granularity envelope
 ├── kernel_contract.py          the constructor contract both decode kernels share
 ├── kernel_cache.py             persistent on-disk cache of compiled kernels
-├── pool.py                     SM100 pool construction and the reference attention
-├── pool_sm90.py                SM90 pool construction and the host repacker
-├── quant_ref.py                reference quantization both builders share
 ├── _vendor/                    QuACK and flash-attention subsets
 ├── _sm90/
 │   ├── int_decode_pingpong.py  the Hopper decode kernel
 │   ├── pingpong_runtime.py     compile and launch glue, workspace, NVVM options
+│   ├── quant_append.py         the Hopper cache writer
+│   ├── quant_dequant.py        the Hopper read-back
 │   ├── scheduler.py            split-K planner
-│   ├── serving_cache.py        the pool contract and its host builders
-│   ├── int_append.py           fused quantize-and-append write path
-│   ├── splitk_combine.py       external split-K combine kernel
+│   ├── serving_cache.py        the pool geometry the layout is built from
+│   └── splitk_combine.py       external split-K combine kernel
 └── _sm100/
     ├── int_fold_decode.py      the Blackwell decode kernel
     ├── int_fold_asm.py         single-instruction inline-asm primitives
     ├── fold_runtime.py         compile and launch glue, per-bits tuning, tiling
-    ├── scheduler.py            split-K planner
-    └── gqa_decode.py           split-K reduction library
+    ├── code_layout.py          pool byte layout for the fold kernel
+    ├── item_loop.py            the persistent item loop
+    ├── gqa_decode.py           the shared split-K reduction library
+    ├── quant_append.py         the Blackwell cache writer
+    ├── quant_dequant.py        the Blackwell read-back
+    └── scheduler.py            split-K planner
 ```
 
 `_sm90` and `_sm100` are private, and nothing architecture-specific is exported at the
@@ -127,11 +133,10 @@ if the call raises, so a replan that fails leaves the wrapper unplanned and `run
 `RuntimeError` rather than launching a half-built plan.
 
 `plan()` synchronizes when `max_kv_len` is omitted, because it reads `seq_lens.max()` for
-the planner's tile count. `pscale_lp()` synchronizes whenever it is called; compute it
-when the KV cache is written and pass the result to `run()`.
+the planner's tile count.
 
-`run()` requires a plan and checks the pools against it before launching: the Q dtype, the
-code-pool dtype, the scale pool's shape against the planned granularity, the scale pool's
+`run()` requires a plan and checks the cache against it before launching: the Q dtype, the
+cache's layout against the planned one, the scale pool's shape against the planned granularity, the scale pool's
 dtype against the planned precision, and, on SM100, the declared K pool order. Each of
 those mismatches would otherwise decode to finite but wrong values.
 

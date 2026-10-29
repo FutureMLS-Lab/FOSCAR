@@ -2,20 +2,21 @@
 """The Blackwell kernel's persistent item loop chooses every warp role from one fresh read.
 
 WHY. In a persistent build each CTA loops over work items, and at the top of each item every
-warp picks its role by comparing its warp index with the role's warp number. Two rules hold
-in a persistent build of either storage width:
+warp picks its role by comparing its warp index with the role's warp number
+(`docs/kernel/int_fold_decode.md`, "The warp role is re-read for every work item"). Two rules
+hold in a persistent build of either storage width:
 
-- One fresh read of the thread index per item. When the warp index comes from the kernel-entry
-  read and stays live through the loop, ptxas can keep it in a per-thread register, compile the
-  role choice as a divergent branch, and make the MMA and TMA warps rebuild their uniform
-  operands on every instruction they issue. So the kernel reads %tid.x once at the top of every
-  item (`_tid_x_fresh`), masks it with 1023 (the largest thread index a CTA can have) so that
-  the compiler knows it is not negative and the divisions are shifts, and derives the item's
-  warp index and warpgroup index from that one read.
+- One fresh read of the thread index per item. When the warp index came from the kernel-entry
+  read and stayed live through the loop, ptxas sometimes kept it in a per-thread register,
+  compiled the role choice as a divergent branch, and made the MMA and TMA warps rebuild their
+  uniform operands on every instruction they issued. So the kernel reads %tid.x once at the top
+  of every item (`_tid_x_fresh`), masks it with 1023 (the largest thread index a CTA can have)
+  so that the compiler knows it is not negative and the divisions are shifts, and derives the
+  item's warp index and warpgroup index from that one read.
 - One opaque copy per warp check of the role dispatch. Compared on one per-item value, the four
-  warp checks of the dispatch lose their source order (the PTX tests the MMA-KQ and TMA-VO warp
-  numbers first), and ptxas can place those two bodies after the dequant loops, which moves
-  every hot loop and makes INT2 1 to 2% slower. So each of those four checks compares its own
+  warp checks of the dispatch lost their source order (the PTX tested the MMA-KQ and TMA-VO
+  warp numbers first), and ptxas placed those two bodies after the dequant loops, which moved
+  every hot loop and made INT2 1 to 2% slower. So each of those four checks compares its own
   copy of the warp index, made by `_opaque_i32`, a side-effecting `mov` the compiler can
   neither merge with another copy nor see through.
 
@@ -37,7 +38,7 @@ THE RULE, read from the source (the modules import the DSL, so they are parsed, 
   example, therefore exposes its other arm.
 - The item's role indices and the copy function are assigned under exactly
   `if cutlass.const_expr(persistent)`; the other arm assigns the indices from the entry values
-  and the copy function as the identity, so a non-persistent build compiles unchanged. In a
+  and the copy function as the identity, so a non-persistent build compiles as before. In a
   persistent build the loop calls `_tid_x_fresh` exactly once, and each name in `PER_ITEM` is
   bound exactly once in the loop, by exactly its expression there. So a second fresh read, a
   later overwrite, an unmasked read and an expression that mixes in an entry value all fail.
@@ -51,7 +52,9 @@ THE RULE, read from the source (the modules import the DSL, so they are parsed, 
   under another test, and a new choice not in the table all fail. `_role_w` is called nowhere
   else in the loop, so every copy belongs to one check. Any other comparison with a role
   number in the loop fails too, except one, matched exactly: the trace-time warp-budget
-  assertion `init_warp_l <= self.threads_per_cta // warp_threads`.
+  assertion `init_warp_l <= self.threads_per_cta // warp_threads`. The first-item test
+  `_item == 0` of the `compact_close` exit chain compares the item counter, not a warp
+  position, and is not a role choice; it is matched exactly too.
 - The two helpers in `int_fold_asm.py` are exactly the single side-effecting `mov` each needs
   to be, returned unchanged: `_tid_x_fresh` reads %tid.x and `_opaque_i32` copies its operand.
   Each definition is the only binding of its name in that module, and the kernel module binds
@@ -60,8 +63,8 @@ THE RULE, read from the source (the modules import the DSL, so they are parsed, 
 WHAT IT DOES NOT COVER, because the kernel does not do it. Two warp positions still come from
 the kernel-entry read in a persistent build: the warp's place in its warpgroup
 (`warpgroup_widx`), which the softmax and correction roles receive, and the warp index the
-persistent epilogue compares after the loop. Re-reading those too makes some persistent INT4
-builds slower, so the kernel keeps the kernel-entry reads there. Thread positions (`tidx`,
+persistent epilogue compares after the loop. Re-reading those too was measured on 2026-10-01
+and not adopted, because it made some persistent INT4 builds slower. Thread positions (`tidx`,
 `lane_idx`, `warpgroup_tidx`) are per-thread values and keep their kernel-entry reads.
 
 The last test applies mutations to the sources in memory and requires the rule to reject each
@@ -89,6 +92,9 @@ NOT_PERSISTENT = _expr("cutlass.const_expr(not persistent)")
 COPY = "_role_w(warp_idx_l)"
 #: The four warp checks of the dispatch, and the rest of the `elif` chain they belong to.
 _EXIT = "exit_early"
+#: The persistent exit-early chain's two forms (`compact_close` in `kernel`).
+_COMPACT = "cutlass.const_expr(compact_close)"
+_NOT_COMPACT = f"not {_COMPACT}"
 _DISPATCH = [
     (COPY, "==", "tma_qk_warp_id"),
     (COPY, "==", "tma_vo_warp_id"),
@@ -122,9 +128,20 @@ ROLE_CHOICES = [
     ("warp_idx_l", "==", "init_warp_l", ()),                     # sM (column max)
     ("warp_idx_l", "==", "init_warp_l", ()),                     # sL (column sum)
     ("warp_idx_l", "==", "init_warp_l", ("cutlass.const_expr(fold_p)",)),  # sC (folded correction)
-    ("warp_idx_l", "==", "mma_vp_warp_id", (_EXIT,)),            # early exit: tmem
+    # early exit, `compact_close` builds: the correction's closure, then the two primes
+    ("warpgroup_idx_l", "==", "correction_warpgroup_id", (_EXIT, _COMPACT)),
+    ("warp_idx_l", "==", "mma_vp_warp_id",
+     (_EXIT, _COMPACT, "not warpgroup_idx_l == correction_warpgroup_id", "_item == 0")),
+    ("warp_idx_l", "==", "tma_vo_warp_id",
+     (_EXIT, _COMPACT, "not warpgroup_idx_l == correction_warpgroup_id", "_item == 0",
+      "not warp_idx_l == mma_vp_warp_id")),
+    # early exit, every other persistent build: one closure per role
+    ("warp_idx_l", "==", "mma_vp_warp_id", (_EXIT, _NOT_COMPACT)),  # tmem, closure
+    ("warp_idx_l", "==", "tma_vo_warp_id",
+     (_EXIT, _NOT_COMPACT, "not warp_idx_l == mma_vp_warp_id")),  # closure
     ("warpgroup_idx_l", "==", "correction_warpgroup_id",
-     (_EXIT, "not warp_idx_l == mma_vp_warp_id")),               # early exit: final handshake
+     (_EXIT, _NOT_COMPACT, "not warp_idx_l == mma_vp_warp_id",
+      "not warp_idx_l == tma_vo_warp_id")),                      # final handshake
     *_elif_chain(_EXIT, _DISPATCH),                              # the role dispatch
     ("warp_idx_l", "==", "reduction_warp_id", ()),
 ]
@@ -132,6 +149,10 @@ ROLE_NUMBERS = {number for _, _, number, _ in ROLE_CHOICES} - {"1"}
 #: The one comparison with a role number in the loop that is not a role choice: the trace-time
 #: check that the init warps fit in the CTA. Matched exactly, inside an `assert`.
 BUDGET_ASSERTION = _expr("init_warp_l <= self.threads_per_cta // warp_threads")
+#: The one `if` test in the loop that compares with an integer constant and is not a role choice:
+#: the first-item test of the `compact_close` exit chain, which compares the item counter. Matched
+#: exactly, so any other test against a constant is still a role choice.
+FIRST_ITEM = _expr("_item == 0")
 #: What a persistent build binds in the item loop, each name once, by exactly this expression:
 #: the one fresh read, the two role indices derived from it, and the copy function.
 PER_ITEM = {
@@ -289,7 +310,8 @@ def _role_choices(loop_body, view):
     tests it sits under), with
     every other comparison that involves a role number collected separately. A role choice is
     an `if` / `elif` test of one comparison whose right side is a role number or an integer
-    constant. The budget assertion is the one exemption."""
+    constant. The budget assertion and the first-item test `_item == 0` (`FIRST_ITEM`) are the
+    exemptions."""
     parents = {c: p for p in ast.walk(ast.Module(body=loop_body, type_ignores=[]))
                for c in ast.iter_child_nodes(p)}
     choices, other = [], []
@@ -302,6 +324,8 @@ def _role_choices(loop_body, view):
                   else repr(right.value) if isinstance(right, ast.Constant)
                   and isinstance(right.value, int) and not isinstance(right.value, bool)
                   else None)
+        if isinstance(parent, ast.If) and parent.test is node and ast.dump(node) == FIRST_ITEM:
+            continue
         if (isinstance(parent, ast.If) and parent.test is node and len(node.ops) == 1
                 and number is not None):
             choices.append((ast.unparse(node.left),
@@ -319,7 +343,7 @@ def check_rule(src):
     loop = fn.body[_item_loop(fn)]
     entry = entry_role_indices(fn)
     assert {"warp_idx", "warpgroup_idx"} <= entry, entry
-    # The guard the rule keys on means what the kernel is built as: `persistent` is bound once in
+    # The guard the rule keys on means what the kernel was built as: `persistent` is bound once in
     # `kernel`, to the constructor's flag, with no condition on the width.
     cls = _class(src)
     sets = [n for n in ast.walk(cls) if isinstance(n, ast.Assign)
@@ -620,6 +644,13 @@ _FRESH = "tid_fresh = _tid_x_fresh() & 1023"
 _WARP = "warp_idx_l = cute.arch.make_warp_uniform(tid_fresh // warp_threads)"
 _WARPGROUP = "warpgroup_idx_l = cute.arch.make_warp_uniform(tid_fresh // warpgroup_threads)"
 _REDUCTION = "            if warp_idx_l == reduction_warp_id:"
+#: The exit-early block's first lines: a persistent build's chain begins with the choice between
+#: its two forms (`compact_close`).
+_EXIT_HEAD = ("if exit_early:\n                if cutlass.const_expr(persistent):\n"
+              "                    if cutlass.const_expr(compact_close):")
+#: The MMA-VP choice of the per-role form of the persistent chain.
+_EXIT_MMA_VP = ("                    else:\n"
+                "                        if warp_idx_l == mma_vp_warp_id:")
 MUTATIONS = {
     "a dispatch reads the entry warp index": (_K, [(
         "elif _role_w(warp_idx_l) == tma_qk_warp_id:",
@@ -644,9 +675,19 @@ MUTATIONS = {
     "an init-warp choice derives the warp from the entry thread index": (_K, [(
         "# Initialize Q load mbarrier\n            if warp_idx_l == init_warp_l:",
         "# Initialize Q load mbarrier\n            if tidx // warp_threads == init_warp_l:")]),
+    "the compact exit chain's MMA-VP prime reads the entry warp index": (_K, [(
+        "                            if warp_idx_l == mma_vp_warp_id:\n"
+        "                                mma_order_vp_nbar.arrive()",
+        "                            if warp_idx == mma_vp_warp_id:\n"
+        "                                mma_order_vp_nbar.arrive()")]),
+    "the compact exit chain's correction choice reads the entry warpgroup index": (_K, [(
+        "                        if warpgroup_idx_l == correction_warpgroup_id:\n"
+        "                            sM_final_nbar.arrive()",
+        "                        if warpgroup_idx == correction_warpgroup_id:\n"
+        "                            sM_final_nbar.arrive()")]),
     "the early-exit MMA VP choice is replaced by `if True`": (_K, [(
-        "if exit_early:\n                if warp_idx_l == mma_vp_warp_id:",
-        "if exit_early:\n                if True:")]),
+        _EXIT_MMA_VP,
+        _EXIT_MMA_VP.replace("if warp_idx_l == mma_vp_warp_id:", "if True:"))]),
     "a stale value overwrites the fresh warp index": (_K, [(
         _WARP,
         _WARP + "\n"
@@ -663,9 +704,9 @@ MUTATIONS = {
         "            if cute.arch.make_warp_uniform(_tid_x_fresh() // warp_threads)"
         " == reduction_warp_id:")]),
     "two warp checks share one copy": (_K, [
-        ("            if exit_early:\n                if warp_idx_l == mma_vp_warp_id:",
+        ("            " + _EXIT_HEAD,
          "            role_w_shared = _role_w(warp_idx_l)\n"
-         "            if exit_early:\n                if warp_idx_l == mma_vp_warp_id:"),
+         "            " + _EXIT_HEAD),
         ("elif _role_w(warp_idx_l) == tma_qk_warp_id:", "elif role_w_shared == tma_qk_warp_id:"),
         ("elif _role_w(warp_idx_l) == tma_vo_warp_id:", "elif role_w_shared == tma_vo_warp_id:")]),
     "a warp check compares the index without its copy": (_K, [(
@@ -689,12 +730,12 @@ MUTATIONS = {
     "a persistent build is given no item": (_K, [(
         "items_this_cta = cute.ceil_div(num_items - bidz, grid_z_rt)", "items_this_cta = 0")]),
     "the dispatch's first test is replaced by `if True`": (_K, [(
-        "            if exit_early:\n                if warp_idx_l == mma_vp_warp_id:",
-        "            if True:\n                if warp_idx_l == mma_vp_warp_id:")]),
+        "            " + _EXIT_HEAD,
+        "            " + _EXIT_HEAD.replace("if exit_early:", "if True:"))]),
     "every item skips its dispatch": (_K, [(
-        "            if exit_early:\n                if warp_idx_l == mma_vp_warp_id:",
+        "            " + _EXIT_HEAD,
         "            continue\n"
-        "            if exit_early:\n                if warp_idx_l == mma_vp_warp_id:")]),
+        "            " + _EXIT_HEAD)]),
     "the reduction choice is put behind a dead branch": (_K, [(
         _REDUCTION,
         "            if False:\n                pass\n"

@@ -1,41 +1,67 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 Donglin Zhuang (standalone fosca adaptation).
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: BSD-3-Clause
 # Adapted from FlashInfer's CuTe DSL paged-decode wrapper (see NOTICE).
 
-"""PyTorch-facing API for paged GQA decode attention.
+"""PagedDecodeWrapper — PyTorch-facing API for paged GQA decode over a quantized KV cache.
 
-:class:`PagedDecodeWrapper` drives the SM90 (Hopper) and SM100 (Blackwell)
-quantized-KV decode kernels behind one interface, dispatching on the compute
-capability of the current device.
+Provides :class:`PagedDecodeWrapper` for SM90 (Hopper) and SM100 (Blackwell) GPUs. The
+architecture is the one of the device the wrapper's workspace lives on, and it selects the
+reader: ``IntPingPongDecodeSm90`` on Hopper, ``IntDecodeSm100`` on Blackwell.
 
-Every decode path is quantized. K and V live in the cache as packed 2-bit or
-4-bit integer values plus a separate scale-and-offset pool, and ``plan()``
-requires ``bits=2`` or ``bits=4``. In this mode ``run()``'s ``k_cache`` and
-``v_cache`` are the packed pools, and the affine block arrives as
-``scale_pool``.
+ONE PLAN PER STEP, ONE RUN PER LAYER
+------------------------------------
+``plan(indptr, indices, seq_lens, num_qo_heads, layout)`` fixes one step's batch: the page
+table, the lengths, the split count and the compiled kernel. ``layout`` is the
+:class:`~fosca.kv_cache.QuantKVLayout` the caches were built with, which carries the
+stored width, the head dimension, the KV-head count, the quantization granularity, the scale
+dtype and the pool orders. ``run(q, kv_cache)`` then decodes one layer's cache. It refuses a
+cache of any other layout, a query or output of another shape, and any tensor on another
+device, so a pool cannot meet a reader that reads it in another order.
 
-Kernels compile with symbolic dimensions, so one compiled module serves varying
-batch sizes, and compilation is memoized in process and cached on disk keyed by
-the static configuration.
+Kernels compile with symbolic dimensions (``cute.sym_int``) so the same compiled module is
+reused across batch sizes and lengths, and compilation is memoized on the static
+configuration, in process and on disk (:mod:`fosca.kernel_cache`).
+
+The split-K planners are deliberately NOT shared between the two architectures; see
+:meth:`PagedDecodeWrapper.plan` for why.
+
+CUDA-GRAPH MODE
+---------------
+``PagedDecodeWrapper(workspace, use_cuda_graph=True)`` is the serving path under CUDA graphs,
+beside eager mode, whose planners, kernels and host paths it leaves as they are: the constructor
+returns the graph-mode implementation (:class:`_GraphDecodeWrapper`), so an eager wrapper runs
+no graph-mode code at all. One graph-mode wrapper serves one captured batch size (a bucket) for
+its whole life: ``plan(page_table=, seq_lens=, ...)`` once, records the engine's fixed buffers
+and compiles the bucket's builds; ``update(lengths)`` once per step, outside the graph, plans the
+step on the host (:mod:`fosca.graph_plan`) and copies its work list to the device;
+``run()`` is captured once per layer and replayed. ``graph_workspace_bytes`` sizes the workspace
+that buckets share.
+
+The pre-launch guards in ``run()`` refuse a query, an output, a cache or an LSE tensor
+that does not match the plan, before anything is launched.
 """
 
 import functools
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
 import torch
 
+from . import _utils
 from ._utils import (
     api as flashinfer_api,
     get_num_sm,
-    is_sm90 as _is_sm90,
-    is_supported as _is_supported,
 )
+from . import graph_plan
+from .kv_cache import QuantKVCache, QuantKVLayout
 
 _QUANT_BITS = (2, 4)
 #: The quantized kernels are built around a 64-token page: both
 #: ``IntDecodeSm100`` and ``IntPingPongDecodeSm90`` assert it (one code block and
-#: one scale block per (page, kv-head)).
+#: one scale block per (page, kv-head)). `kv_cache.PAGE_SIZE` is the layout's statement of
+#: it; this literal is the one read from this file's syntax tree without importing the
+#: package, and `tests/test_public_api.py` holds the two equal.
 _QUANT_PAGE_SIZE = 64
 
 # The decode kernels are specialized to the head dimensions they tile, and this is NOT a
@@ -45,19 +71,35 @@ _QUANT_PAGE_SIZE = 64
 #   channels, the fold, an f32 scale pool and 2 or 4 stages (`quant_layout.sm90_wide_refusal`).
 #   At 256 it cuts both contractions into 128-channel groups and tiles its output
 #   accumulators and its fused split-K epilogue by D.
-#   SM100 is any positive multiple of 128, because it tiles D at 128 and masks no partial
-#   tile. D=256 is therefore not rejected by that kernel, but nothing here measures it.
+#   SM100 tiles D in complete groups of 128. The public D256 layout is narrower:
+#   whole-head token-wise K/V, f32 scales and default settings, in eager mode.
 # Both constructors RAISE rather than assert, so `python -O` cannot drop the guard.
 # The accepted set is therefore per architecture, keyed by the names `_utils.get_capabilities`
-# reports. A value is listed once a kernel implements AND a run covers it, or plan() admits a
+# reports. A value is listed once a kernel implements AND a run covers it, or a layout admits a
 # configuration that writes out of range (below 128) or that nothing has measured:
-#   "sm90" lists 256 because the SM90 kernel implements it, it was timed there, and the
-#   SM90 planner has a D=256 entry fitted on its own split ladder
-#   (`_sm90/scheduler.py`, PINGPONG_MODEL).
-#   "sm100" lists 128 only: its kernel builds 256, but no run measures it there.
-# It stays one literal so that tooling can read it from this file's syntax tree
-# with `ast.literal_eval` rather than importing the package.
-_ACCEPTED_HEAD_DIMS = {"sm90": (128, 256), "sm100": (128,)}
+#   "sm90" lists 256 because the SM90 kernel implements it, its ring depth and phase lock
+#   are measured at that head dim, and its planner has a kernel-side D=256 entry fitted on
+#   its own split ladder (``_sm90/scheduler.py``, PINGPONG_MODEL).
+#   "sm100" lists 128 and 256; D256 is covered by correctness and SASS gates.
+#   Graph, append and dequantize keep their D128 envelope.
+# `kv_cache.QuantKVLayout.create` refuses anything else, so a plan never sees it.
+# It stays one literal, because tooling reads it from this file's syntax tree with
+# `ast.literal_eval` rather than importing the package.
+_ACCEPTED_HEAD_DIMS = {"sm90": (128, 256), "sm100": (128, 256)}
+
+#: The output dtypes each architecture's kernel is compiled for. float32 is the engine's opt-in:
+#: a plan for it compiles its own build, and a bf16 plan compiles the default build. A dtype
+#: outside the list is refused at plan time rather than at the launch
+#: (`_sm90/pingpong_runtime.OUT_DTYPES` is that kernel's own list).
+_OUT_DTYPES = {"sm90": (torch.bfloat16, torch.float32),
+               "sm100": (torch.bfloat16, torch.float16, torch.float32)}
+#: The query dtype each architecture's kernel reads.
+_Q_DTYPES = {"sm90": torch.bfloat16, "sm100": torch.float8_e4m3fn}
+
+#: Arguments of the per-argument `plan()` and the tensor-form `run()` that the current call
+#: forms refuse. Each raises and names what replaced it.
+_RETIRED_PLAN_ARGS = ("num_kv_heads", "head_dim", "page_size", "bits", "k_quant", "v_quant")
+_RETIRED_RUN_ARGS = ("k_cache", "v_cache", "scale_pool", "pscale_lp", "k_pool_order")
 
 
 # ---------------------------------------------------------------------------
@@ -68,12 +110,13 @@ _ACCEPTED_HEAD_DIMS = {"sm90": (128, 256), "sm100": (128,)}
 def _torch_to_cutlass(dtype: torch.dtype):
     """Map a torch dtype to the CuTe DSL dtype of the same width.
 
-    The DSL is imported here rather than at module scope so that importing the
-    package does not require a CUDA toolkit to be installed.
+    Imported here rather than at module scope so that importing the package does
+    not require a CUDA toolkit.
     """
     import cutlass
 
     table = {
+        torch.float32: cutlass.Float32,
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
         torch.float8_e5m2: cutlass.Float8E5M2,
@@ -81,7 +124,8 @@ def _torch_to_cutlass(dtype: torch.dtype):
     }
     if dtype not in table:
         raise TypeError(
-            f"fosca does not support {dtype}; supported: {list(table)}"
+            f"cute-dsl decode does not support {dtype}; "
+            f"supported: {list(table)}"
         )
     return table[dtype]
 
@@ -100,7 +144,6 @@ def _slice_workspace(
         (kv_splits, batch_size, prediction, num_qo_heads, head_dim)
     )
     m_partial_shape = l_partial_shape = o_partial_shape[:-1]
-    m_shape = o_partial_shape[1:-1]
 
     workspace = workspace.view(dtype=torch.float32)
 
@@ -108,7 +151,6 @@ def _slice_workspace(
         o_partial_shape.numel()
         + m_partial_shape.numel()
         + l_partial_shape.numel()
-        + m_shape.numel()
     )
     if workspace.numel() < required_elts:
         raise RuntimeError(
@@ -128,10 +170,7 @@ def _slice_workspace(
     start, end = end, end + m_partial_shape.numel()
     m_partial = workspace[start:end].view(m_partial_shape)
 
-    start, end = end, end + m_shape.numel()
-    m = workspace[start:end].view(m_shape)
-
-    return m, o_partial, l_partial, m_partial
+    return o_partial, l_partial, m_partial
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +178,6 @@ def _slice_workspace(
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
 @functools.cache
 def _get_compiled_fold_kernel(
     page_size: int,
@@ -150,19 +188,23 @@ def _get_compiled_fold_kernel(
     bits: int,
     out_dtype: "cutlass.dtype",
     kernel_kwargs: Tuple[Tuple[str, Any], ...],
+    has_q_descale: bool = False,
+    has_lse: bool = False,
 ):
     """Compile + cache ``IntDecodeSm100`` (SM100 quantized-KV decode).
 
     Keyed on the STATIC configuration only: ``compile_fold`` traces batch,
     physical page count and kv_splits as ``cute.sym_int()``, so one compiled
     module serves every batch size and KV length. A trace costs 10 to 13 s on
-    B200, so this in-process memo is the
-    difference between a usable plan() and an unusable one, and
-    :mod:`fosca.kernel_cache` underneath it serves a repeat of the same
-    trace from disk across processes.
+    B200, so this in-process memo is the difference between a usable plan() and
+    an unusable one, and :mod:`fosca.kernel_cache` underneath it serves a repeat
+    of the same trace from disk across processes.
 
     ``kernel_kwargs`` arrives as a sorted tuple of pairs because
-    :func:`functools.cache` needs hashable arguments.
+    :func:`functools.cache` needs hashable arguments. ``has_q_descale`` selects the
+    variant that reads a per-row query descale (``run(q_descale=)``), and ``has_lse`` the one
+    that returns the log-sum-exp (``run(lse=)``); each is a different compiled kernel, so both
+    are part of the key.
 
     Returns ``(compiled, applied_knobs)``. ``applied_knobs`` is read back off
     the CONSTRUCTED kernel object and is cached with it, so
@@ -183,9 +225,23 @@ def _get_compiled_fold_kernel(
         out_dtype=out_dtype,
         tma_mask=False,
         knobs_out=knobs,
+        has_q_descale=has_q_descale,
+        has_lse=has_lse,
         **dict(kernel_kwargs),
     )
     return compiled, knobs
+
+
+@functools.cache
+def _persistent_sm_count() -> int:
+    """The most CTAs `IntDecodeSm100`'s persistent grid launches when the layout sets no
+    `persistent_sm_count` of its own: the constructor's default, read off its signature so
+    that the plan and the kernel cannot disagree."""
+    import inspect
+
+    from ._sm100.int_fold_decode import IntDecodeSm100
+
+    return int(inspect.signature(IntDecodeSm100).parameters["persistent_sm_count"].default)
 
 
 @functools.cache
@@ -200,6 +256,8 @@ def _get_compiled_pingpong_kernel(
     k_quant: Tuple[str, int],
     v_quant: Tuple[str, int],
     sdtype: torch.dtype = torch.float32,
+    out_dtype: torch.dtype = torch.bfloat16,
+    has_lse: bool = False,
 ):
     """Compile + cache ``IntPingPongDecodeSm90`` (SM90 quantized-KV decode).
 
@@ -209,7 +267,8 @@ def _get_compiled_pingpong_kernel(
     ``sdtype`` is part of the cache key, not a default to be dropped: it sets
     the scale pool's CuTe element type and its TMA transaction byte count, so
     two granularity configs that differ only in pool precision are two
-    different compiled kernels.
+    different compiled kernels. So are ``out_dtype``, the output's dtype, and ``has_lse``, the
+    fused-combine build that also stores the merged log-sum-exp (``run(lse=)``).
     """
     from ._sm90.pingpong_runtime import compile_pingpong
 
@@ -224,15 +283,245 @@ def _get_compiled_pingpong_kernel(
         v_quant=v_quant,
         page_size=page_size,
         sdtype=sdtype,
+        out_dtype=out_dtype,
+        has_lse=has_lse,
     )
 
 
 @functools.cache
-def _get_compiled_splitk_combine(head_dim: int):
-    """Compile + cache the SM90 external split-K combine. Validated on H100."""
+def _get_compiled_splitk_combine(head_dim: int, out_dtype: torch.dtype = torch.bfloat16,
+                                 has_lse: bool = False):
+    """Compile + cache the SM90 external split-K combine, for the output dtype and, with
+    ``has_lse``, the form that also stores the merged log-sum-exp. Validated on H100."""
     from ._sm90.pingpong_runtime import compile_splitk_combine
 
-    return compile_splitk_combine(head_dim=head_dim)
+    return compile_splitk_combine(head_dim=head_dim, out_dtype=out_dtype, has_lse=has_lse)
+
+
+# ---------------------------------------------------------------------------
+# CUDA-graph mode's builds, compiled apart from eager's (`_GraphDecodeWrapper`)
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _get_compiled_fold_graph_kernel(page_size, num_qo_heads, num_kv_heads, head_dim, bits,
+                                    out_dtype, kernel_kwargs, has_q_descale, has_lse):
+    """Compile + cache Blackwell's graph split build (`compile_fold(graph_split=True)`), the
+    split build (`reduction="kernel"`) that reads its pieces from a work list, keyed and read
+    back as `_get_compiled_fold_kernel` keys and reads back eager's builds."""
+    from ._sm100.fold_runtime import compile_fold
+
+    knobs: Dict[str, Any] = {}
+    compiled = compile_fold(
+        page_size=page_size, num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
+        head_dim=head_dim, reduction="kernel", bits=bits, out_dtype=out_dtype, tma_mask=False,
+        knobs_out=knobs, has_q_descale=has_q_descale, has_lse=has_lse, graph_split=True,
+        **dict(kernel_kwargs))
+    return compiled, knobs
+
+
+@functools.cache
+def _get_compiled_pingpong_graph_kernel(page_size, num_qo_heads, num_kv_heads, head_dim, bits,
+                                        min_blocks_per_sm, fused_combine, k_quant, v_quant,
+                                        sdtype, out_dtype, has_lse):
+    """Compile + cache Hopper's graph split build (`compile_pingpong(graph=True)`), keyed as
+    `_get_compiled_pingpong_kernel` keys eager's builds."""
+    from ._sm90.pingpong_runtime import compile_pingpong
+
+    return compile_pingpong(
+        head_dim=head_dim, num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads, bits=bits,
+        min_blocks_per_sm=min_blocks_per_sm, fused_combine=fused_combine, k_quant=k_quant,
+        v_quant=v_quant, page_size=page_size, sdtype=sdtype, out_dtype=out_dtype,
+        has_lse=has_lse, graph=True)
+
+
+@functools.cache
+def _get_compiled_splitk_combine_graph(head_dim, out_dtype, has_lse):
+    """Compile + cache Hopper's graph combine, which reads each request's split count from
+    memory, with the LSE or without."""
+    from ._sm90.pingpong_runtime import compile_splitk_combine
+
+    return compile_splitk_combine(head_dim=head_dim, out_dtype=out_dtype, has_lse=has_lse,
+                                  graph=True)
+
+
+# ---------------------------------------------------------------------------
+# CUDA-graph mode: buckets, their scratch, and the host lengths of a step
+# ---------------------------------------------------------------------------
+
+#: The pinned host buffers `update()` writes its work lists into, in turn. Before it rewrites one
+#: it waits for that buffer's previous copy to the device to complete, so a host running more
+#: than this many steps ahead of the device waits there; nothing waits on the device as a whole.
+_GRAPH_HOST_BUFFERS = 4
+#: The longest context a graph bucket takes: the kernels hold lengths and tile counts in int32,
+#: and a length is rounded up to a whole 64-token tile.
+_GRAPH_MAX_KV_LEN = 2**31 - 1 - 63
+
+
+def _graph_tile(arch, layout):
+    """The sequence tile of the graph builds of `layout`, in tokens: Hopper's 64-token page, and
+    Blackwell's `resolve_fold_tiling` (256, or 128 for K token-128 with V channel-64), which is
+    also what eager's planner is told (`_plan_quantized_sm100`)."""
+    if arch == "sm90":
+        return _QUANT_PAGE_SIZE
+    from ._sm100.fold_runtime import resolve_fold_tiling
+
+    return resolve_fold_tiling(layout.k_quant, layout.v_quant)[0]
+
+
+def _graph_bucket(arch, layout, batch, max_kv_len, sm_count):
+    """The `graph_plan.Bucket` of `batch` requests of `layout` with contexts up to `max_kv_len`
+    on a device of `sm_count` SMs."""
+    return graph_plan.Bucket(batch, layout.num_kv_heads,
+                             wave=graph_plan.SPLIT_CTAS_PER_SM[arch] * sm_count,
+                             tile=_graph_tile(arch, layout), max_kv_len=max_kv_len)
+
+
+def _graph_scratch_words(arch, bucket, num_qo_heads, head_dim):
+    """The f32 words of the shared workspace one launch of `bucket` uses: on Hopper the decode's
+    split outputs and split LSEs at the bucket's split capacity (one split when it cannot split,
+    because the unsplit build stores its LSE there too); on Blackwell the split build's partial
+    output, maxima and sums, and nothing for an unsplit bucket."""
+    rows = bucket.s_tight * bucket.batch * num_qo_heads
+    if arch == "sm90":
+        return rows * (head_dim + 1)
+    return rows * (head_dim + 2) if bucket.split_capable else 0
+
+
+def graph_workspace_bytes(max_batch: int, num_qo_heads: int, layout: QuantKVLayout, *,
+                          max_kv_len: int, device=None) -> int:
+    """The float workspace that graph-mode wrappers of every batch size up to `max_batch` can
+    share, for `num_qo_heads` query heads over caches of `layout` with contexts up to
+    `max_kv_len`, on `device` (default: the current CUDA device): the largest scratch any one
+    bucket's launch uses. Buckets may share it because a launch writes every scratch word it
+    reads, and because no two of their graphs run at the same time; an engine that overlaps two
+    batches gives each stream its own workspace."""
+    if isinstance(max_batch, bool) or not isinstance(max_batch, int) or max_batch < 1:
+        raise ValueError(f"max_batch must be a positive int; got {max_batch!r}")
+    device = torch.device("cuda", _utils.cuda_index(device))
+    arch = _utils.require_arch(device)
+    if layout.arch != arch:
+        raise ValueError(f"the layout was resolved for {layout.arch} and {device} is {arch}")
+    if arch == "sm100" and layout.head_dim != 128:
+        raise NotImplementedError("SM100 head_dim=256 is eager-only; CUDA graphs retain D=128")
+    sm_count = get_num_sm(device)
+    wave = graph_plan.SPLIT_CTAS_PER_SM[arch] * sm_count
+    words = 0
+    for batch in range(1, max_batch + 1):
+        if batch * layout.num_kv_heads >= wave and batch < max_batch:
+            continue            # unsplit, and its scratch grows with the batch: max_batch's is larger
+        bucket = _graph_bucket(arch, layout, batch, max_kv_len, sm_count)
+        words = max(words, _graph_scratch_words(arch, bucket, num_qo_heads, layout.head_dim))
+    return 4 * words
+
+
+def _pinned_words(n):
+    """A page-locked int32 host buffer of `n` words: a copy from pageable memory is not
+    asynchronous, so `update()` would wait for it."""
+    return torch.empty(n, dtype=torch.int32, pin_memory=True)
+
+
+def _graph_host_lengths(lengths, batch, max_kv_len):
+    """`update()`'s lengths as int64 [B], refused before any conversion unless they are integers
+    on the host: a CUDA tensor would need a device sync, and a float would be rounded."""
+    if isinstance(lengths, torch.Tensor):
+        if lengths.device.type != "cpu":
+            raise ValueError(
+                f"update() takes the step's lengths on the host (a list, a numpy array or a CPU "
+                f"tensor); reading a tensor on {lengths.device} would wait for the device")
+        if lengths.dtype.is_floating_point or lengths.dtype.is_complex \
+                or lengths.dtype == torch.bool:
+            raise ValueError(f"update() takes integer lengths; got a {lengths.dtype} tensor")
+        lengths = lengths.numpy()
+    else:
+        lengths = np.asarray(lengths)
+        if lengths.dtype.kind not in "iu":
+            raise ValueError(f"update() takes integer lengths; got {lengths.dtype} values")
+    if lengths.shape != (batch,):
+        raise ValueError(f"update() takes one length per request of the bucket, [{batch}]; got "
+                         f"shape {tuple(lengths.shape)}")
+    lengths = lengths.astype(np.int64)
+    if int(lengths.min()) < 1 or int(lengths.max()) > max_kv_len:
+        raise ValueError(
+            f"every length must be in [1, max_kv_len = {max_kv_len}]; got "
+            f"[{int(lengths.min())}, {int(lengths.max())}]. A padded row decodes one token of a "
+            f"reserved page.")
+    return lengths
+
+
+class _GraphPlan:
+    """What a graph-mode `plan()` fixed and keeps for the wrapper's life, because a captured graph
+    keeps the address of every tensor here."""
+
+    def __init__(self, bucket, page_table, seq_lens, lse, q_descale):
+        self.bucket = bucket
+        self.page_table, self.seq_lens = page_table, seq_lens
+        #: the declared variants: whether every `run()` passes `lse=` and `q_descale=`
+        self.lse, self.q_descale = lse, q_descale
+        self.decode = self.combine = None
+        # views of the shared workspace: the split outputs, and on Hopper the split LSEs, on
+        # Blackwell the split maxima and sums
+        self.o_partial = self.split_lse = self.l_partial = self.m_partial = None
+        # Hopper: the fused-combine arrival counters, private and zeroed once
+        self.counters = None
+        # Blackwell: the unsplit build's row offsets into the engine's page table
+        self.table_offsets = None
+        # split buckets: the device work list (`work_views` cuts its [W, 4] slots and [B] split
+        # counts out of it at each launch, so that it is one tensor), and the pinned host
+        # buffers it is copied from with each copy's completion event
+        self.work = None
+        self.host, self.host_words, self.events = [], [], []
+        self.recorded = [False] * _GRAPH_HOST_BUFFERS
+        #: the split counts each pinned buffer was last written with: a step with the same
+        #: counts rewrites only its lengths (`Bucket.write_lengths`)
+        self.host_splits = [None] * _GRAPH_HOST_BUFFERS
+        self.next_host = 0
+        #: the stream of the first `update()`, which every later one must use
+        self.stream = None
+
+    def work_views(self):
+        """`(slots, splits)`: the work list's int32 [W, 4] slots and [B] split counts."""
+        wave, batch = self.bucket.wave, self.bucket.batch
+        k0 = graph_plan.k_offset(wave)
+        return (self.work[:k0].view(wave, graph_plan.ENTRY_WORDS),
+                self.work[k0:k0 + batch])
+
+
+
+def _check_num_qo_heads(arch, num_qo_heads, num_kv_heads):
+    """Refuse a query-head count the architecture's decode does not build for `num_kv_heads`:
+    Shared by eager and graph planning before any compilation."""
+    if (isinstance(num_qo_heads, bool) or not isinstance(num_qo_heads, int)
+            or num_qo_heads <= 0 or num_qo_heads % num_kv_heads != 0):
+        raise ValueError(
+            f"num_qo_heads ({num_qo_heads!r}) must be a positive multiple of the layout's "
+            f"num_kv_heads ({num_kv_heads})"
+        )
+    ratio = num_qo_heads // num_kv_heads
+    if arch == "sm90" and ratio > 8 and ratio % 8:
+        raise NotImplementedError(
+            "SM90 GQA ratios above eight must be multiples of eight; "
+            f"got {ratio} ({num_qo_heads} / {num_kv_heads})")
+
+
+def _resolve_io_dtypes(arch, layout, q_data_type, o_data_type):
+    """`(q_data_type, o_data_type)` with the defaults resolved, refusing what the architecture's
+    decode does not read or write: graph mode's copy of eager `plan()`'s resolution."""
+    if q_data_type is None:
+        q_data_type = _Q_DTYPES[arch]
+    if q_data_type != _Q_DTYPES[arch]:
+        raise ValueError(
+            f"the {layout.reader} decode reads a {_Q_DTYPES[arch]} query; got "
+            f"q_data_type={q_data_type}. The SM100 kernel takes fp8 e4m3 with its "
+            f"per-tensor descale folded into sm_scale; the SM90 kernel takes bf16.")
+    if o_data_type is None:
+        o_data_type = torch.bfloat16
+    if o_data_type not in _OUT_DTYPES[arch]:
+        raise ValueError(
+            f"the {layout.reader} decode writes a {list(_OUT_DTYPES[arch])} output; got "
+            f"o_data_type={o_data_type}")
+    return q_data_type, o_data_type
+
 
 
 # ---------------------------------------------------------------------------
@@ -255,27 +544,62 @@ def _fail_closed_plan(method):
     return wrapped
 
 
+def _refuse_retired(where, positional, keywords, retired, replacement):
+    """Raise for arguments the current call forms refuse, naming what replaced them.
+
+    Such an argument must RAISE rather than be accepted and ignored, on every entry point,
+    or a caller who still passes it believes something false."""
+    if "kernel_kwargs" in keywords:
+        raise TypeError(
+            f"{where}: kernel_kwargs is retired from the public API, because what it still "
+            f"carried selects kernel paths and pool layouts; the layout carries every "
+            f"configuration a plan needs (QuantKVLayout.create)")
+    named = sorted(set(keywords) & set(retired))
+    if named or positional:
+        what = (f"{named}" if named else f"{len(positional)} extra positional argument(s)")
+        raise TypeError(f"{where}: {what} belong to the retired call form; {replacement}")
+    if keywords:
+        raise TypeError(f"{where}: unexpected keyword argument(s) {sorted(keywords)}")
+
+
 class PagedDecodeWrapper:
-    """PyTorch-facing wrapper for the paged CuTe DSL GQA decode kernel (SM90/SM100)."""
+    """PyTorch-facing wrapper for paged GQA decode over a quantized KV cache (SM90/SM100)."""
+
+    def __new__(cls, float_workspace_buffer: torch.Tensor = None, use_cuda_graph: bool = False):
+        # CUDA-graph mode is a separate implementation, chosen here, once: a wrapper built with
+        # `use_cuda_graph=True` is a `_GraphDecodeWrapper`, and an eager wrapper's plan() and
+        # run() run no graph-mode code (module docstring, CUDA-GRAPH MODE).
+        if use_cuda_graph and cls is PagedDecodeWrapper:
+            cls = _GraphDecodeWrapper
+        return super().__new__(cls)
 
     @flashinfer_api
-    def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
+    def __init__(
+        self,
+        float_workspace_buffer: torch.Tensor,
+        use_cuda_graph: bool = False,
+    ) -> None:
         self._float_workspace_buffer = float_workspace_buffer
+        # The workspace's device is the wrapper's device, and it is concrete: a tensor's
+        # `.device` always carries its ordinal. Every plan resolves the architecture from it,
+        # never from whichever device happens to be current.
         self.device = float_workspace_buffer.device
-        self._planned = False
-        # None = dense mode (everything below is unused); 2 or 4 = quantized.
-        self._bits: Optional[int] = None
-        # Resolved only for the SM100 quantized path. SM90 retains its existing
-        # contract until its separately active resource work lands.
-        self._scale_pool_dtype: Optional[torch.dtype] = None
-        self._scale_pool_sdtype: Optional[str] = None
+        # `use_cuda_graph` selects the implementation in `__new__`; nothing here reads it.
+        self._invalidate_plan()
 
     def _invalidate_plan(self) -> None:
         """Discard every state object that could make a failed replan runnable."""
         self._planned = False
-        self._compiled_fmha_std = None
-        self._compile_args = None
+        self._layout = None
+        self._arch = None
         self._compiled_fold = None
+        # the plan's compile key, and the variants of the same kernel, keyed by
+        # (has_q_descale, has_lse), which `run(q_descale=)` and `run(lse=)` fetch the first
+        # time they are passed
+        self._fold_key = None
+        self._fold_variants = None
+        # whether the plan's Blackwell build reads the cache's count table of page maxima
+        self._reads_v_max_hist = None
         self._compiled_combine = None
         self._quant_kernel_kwargs = None
         self._quant_offsets = None
@@ -283,29 +607,29 @@ class PagedDecodeWrapper:
         self._planned_reduction = None
         self._sm90_min_blocks = None
         self._sm90_fused_combine = None
+        self._sm90_scale_dtype = None
         self._sm90_block_table = None
         self._sm90_ws = None
+        # the compile arguments of the plan's decode, and its LSE-returning merge (the fused
+        # decode or the external combine built with `has_lse`), fetched on first `run(lse=)`
+        self._sm90_compile_args = None
+        self._sm90_lse_merge = None
         self._bits = None
         self._k_quant = None
         self._v_quant = None
         self._q_data_type = None
         self._o_data_type = None
-        self._scale_pool_dtype = None
-        self._scale_pool_sdtype = None
         self._is_sm90 = None
         self._num_qo_heads = None
         self._num_kv_heads = None
         self._head_dim = None
         self._page_size = None
-        self._q_len_per_req = None
         self._sm_scale = None
         self._batch_size = None
         self._max_kv_len = None
-        self._tma_mask = None
         self._kv_splits = None
         self._reduction = None
         self._has_workspace = False
-        self._m = None
         self._o_partial = None
         self._l_partial = None
         self._m_partial = None
@@ -315,8 +639,7 @@ class PagedDecodeWrapper:
 
     # -- read-only view of what plan() decided -------------------------------
     # Integrators need these to size their own buffers and to log what the
-    # planner picked; they were previously reachable only as private
-    # attributes, which is how the split plan stayed invisible.
+    # planner picked.
 
     @property
     def kv_splits(self) -> int:
@@ -325,23 +648,13 @@ class PagedDecodeWrapper:
 
     @property
     def reduction(self) -> str:
-        """Resolved reduction mode ("none" / "kernel" / "atomic")."""
+        """Resolved reduction mode ("none" or "kernel")."""
         return self._reduction
 
     @property
     def bits(self) -> Optional[int]:
-        """``None`` in dense mode; 2 or 4 in quantized mode."""
+        """The planned layout's stored bit width, 2 or 4; ``None`` before a plan."""
         return self._bits
-
-    @property
-    def scale_pool_dtype(self) -> Optional[torch.dtype]:
-        """Resolved IntDecodeSm100 metadata dtype, else ``None``.
-
-        K token-64 defaults to ``torch.bfloat16`` and records
-        ``torch.float32`` when ``kernel_kwargs={"sdtype": "f32"}`` is passed.
-        Dense plans and SM90 plans return ``None``.
-        """
-        return self._scale_pool_dtype
 
     @flashinfer_api
     @_fail_closed_plan
@@ -351,10 +664,9 @@ class PagedDecodeWrapper:
         indices: torch.Tensor,
         seq_lens: torch.Tensor,
         num_qo_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        page_size: int,
-        q_data_type: torch.dtype = torch.bfloat16,
+        layout: QuantKVLayout = None,
+        *retired_positional,
+        q_data_type: Optional[torch.dtype] = None,
         o_data_type: Optional[torch.dtype] = None,
         sm_scale: Optional[float] = None,
         kv_splits: Optional[int] = None,
@@ -362,191 +674,115 @@ class PagedDecodeWrapper:
         q_len_per_req: int = 1,
         max_kv_len: Optional[int] = None,
         non_blocking: bool = True,
-        bits: Optional[int] = None,
-        k_quant: Optional[Tuple[str, int]] = None,
-        v_quant: Optional[Tuple[str, int]] = None,
-        kernel_kwargs: Optional[Dict[str, Any]] = None,
+        **retired,
     ) -> None:
-        """Plan paged GQA decode for the given problem.
+        """Plan paged GQA decode for one step's batch over caches of ``layout``.
 
         Parameters
         ----------
         indptr : torch.Tensor (int32, [batch_size + 1])
             Prefix-sum offsets into ``indices``.
         indices : torch.Tensor (int32, [num_pages_total])
-            Flat per-sequence virtual page indices.
-        seq_lens : torch.Tensor (int32, [batch_size])
-            Per-sequence KV length in tokens. The kernel reads this
-            directly; callers that have ``last_page_len`` instead can
-            convert via ``(indptr.diff() - 1) * page_size + last_page_len``.
-        num_qo_heads, num_kv_heads, head_dim, page_size : int
-            GQA + paging configuration.  ``page_size`` must be 64 (the
-            quant-pool contract: one scale block per (page, kv-head)), and
-            ``head_dim`` one of the running architecture's ``_ACCEPTED_HEAD_DIMS``:
-            128 or 256 on SM90, where 256 is built in one layout (token-wise K and V
-            over all 256 channels with a float32 scale pool) and every other layout is
-            refused with the kernel constructor's own ``ValueError`` before anything is
-            compiled, and 128 on SM100 (the kernels are specialized to these, see that
-            constant).
-        q_data_type, o_data_type : torch.dtype
-            Q/O dtypes.  K/V are the packed code pools and are always
-            ``torch.uint8``, so there is no ``kv_data_type``.
+            Flat per-sequence physical page indices, in logical order.
+        seq_lens : torch.Tensor (int32 or int64, [batch_size])
+            Per-sequence KV length in tokens. Plan copies it to the device as int32. Callers
+            that have ``last_page_len`` instead can convert via
+            ``(indptr.diff() - 1) * 64 + last_page_len``.
+        num_qo_heads : int
+            Query heads; a positive multiple of ``layout.num_kv_heads``. Eager
+            kernels pad small groups and tile larger groups into eight-head CTAs.
+            On SM90 ratios above eight must be multiples of eight. Graph mode
+            retains ratios 1--8 on SM90 and 3--8 on SM100.
+        layout : QuantKVLayout
+            The layout the caches ``run()`` will read were built with, from
+            ``QuantKVLayout.create(...)`` for this wrapper's device. It carries the stored
+            width, head dimension, KV-head count, granularity, scale dtype and pool orders,
+            and it replaces the ``num_kv_heads``, ``head_dim``, ``page_size``,
+            ``bits``, ``k_quant``, ``v_quant`` and ``kernel_kwargs`` arguments, each of which
+            raises. A layout resolved for another architecture than this wrapper's device is
+            refused.
+        q_data_type, o_data_type : Optional[torch.dtype]
+            The query dtype must be the reader's: ``torch.float8_e4m3fn`` on SM100 and
+            ``torch.bfloat16`` on SM90 (the default resolves it). The output defaults to
+            bfloat16; both GPUs also write float32, and SM100 float16. Each output dtype is
+            its own compiled build, so a bfloat16 plan's kernel is the same whether or not a
+            float32 plan exists.
         sm_scale : Optional[float]
-            Softmax scale; defaults to ``1 / sqrt(head_dim)``.
+            Softmax scale; defaults to ``1 / sqrt(head_dim)``. On SM100 the fp8 query's
+            per-tensor descale is folded in here by the caller (``sm_scale / q_scale``).
         kv_splits : Optional[int]
-            Threadblocks per sequence (flash decoding).  ``None`` auto-tunes
-            from the planned shapes and SM count.
+            Threadblocks per sequence (flash decoding).  ``None`` takes the
+            architecture's planner pick from the planned shapes and SM count.
         reduction : str
             ``"kernel"`` (deterministic with workspace), ``"none"`` (no
             flash-decoding split-K; requires kv_splits == 1), or ``"auto"``
-            (the arch cost model picks).  ``"atomic"`` was dense-only and both
-            quantized planners reject it.
+            (the arch cost model picks). On SM90 the reduction is derived
+            from the split count, so only ``"auto"`` or the derived value is accepted.
         q_len_per_req : int
-            Must be 1.  Speculative decode was dense-only.
+            Must be 1: this is decode, one query token per request.
         max_kv_len : Optional[int]
-            Maximum KV sequence length across the batch.  Used to auto-tune
-            ``kv_splits``; pass it explicitly to avoid a GPU→CPU sync.
+            Maximum KV sequence length across the batch, which the planners
+            key on; passing it skips the ``seq_lens.max().item()`` that waits for the
+            device. Hopper's plan still waits while it builds its block table.
         non_blocking : bool
             Async device copies for the plan-time integer buffers.
-        bits : int
-            REQUIRED -- ``2`` or ``4``.  Selects the QUANTIZED-KV kernel (``IntDecodeSm100`` on SM100,
-            ``IntPingPongDecodeSm90`` on SM90).  In quantized mode ``run``'s
-            ``k_cache``/``v_cache`` are the PACKED CODE POOLS and the affine
-            block is passed as ``run(scale_pool=...)``.  See
-            :meth:`_plan_quantized` for the extra constraints (page_size 64,
-            fp8 query on SM100, ``kv_splits`` chosen by the arch cost model).
-        k_quant, v_quant : Optional[Tuple[str, int]]
-            Quantized mode only: per-tensor quantization granularity as
-            ``(axis, group)`` — ``("token", head_dim)`` (the default and the
-            shipped fast path), ``("token", head_dim // 2)``, or
-            ``("channel", G)`` with ``G`` in ``{64, 128, 256}``.  The pool
-            layout must match; see ``quant_layout.quant_block_offsets``.
-        kernel_kwargs : Optional[dict]
-            Quantized mode only, ADVANCED: extra constructor knobs forwarded
-            verbatim to the quantized kernel (e.g. ``sdtype``,
-            ``dequant_int2_to_f4``, ``o_stages``).  Anything set here
-            OVERRIDES the promoted per-bits tuning, so use it only when you
-            know which knob you are moving and why. On SM100, K token-64 keeps
-            its bf16 scale-pool default and also accepts explicit
-            ``sdtype="f32"``; :attr:`scale_pool_dtype` records the resolved
-            torch dtype.
-        """
-        if bits is not None:
-            return self._plan_quantized(
-                indptr, indices, seq_lens, num_qo_heads, num_kv_heads,
-                head_dim, page_size, bits,
-                q_data_type=q_data_type, o_data_type=o_data_type,
-                sm_scale=sm_scale, kv_splits=kv_splits, reduction=reduction,
-                q_len_per_req=q_len_per_req, max_kv_len=max_kv_len,
-                non_blocking=non_blocking, k_quant=k_quant, v_quant=v_quant,
-                kernel_kwargs=kernel_kwargs,
-            )
-        if k_quant is not None or v_quant is not None or kernel_kwargs:
-            raise ValueError(
-                "k_quant / v_quant / kernel_kwargs are quantized-mode "
-                "arguments; pass bits=2 or bits=4 to select that mode"
-            )
-        raise ValueError(
-            "bits=2 or bits=4 is required: the dense (unquantized) decode path "
-            "was removed. It used to be plan()'s default via bits=None."
-        )
 
-    def _plan_quantized(
-        self,
-        indptr: torch.Tensor,
-        indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        num_qo_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        page_size: int,
-        bits: int,
-        *,
-        q_data_type: Optional[torch.dtype],
-        o_data_type: Optional[torch.dtype],
-        sm_scale: Optional[float],
-        kv_splits: Optional[int],
-        reduction: str,
-        q_len_per_req: int,
-        max_kv_len: Optional[int],
-        non_blocking: bool,
-        k_quant: Optional[Tuple[str, int]],
-        v_quant: Optional[Tuple[str, int]],
-        kernel_kwargs: Optional[Dict[str, Any]],
-    ) -> None:
-        """Plan the quantized-KV kernel. Called by :meth:`plan` when ``bits``
-        is set.
-
-        Both cost models (``_sm100/scheduler.plan_splits_sm100`` and
-        ``_sm90/scheduler.plan_splits``) are keyed by ``bits`` and calibrated
-        against the quantized kernels, whose per-tile cost differs by about 1.6
-        times between the two bit widths. They are not shared with each other
-        and must not be unified: the two architectures plan by different cost
-        forms.
+        THE TWO PLANNERS ARE NOT SHARED, and must not be unified. Both quantized cost models
+        (``_sm100/scheduler.plan_splits_sm100``, ``_sm90/scheduler.plan_splits``) are KEYED
+        BY ``bits`` and calibrated against their own kernels, with per-tile costs from
+        measured int2/int4 sweeps (int2 0.791 us/tile unsplit against int4 1.25 on B200).
         """
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "paged decode needs a CUDA GPU, and torch reports no CUDA "
-                "device. Install a CUDA build of torch and run on an SM90 "
-                "(Hopper) or SM100 (Blackwell) device."
-            )
-        if not _is_supported():
-            major, minor = torch.cuda.get_device_capability()
+        if retired_positional or retired or not isinstance(layout, QuantKVLayout):
+            _refuse_retired(
+                "PagedDecodeWrapper.plan", retired_positional, retired, _RETIRED_PLAN_ARGS,
+                "build the cache layout with QuantKVLayout.create(bits=, head_dim=, "
+                "num_kv_heads=, k_quant=, v_quant=) and pass it as plan(indptr, indices, "
+                "seq_lens, num_qo_heads, layout)")
+            raise TypeError(f"PagedDecodeWrapper.plan: layout must be a QuantKVLayout; got "
+                            f"{type(layout).__name__}")
+        # The architecture of the WRAPPER'S device, whatever device is current: the workspace,
+        # the planner's SM count and every launch belong to it.
+        arch = _utils.require_arch(self.device)
+        if layout.arch != arch:
             raise ValueError(
-                f"this package runs on SM90 (Hopper) and SM100 (Blackwell) "
-                f"only; the current device reports compute capability "
-                f"{major}.{minor}. Use get_capabilities() to check a device "
-                f"before planning."
-            )
-        if bits not in _QUANT_BITS:
-            raise ValueError(f"bits must be one of {_QUANT_BITS} or None; got {bits}")
-        if page_size != _QUANT_PAGE_SIZE:
-            raise ValueError(
-                f"quantized decode requires page_size == {_QUANT_PAGE_SIZE} "
-                f"(one code block and one scale block per (page, kv-head)); "
-                f"got {page_size}"
-            )
-        if num_qo_heads % num_kv_heads != 0:
-            raise ValueError(
-                f"num_qo_heads ({num_qo_heads}) must be a multiple of "
-                f"num_kv_heads ({num_kv_heads})"
-            )
-        # First the union over architectures, before any device query, so a head dimension
-        # no architecture accepts is refused on a box without a GPU. The running
-        # architecture's own set is checked once the device is known, below.
-        accepted_anywhere = sorted({d for dims in _ACCEPTED_HEAD_DIMS.values() for d in dims})
-        if head_dim not in accepted_anywhere:
-            raise ValueError(
-                f"head_dim ({head_dim}) is not accepted; the decode kernels accept "
-                f"{accepted_anywhere} on some architecture "
-                f"({', '.join(f'{a}: {list(d)}' for a, d in _ACCEPTED_HEAD_DIMS.items())}). "
-                f"A multiple of 64 is NOT sufficient: below 128 the kernels write past the "
-                f"output row, and above it a value is accepted only where a kernel builds it "
-                f"and a run measures it."
-            )
+                f"the layout was resolved for {layout.arch} and this wrapper's device "
+                f"{self.device} is {arch}; create the layout for the device that decodes it")
+        # Before any device work: the DSL compiles for one architecture per process.
+        _utils.require_dsl_target(arch)
         if q_len_per_req != 1:
             raise NotImplementedError(
                 "quantized decode is plain decode only (the fold kernels pack "
                 f"one query token per threadblock); got "
                 f"q_len_per_req={q_len_per_req}"
             )
-        is_sm90 = _is_sm90()
-        self._is_sm90 = is_sm90
-        arch_key, arch_name = ("sm90", "SM90") if is_sm90 else ("sm100", "SM100")
-        if head_dim not in _ACCEPTED_HEAD_DIMS[arch_key]:
-            raise ValueError(
-                f"head_dim {head_dim} is built by the {arch_name} kernel but not measured, "
-                f"so plan() accepts "
-                f"{' and '.join(str(d) for d in _ACCEPTED_HEAD_DIMS[arch_key])} only on "
-                f"{arch_name}"
-            )
-
+        num_kv_heads, head_dim = layout.num_kv_heads, layout.head_dim
+        _check_num_qo_heads(arch, num_qo_heads, num_kv_heads)
+        if seq_lens.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"seq_lens must be int32 or int64; got {seq_lens.dtype}")
         batch_size = seq_lens.numel()
+        if batch_size == 0:
+            raise ValueError("plan() needs at least one request; seq_lens is empty")
         if indptr.numel() < batch_size:
             raise ValueError(
                 f"indptr length ({indptr.numel()}) must be at least batch_size "
                 f"({batch_size})"
             )
+
+        if q_data_type is None:
+            q_data_type = _Q_DTYPES[arch]
+        if q_data_type != _Q_DTYPES[arch]:
+            raise ValueError(
+                f"the {layout.reader} decode reads a {_Q_DTYPES[arch]} query; got "
+                f"q_data_type={q_data_type}. The SM100 kernel takes fp8 e4m3 with its "
+                f"per-tensor descale folded into sm_scale; the SM90 kernel takes bf16.")
+        if o_data_type is None:
+            o_data_type = torch.bfloat16
+        if o_data_type not in _OUT_DTYPES[arch]:
+            raise ValueError(
+                f"the {layout.reader} decode writes a {list(_OUT_DTYPES[arch])} output; got "
+                f"o_data_type={o_data_type}")
+        if sm_scale is None:
+            sm_scale = head_dim**-0.5
 
         if max_kv_len is None:
             # Unlike the dense path, we cannot fall back to "assume the largest
@@ -563,68 +799,40 @@ class PagedDecodeWrapper:
         indices = to_int32_device(indices)
         indptr = to_int32_device(indptr)
 
-        if q_data_type is None:
-            q_data_type = torch.float8_e4m3fn if not is_sm90 else torch.bfloat16
-        if o_data_type is None:
-            o_data_type = torch.bfloat16
-        if sm_scale is None:
-            sm_scale = head_dim**-0.5
-
-        k_quant = ("token", head_dim) if k_quant is None else (k_quant[0], int(k_quant[1]))
-        v_quant = ("token", head_dim) if v_quant is None else (v_quant[0], int(v_quant[1]))
-
-        self._bits = bits
-        self._k_quant = k_quant
-        self._v_quant = v_quant
+        self._layout = layout
+        self._arch = arch
+        self._is_sm90 = arch == "sm90"
+        self._bits = layout.bits
+        self._k_quant = layout.k_quant
+        self._v_quant = layout.v_quant
         self._q_data_type = q_data_type
         self._o_data_type = o_data_type
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
-        self._page_size = page_size
-        self._q_len_per_req = 1
+        self._page_size = _QUANT_PAGE_SIZE
         self._sm_scale = sm_scale
         self._batch_size = batch_size
         self._seqlens = seq_lens
         self._table_offsets = indptr[:batch_size]
         self._page_table = indices
         self._max_kv_len = max_kv_len
-        self._scale_pool_dtype = None
-        self._scale_pool_sdtype = None
+        self._quant_kernel_kwargs = dict(layout._kernel_kwargs)
 
-        if is_sm90:
-            self._plan_quantized_sm90(indptr, indices, kv_splits, reduction,
-                                      kernel_kwargs)
+        if self._is_sm90:
+            self._plan_quantized_sm90(indptr, indices, kv_splits, reduction)
         else:
-            self._plan_quantized_sm100(kv_splits, reduction, kernel_kwargs)
+            self._plan_quantized_sm100(kv_splits, reduction)
         self._planned = True
 
-    def _plan_quantized_sm100(self, kv_splits, reduction, kernel_kwargs) -> None:
-        from ._sm100.fold_runtime import blk_tile_n_of, quant_cfg_of
-        from .quant_layout import quant_block_offsets, validate_quant_flex
+    def _plan_quantized_sm100(self, kv_splits, reduction) -> None:
+        from ._sm100.fold_runtime import quant_cfg_of, reads_v_max_hist
+        from ._sm100.item_loop import drops_item_loop
+        from .quant_layout import quant_block_offsets
         from ._sm100.scheduler import plan_splits_sm100
 
         bits = self._bits
-        tile_n = blk_tile_n_of(self._num_qo_heads, self._num_kv_heads)
-        if tile_n > 8:
-            raise NotImplementedError(
-                f"IntDecodeSm100 packs at most 8 Q head rows per threadblock (the "
-                f"P hi/lo row budget, 2 * blk_tile_n <= mma_tile_n), and this "
-                f"wrapper picks the head tile as the GQA ratio rounded up to a "
-                f"power of two rather than spreading a larger ratio over several "
-                f"threadblocks; num_qo_heads / num_kv_heads = "
-                f"{self._num_qo_heads // self._num_kv_heads} needs a "
-                f"{tile_n}-wide N tile")
-        if self._q_data_type != torch.float8_e4m3fn:
-            raise ValueError(
-                "IntDecodeSm100 is fp8-mode-only: q_data_type must be "
-                f"torch.float8_e4m3fn, got {self._q_data_type}. The per-tensor "
-                "Q descale is folded into sm_scale by the caller "
-                "(scale_s = sm_scale / q_scale) — the kernel takes no q_scale."
-            )
-        k_quant, v_quant = validate_quant_flex(
-            self._k_quant, self._v_quant, self._page_size, self._head_dim)
-        self._k_quant, self._v_quant = k_quant, v_quant
+        k_quant, v_quant = self._k_quant, self._v_quant
         self._quant_offsets = quant_block_offsets(
             k_quant, v_quant, N=self._page_size, D=self._head_dim)
 
@@ -636,13 +844,14 @@ class PagedDecodeWrapper:
         # kernel will actually be built with -- compile_fold resolves 128 for
         # V-ch64 while the planner's default is 256, and a planner costing
         # 256-token tiles against a 128-token kernel picks the wrong split
-        # count. Safe here: k_quant/v_quant were validated just above.
+        # count.
         from ._sm100.fold_runtime import resolve_fold_tiling
 
         _seq_res, _ = resolve_fold_tiling(k_quant, v_quant)
         self._planned_splits, self._planned_reduction = plan_splits_sm100(
             self._batch_size, self._num_kv_heads, self._max_kv_len, bits=bits,
-            sm_count=get_num_sm(self.device), sequence_tile=_seq_res)
+            sm_count=get_num_sm(self.device), sequence_tile=_seq_res,
+            head_tiles=(self._num_qo_heads // self._num_kv_heads + 7) // 8)
         if kv_splits is None or kv_splits <= 0:
             kv_splits = self._planned_splits
             if reduction == "auto":
@@ -670,39 +879,54 @@ class PagedDecodeWrapper:
         self._has_workspace = reduction == "kernel"
 
         if self._has_workspace:
-            m, o_partial, l_partial, m_partial = _slice_workspace(
+            o_partial, l_partial, m_partial = _slice_workspace(
                 self._float_workspace_buffer, kv_splits, self._batch_size,
                 1, self._num_qo_heads, self._head_dim)
-            self._m = m
             self._o_partial = o_partial
             self._l_partial = l_partial
             self._m_partial = m_partial
 
-        kkw = dict(kernel_kwargs or {})
-        clash = {"k_quant", "v_quant"} & set(kkw)
-        if clash:
-            raise ValueError(
-                f"pass granularity through the named plan() arguments, not "
-                f"kernel_kwargs: {sorted(clash)}. Only the named ones are "
-                f"validated (validate_quant_flex) and recorded for the "
-                f"pscale_lp derivation in run().")
-        # Legacy ("token", head_dim) for BOTH tensors is the shipped default and
-        # is left OUT of the ctor kwargs on purpose: it keeps the compile key —
-        # and therefore the traced kernel — byte-for-byte what the benchmark and
-        # gate harness produce, which is what the equivalence gate compares.
-        if k_quant != ("token", self._head_dim) or v_quant != ("token", self._head_dim):
+        # The layout's kernel keyword arguments (empty in production), plus the
+        # granularity. At D128 whole-head token-wise K/V is left OUT on purpose:
+        # the compile key, and therefore the traced kernel, is then byte-for-byte the
+        # default build's. The scale dtype is never passed: the layout
+        # admits only the dtype `quant_cfg_of` resolves without one, asserted below.
+        # compile_fold's constructor defaults are explicitly token-128, so D256 must
+        # forward its whole-head pair even though quant_cfg_of derives it when omitted.
+        kkw = dict(self._quant_kernel_kwargs)
+        if self._head_dim != 128 or k_quant != ("token", self._head_dim) or v_quant != ("token", self._head_dim):
             kkw["k_quant"] = k_quant
             kkw["v_quant"] = v_quant
-        cfg_k, cfg_v, scale_sdtype, _ = quant_cfg_of(
-            self._page_size, self._head_dim, kkw)
+        cfg_k, cfg_v, scale_sdtype, _ = quant_cfg_of(self._page_size, self._head_dim, kkw)
         assert (cfg_k, cfg_v) == (k_quant, v_quant), (
-            f"quant_cfg_of drifted from the validated plan: "
+            f"quant_cfg_of drifted from the layout: "
             f"{cfg_k}/{cfg_v} != {k_quant}/{v_quant}")
-        self._scale_pool_sdtype = scale_sdtype
-        self._scale_pool_dtype = (
-            torch.bfloat16 if scale_sdtype == "bf16" else torch.float32)
-        self._quant_kernel_kwargs = kkw
-        self._compiled_fold, applied = _get_compiled_fold_kernel(
+        compiled_dtype = torch.bfloat16 if scale_sdtype == "bf16" else torch.float32
+        assert compiled_dtype == self._layout.scale_dtype, (
+            f"the kernel would read a {compiled_dtype} scale pool and the layout holds "
+            f"{self._layout.scale_dtype}")
+        # ONE WORK ITEM PER CTA. Without a split, the kernel is persistent by default: it
+        # launches at most `persistent_sm_count` CTAs (the constructor's default, or the
+        # layout's own value), and each loops over the (KV head, request) work items it is
+        # given. A persistent build that reads the exponent table (the fold with token-wise
+        # V) reads it before its first item's set-up barrier, which every role then waits
+        # for. When the batch has no more items than the CTA cap, no CTA gets a second item,
+        # so the plan compiles such a build without the item loop, where the warpgroups that
+        # use the exponent read the table themselves while the first tile is produced. On
+        # B200 that build runs 0.3 to 7.6% faster than the persistent one on such grids, with
+        # bitwise the same output (INT2 and INT4; 32/8, 64/8, 24/8, 16/4, 8/2 and 4/1 heads;
+        # token-wise and channel-wise K, K token-64; KV 63 to 8192). Channel-wise
+        # V reads no table, and there the build without the loop measures up to 3.8% slower
+        # at long requests, so it keeps the persistent build. A layout that names
+        # `persistent` among its kernel arguments keeps its own choice. The predicate is
+        # `_sm100/item_loop.py`.
+        self._reads_v_max_hist = reads_v_max_hist(self._page_size, self._head_dim, kkw)
+        ckw = dict(kkw)
+        cap = int(ckw.get("persistent_sm_count", _persistent_sm_count()))
+        if drops_item_loop(reduction, self._reads_v_max_hist, "persistent" in ckw,
+                           self._batch_size * self._num_kv_heads, cap):
+            ckw["persistent"] = False
+        self._fold_key = (
             self._page_size,
             self._num_qo_heads,
             self._num_kv_heads,
@@ -710,19 +934,20 @@ class PagedDecodeWrapper:
             reduction,
             bits,
             _torch_to_cutlass(self._o_data_type),
-            tuple(sorted(kkw.items())),
+            tuple(sorted(ckw.items())),
         )
+        self._compiled_fold, applied = _get_compiled_fold_kernel(*self._fold_key)
+        self._fold_variants = {(False, False): self._compiled_fold}
         self._assert_bits_tuning_applied(applied)
 
     def _assert_bits_tuning_applied(self, applied: Dict[str, Any]) -> None:
         """Prove the promoted per-bits tuning reached the object we compiled.
 
-        ``_sm100/fold_runtime.compile_fold`` guards this because the tuning was
-        once applied as a dead statement AFTER the constructor and the int4
-        timings came back bit-for-bit identical (1674.2 us both ways) — a
-        promoted optimisation the kernel object never received. The wrapper
-        shares the same ``BITS_TUNING`` dict (imported, never copied, so the
-        two cannot drift) and therefore shares the guard.
+        ``_sm100/fold_runtime.compile_fold`` guards this, so that a promoted
+        optimisation cannot be applied as a dead statement after the constructor
+        and leave the kernel object without it. The wrapper shares the same
+        ``BITS_TUNING`` dict (imported, never copied, so the two cannot drift)
+        and therefore shares the guard.
 
         ``applied`` holds the knob values read back off the constructed kernel;
         it is cached alongside the compiled module so this still fires on a
@@ -737,30 +962,27 @@ class PagedDecodeWrapper:
             f"for bits={self._bits}, wrapper expected {sorted(want_all)}")
         for key, want in want_all.items():
             if key in overrides and overrides[key] != want:
-                continue                       # caller overrode deliberately
+                continue                       # a layout overrode it deliberately
             assert applied[key] == want, (
                 f"per-bits tuning did not reach the kernel: bits={self._bits} "
                 f"{key} is {applied[key]!r}, expected {want!r}; see "
                 f"_sm100/fold_runtime.BITS_TUNING")
 
-    def _plan_quantized_sm90(self, indptr, indices, kv_splits, reduction,
-                             kernel_kwargs) -> None:
+    def _plan_quantized_sm90(self, indptr, indices, kv_splits, reduction) -> None:
         """Plan ``IntPingPongDecodeSm90``. Validated on H100.
 
         See ``_sm90/pingpong_runtime.py``'s module docstring for what was checked.
-        This wires the SAME API surface (`plan` -> `run`) as the SM100 path.
 
-        WHY ``kv_splits`` IS HONOURED HERE AND WAS NOT BEFORE
-        ----------------------------------------------------
-        This function used to call ``plan_pingpong`` unconditionally and drop
-        the caller's ``kv_splits`` and ``reduction`` on the floor, so
-        ``plan(kv_splits=4)`` silently returned the planner's pick. Two things
-        that breaks, both of which the SM100 path supports:
+        WHY ``kv_splits`` IS HONOURED HERE
+        ----------------------------------
+        A caller's ``kv_splits`` and ``reduction`` reach the plan, so that
+        ``plan(kv_splits=4)`` is what launches. Two things depend on it, both of
+        which the SM100 path also supports:
 
-          * a correctness gate cannot reach the split counts the planner did
-            not happen to choose -- and "only wrong at outer > 1" is exactly
-            this path's exposure;
-          * the planner cannot be SCORED, because scoring it means timing the
+          * a correctness gate must reach the split counts the planner does not
+            happen to choose, because "only wrong at outer > 1" is exactly this
+            path's exposure;
+          * the planner must be SCORABLE, because scoring it means timing the
             same problem at every candidate split and comparing.
 
         REDUCTION IS DERIVED, NOT CHOSEN, and that is an arch difference worth
@@ -772,106 +994,27 @@ class PagedDecodeWrapper:
         not exist, and gets an error rather than a silent substitution.
 
         The third axis -- fused tail vs external combine -- is a real choice
-        (``plan_fused_combine`` is a POLICY, not a constraint), so it is
-        exposed as ``kernel_kwargs={"fused_combine": bool}`` for A/B work.
+        (``plan_fused_combine`` is a POLICY, not a constraint). A layout reaches it
+        through ``QuantKVLayout._create(..., kernel_kwargs={"fused_combine": bool})``;
+        production layouts carry nothing.
 
-        The fourth is ``kernel_kwargs={"sdtype": torch.float32 | torch.bfloat16}``,
-        the scale-pool precision, which the CALLER owns because the caller is
-        the one who built the pool -- the same surface SM100 exposes. It is
-        validated, not derived: ``("token", head_dim // 2)`` requires the
-        bfloat16 pool (token-64 doubles the scale ring's smem section and
-        halving the element is what funds it), and asking for anything else
-        with it is an error here rather than an assert about a smem budget from
-        inside the kernel constructor. Default ``torch.float32``.
-
-        Nothing else is accepted: the remaining SM100 knobs do not exist on
-        this kernel.
+        The scale-pool precision is the layout's ``scale_dtype``, which ``create()`` checked
+        against the granularity (token-wise K over D/2 needs bfloat16, D=256 needs float32).
         """
-        from .kernel_contract import normalize_sdtype
-        from .quant_layout import SM90_WIDE_STAGES, sm90_wide_refusal, validate_quant_flex
+        from .quant_layout import quant_block_offsets
         from ._sm90.pingpong_runtime import (
             alloc_pingpong_workspace, block_table_2d, plan_pingpong,
         )
         from ._sm90.scheduler import plan_fused_combine
-        from ._sm90.serving_cache import quant_block_offsets
 
-        kkw = dict(kernel_kwargs or {})
-        fused_override = kkw.pop("fused_combine", None)
-        sdtype = kkw.pop("sdtype", torch.float32)
-        if kkw:
-            raise NotImplementedError(
-                f"the SM90 quantized path takes its knobs from plan_splits / "
-                f"plan_fused_combine; the accepted kernel_kwargs keys are "
-                f"'fused_combine' and 'sdtype' (got {sorted(kkw)})")
-        if sdtype not in (torch.float32, torch.bfloat16):
-            raise ValueError(
-                f"kernel_kwargs['sdtype'] is the scale-pool precision and must "
-                f"be torch.float32 (default) or torch.bfloat16; got {sdtype}")
-        if self._q_data_type != torch.bfloat16:
-            raise ValueError(
-                "IntPingPongDecodeSm90 takes a bf16 query (mQ); got "
-                f"{self._q_data_type}. Note the arch difference: the SM100 "
-                "fold kernel takes fp8 e4m3."
-            )
-        # AT A HEAD DIMENSION OTHER THAN 128 THE KERNEL BUILDS ONE LAYOUT, and every other pair or
-        # pool precision is refused here with the constructor's own reason
-        # (`quant_layout.sm90_wide_refusal`), before anything is planned or compiled. It has to
-        # come before `validate_quant_flex` and the token-D/2 pool check below, because both
-        # describe the envelope at 128: the first raises an AssertionError for V token-128 at
-        # head_dim 256, and the second advises a bfloat16 pool for K token-128 at head_dim 256,
-        # which no pool precision builds. `compile_pingpong` always folds and leaves the ring
-        # depth to the constructor, which resolves it inside `SM90_WIDE_STAGES` at these head
-        # dimensions, so neither can be refused here, and an admitted depth stands in for it.
-        if self._head_dim != 128:
-            refusal = sm90_wide_refusal(
-                self._head_dim, self._k_quant, self._v_quant, sdtype=normalize_sdtype(sdtype),
-                fold_scale_zero=True, num_stages=SM90_WIDE_STAGES[0])
-            if refusal is not None:
-                raise ValueError(refusal)
-        # VALIDATE THE GRANULARITY, which this path used to accept blind. It
-        # forwarded `k_quant`/`v_quant` straight into the compile without ever
-        # calling `validate_quant_flex`, and `run()` skipped the `scale_pool`
-        # shape check on SM90 as well -- so a pool built at a different
-        # granularity surfaced either as a DSL trace assert naming an argument
-        # index, or as silently wrong output. `validate_quant_flex` is
-        # arch-neutral despite living under `_sm100/`: its own docstring records
-        # that it encodes the SM90 IntPingPongDecodeSm90 envelope verbatim.
-        k_quant, v_quant = validate_quant_flex(
-            self._k_quant, self._v_quant, self._page_size, self._head_dim)
-        self._k_quant, self._v_quant = k_quant, v_quant
-        # SM90's OWN offsets table (`_sm90/serving_cache`), not the SM100 mirror
-        # of it -- same keys, and this is the one the SM90 pool builders use.
+        fused_override = self._quant_kernel_kwargs.get("fused_combine")
         self._quant_offsets = quant_block_offsets(
-            k_quant, v_quant, N=self._page_size, D=self._head_dim)
-        # CHECK the caller's scale-pool precision against the granularity; do
-        # not pick it for them. The pool is the caller's tensor -- deriving a
-        # dtype here would mean plan() silently compiling for a precision the
-        # pool they already built does not have, and the mismatch would surface
-        # as wrong numbers rather than as an error.
-        #
-        # The constraint itself is the kernel's: token-64 doubles the scale
-        # ring's smem section and halving the element is what funds it, so
-        # `IntPingPongDecodeSm90.__init__` asserts `sdtype == bfloat16`. Raising
-        # here turns that into a message naming the two arguments that
-        # disagree. The sdtype MUST be forwarded: without it `compile_pingpong`'s
-        # f32 default applies unconditionally and every `k_quant=("token", 64)`
-        # plan dies on the constructor assert, even though
-        # `validate_quant_flex` accepts ("token", D//2) and the capability
-        # surface advertises it.
-        if ("token", self._head_dim // 2) in (k_quant, v_quant):
-            if sdtype != torch.bfloat16:
-                raise ValueError(
-                    f"k_quant={k_quant} v_quant={v_quant}: token-"
-                    f"{self._head_dim // 2} requires a bfloat16 scale pool (it "
-                    f"doubles the scale-ring smem section and halving the "
-                    f"element funds it), but kernel_kwargs['sdtype'] is "
-                    f"{sdtype}. Build the pool with "
-                    f"make_serving_cache_flex(..., sdtype=torch.bfloat16) and "
-                    f"pass kernel_kwargs={{'sdtype': torch.bfloat16}}.")
-        self._sm90_scale_dtype = sdtype
+            self._k_quant, self._v_quant, N=self._page_size, D=self._head_dim)
+        self._sm90_scale_dtype = self._layout.scale_dtype
         planned_outer, planned_minb, planned_fused = plan_pingpong(
             self._batch_size, self._num_kv_heads, self._max_kv_len,
-            bits=self._bits, head_dim=self._head_dim, sm_count=get_num_sm(self.device))
+            bits=self._bits, head_dim=self._head_dim, sm_count=get_num_sm(self.device),
+            head_tiles=(self._num_qo_heads // self._num_kv_heads + 7) // 8)
         self._planned_splits = planned_outer
         self._planned_reduction = "none" if planned_outer == 1 else "kernel"
 
@@ -884,7 +1027,9 @@ class PagedDecodeWrapper:
             # with the split count -- plan_splits returns 2 unconditionally.
             # Take the planner's value rather than hardcode.
             min_blocks = planned_minb
-            fused = plan_fused_combine(self._batch_size, self._num_kv_heads, outer)
+            fused = plan_fused_combine(
+                self._batch_size, self._num_kv_heads, outer,
+                head_tiles=(self._num_qo_heads // self._num_kv_heads + 7) // 8)
         if fused_override is not None:
             fused = bool(fused_override) and outer > 1
         if reduction == "atomic":
@@ -907,423 +1052,615 @@ class PagedDecodeWrapper:
         self._sm90_ws = alloc_pingpong_workspace(
             self._batch_size, self._num_qo_heads, self._num_kv_heads,
             self._head_dim, outer, device=self.device)
-        self._compiled_fold = _get_compiled_pingpong_kernel(
+        self._sm90_compile_args = (
             self._page_size, self._num_qo_heads, self._num_kv_heads,
             self._head_dim, self._bits, min_blocks, fused,
             tuple(self._k_quant), tuple(self._v_quant),
-            self._sm90_scale_dtype)
+            self._sm90_scale_dtype, self._o_data_type)
+        self._compiled_fold = _get_compiled_pingpong_kernel(*self._sm90_compile_args)
         # The external combine runs ONLY when the in-kernel fused tail is off.
         self._compiled_combine = (
-            _get_compiled_splitk_combine(self._head_dim)
+            _get_compiled_splitk_combine(self._head_dim, self._o_data_type)
             if outer > 1 and not fused else None)
-        # What the caller actually asked for, kept so a benchmark label cannot
-        # claim a config the plan did not use (the SM100 side needs this for
-        # its BITS_TUNING override check; here it is pure auditability).
-        self._quant_kernel_kwargs = dict(kernel_kwargs or {})
+        self._sm90_lse_merge = None
 
-    def pscale_lp(self, scale_pool: torch.Tensor) -> float:
-        """Precompute `run(pscale_lp=...)` for this pool. **Does a device sync.**
+    def pscale_lp(self, *args, **kwargs):
+        """Always raises: ``run(q, kv_cache)`` derives the Blackwell P-scale exponent
+        itself, so there is no value to precompute or pass."""
+        raise TypeError(
+            "PagedDecodeWrapper.pscale_lp() is retired: run(q, kv_cache) derives the "
+            "Blackwell P-scale exponent itself, so there is no value to precompute or pass")
 
-        `run()` derives this itself when you omit it, which costs a
-        `.max().item()` on every call -- a full device sync sitting in the
-        middle of the decode path. The value is a property of the scale pool
-        alone, so a serving loop should call this when the KV cache is written
-        and pass the cached float to every `run()` after that.
-
-        Exposed as a method because the alternative was pointing users at
-        `_sm100.fold_runtime.pscale_lp_for_pool` and asking them to thread
-        `(k_quant, v_quant, page_size, head_dim)` through by hand -- four
-        values this object already holds, and a mismatch on any of them is
-        silent.
-        """
-        if not self._planned:
-            raise RuntimeError("Call plan() before pscale_lp().")
-        if self._bits is None:
-            raise RuntimeError("pscale_lp() is quantized-mode only; this "
-                               "wrapper was planned without bits=")
-        from ._sm100.fold_runtime import pscale_lp_for_pool
-        self._require_scale_pool_dtype(scale_pool)
-        return pscale_lp_for_pool(
-            scale_pool, self._k_quant, self._v_quant,
-            page_size=self._page_size, head_dim=self._head_dim)
-
-    def _require_scale_pool_dtype(self, scale_pool: torch.Tensor) -> None:
-        """Enforce the resolved SM100 metadata dtype before any sync or launch."""
-        if self._scale_pool_dtype is None:
-            return
-        from ._sm100.fold_runtime import require_scale_pool_dtype
-        require_scale_pool_dtype(
-            scale_pool,
-            self._scale_pool_dtype,
-            expected_sdtype=self._scale_pool_sdtype,
-        )
-
-    def _require_declared_k_pool_order(self, k_pool_order) -> None:
-        """The caller must SAY which K order its pool carries, when it matters.
-
-        NOTHING CAN DETECT THIS FROM THE BYTES. The kernel reads a K pool
-        whose codes were permuted at store time by
-        `fosca.pool.k_store_perm_sm100_f4`: at int4 at EVERY configuration
-        (the raw-feed 8-slot shuffle) and at int2 with the E2M1 feed at either
-        K axis. A pool written in
-        `pack_rows` order has the same dtype, the same shape and the same byte
-        count, and decodes to finite, plausible values with every K channel taken
-        from the wrong slot inside its packed-word group. No validation can see
-        that, so the only alternative to a silent wrong answer is to make the
-        caller state what it wrote and to check the statement against the
-        configuration.
-
-        This is where the risk lives: a pool writer can build the order the
-        kernel does not read, and nothing in the pool's bytes reveals which order
-        it carries. `fosca.pool` and `docs/K_STORE_PERM.md` give a writer
-        the order it has to meet; this guard covers a caller that builds pools
-        some other way.
-
-        `k_pool_order` is "permuted" or "logical", and it is required only for the
-        configurations that read a permuted pool: INT4 everywhere and INT2 with
-        the E2M1 feed at either K axis. An undeclared pool is refused rather than
-        read wrong.
-        """
-        if self._is_sm90 or self._bits is None:
-            return
-        # `getattr`, because a partially built wrapper must produce a USEFUL
-        # error rather than an AttributeError from inside a validator. `__init__`
-        # sets this attribute, so a real wrapper always carries it; the host
-        # tests reach the pre-launch guards through `__new__`.
-        kkw = dict(getattr(self, "_quant_kernel_kwargs", None) or {})
-        # The SAME predicate the pool builder asks, so the builder and the
-        # launch agree.
-        from ._sm100.int_fold_decode import IntDecodeSm100
-        want_permuted = IntDecodeSm100.k_pool_is_permuted(
-            self._bits,
-            dequant_int2_to_f4=kkw.get("dequant_int2_to_f4"),
-            k_quant=tuple(self._k_quant or ("token", self._head_dim)),
-            fold_scale_zero=bool(int(kkw.get("fold_scale_zero", 1) or 0)))
-        if k_pool_order not in (None, "permuted", "logical"):
-            raise ValueError(
-                f"k_pool_order must be 'permuted', 'logical' or None; got "
-                f"{k_pool_order!r}")
-        if not want_permuted:
-            if k_pool_order == "permuted":
-                raise ValueError(
-                    "this plan reads K in LOGICAL (pack_rows) order, so a "
-                    "permuted pool would be read wrong. Ask "
-                    "IntDecodeSm100.k_pool_is_permuted; "
-                    "see docs/K_STORE_PERM.md")
-            return
-        if k_pool_order is None:
-            raise ValueError(
-                "this plan reads a PERMUTED K pool, and the order cannot be "
-                "detected from the pool itself, so run() requires you to declare "
-                "it: pass k_pool_order='permuted' if the K codes were permuted "
-                "by fosca.pool.k_store_perm_sm100_f4 before packing, which is "
-                "what this configuration reads (bits=4 at every configuration, "
-                "or bits=2 with the E2M1 feed at either K axis). A pool in "
-                "pack_rows order is silently wrong "
-                "here at every K channel. See docs/K_STORE_PERM.md")
-        if k_pool_order != "permuted":
-            raise ValueError(
-                "k_pool_order='logical' contradicts this plan, which reads a "
-                "PERMUTED K pool (bits=4 everywhere; bits=2 with the E2M1 feed "
-                "at either K axis). Permute "
-                "the K codes with fosca.pool.k_store_perm_sm100_f4 before "
-                "packing, or plan a configuration that reads logical order; see "
-                "docs/K_STORE_PERM.md")
-
-    def _run_quantized(
-        self,
-        q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        scale_pool: Optional[torch.Tensor],
-        out: Optional[torch.Tensor],
-        sm_scale: Optional[float],
-        o_scale: Optional[float],
-        pscale_lp: Optional[float],
-        enable_pdl: bool,
-        k_pool_order: Optional[str] = None,
-    ) -> torch.Tensor:
-        if scale_pool is None:
-            raise ValueError(
-                "quantized decode needs the affine (scale, zero) block: pass "
-                "run(..., scale_pool=mScale)")
-        self._require_scale_pool_dtype(scale_pool)
-        # AFTER the scale-pool guards, deliberately. A caller with both a wrong
-        # metadata dtype and no declared K order should hear about the dtype
-        # first: that is the older, narrower error, and
-        # `tests/test_sm100_scale_dtype_host.py` pins it as the first thing a
-        # mismatched pool hits. Both run before any launch, which is what matters.
-        self._require_declared_k_pool_order(k_pool_order)
-        if q.dtype != self._q_data_type:
-            raise ValueError(
-                f"q.dtype={q.dtype} mismatches planned {self._q_data_type}")
-        if k_cache.dtype != torch.uint8 or v_cache.dtype != torch.uint8:
-            raise ValueError(
-                "in quantized mode k_cache/v_cache are the PACKED CODE POOLS "
-                f"(uint8 mKq/mVq); got {k_cache.dtype}/{v_cache.dtype}")
-        # Catch a pool built for a different granularity HERE. Downstream it
-        # surfaces as a DSL trace assert on argument #19, which does not say
-        # "your k_quant and your pool disagree".
-        #
-        # RUNS ON BOTH ARCHES, and must. Guarding it on `not self._is_sm90` left
-        # Hopper with either that opaque trace assert or silently wrong output.
-        # Both arches build the same sectioned block, so one check covers both.
-        legacy = self._quant_offsets["legacy"]
-        if legacy:
-            want_rank, want_tail = 4, 4
-            want = "[num_pages, num_kv_heads, page_size, 4]"
+    def _check_tensor(self, name, x, dtype):
+        """The query or output: ``[B, HQ, D]`` or ``[B, 1, HQ, D]`` with the planned B, HQ and
+        D exactly, C-contiguous, 16-byte aligned, on this wrapper's device. Returns True for
+        the 3-D form. Constant time; it never reshapes by element count, so a ``[1, 16, 256]``
+        query cannot pass a plan for HQ=32, D=128."""
+        if x.dtype != dtype:
+            raise ValueError(f"{name}.dtype={x.dtype} mismatches the planned {dtype}")
+        if x.device != self.device:
+            raise ValueError(f"{name} is on {x.device}; this wrapper plans for {self.device}")
+        b, hq, d = self._batch_size, self._num_qo_heads, self._head_dim
+        shape = x.shape
+        if shape == (b, hq, d):
+            three_d = True
+        elif shape == (b, 1, hq, d):
+            three_d = False
         else:
-            want_rank = 3
-            want_tail = self._quant_offsets["block_tot"]
-            want = f"[num_pages, num_kv_heads, {want_tail}]"
-        if scale_pool.dim() != want_rank or scale_pool.shape[-1] != want_tail:
             raise ValueError(
-                f"scale_pool shape {tuple(scale_pool.shape)} does not match "
-                f"k_quant={self._k_quant} v_quant={self._v_quant}: "
-                f"expected {want}")
-        # And the POOL PRECISION, which the shape check above cannot see. The
-        # kernel's scale TMA is traced against a fixed element type and
-        # transaction size, so handing it a pool of the other dtype reads the
-        # right bytes as the wrong numbers -- finite, plausibly scaled, wrong.
-        # SM90 only, because that is where `plan()` records what it compiled
-        # for. On SM100 the same value goes through `kernel_kwargs["sdtype"]`
-        # straight into the trace and is not tracked separately here.
-        if self._is_sm90 and scale_pool.dtype != self._sm90_scale_dtype:
-            raise ValueError(
-                f"scale_pool dtype {scale_pool.dtype} does not match the "
-                f"precision this plan compiled for "
-                f"({self._sm90_scale_dtype}); pass the same dtype to "
-                f"make_serving_cache_flex(..., sdtype=...) and to "
-                f"plan(kernel_kwargs={{'sdtype': ...}}).")
-
-        # q accepted as [B, HQ, D] or [B, 1, HQ, D]; the fold kernel wants BSHD.
-        if q.dim() == 3:
-            q_view = q.view(self._batch_size, 1, self._num_qo_heads, self._head_dim)
-            out_was_3d = True
-        elif q.dim() == 4:
-            if q.shape[1] != 1:
-                raise ValueError(
-                    f"quantized decode is plain decode (q_len_per_req == 1); "
-                    f"got q.shape={tuple(q.shape)}")
-            q_view = q
-            out_was_3d = False
-        else:
-            raise ValueError(f"q must be 3D or 4D; got ndim={q.dim()}")
-        if q_view.shape[0] != self._batch_size:
-            raise ValueError(
-                f"q batch {q_view.shape[0]} mismatches planned {self._batch_size}")
-
-        scale_s = self._sm_scale if sm_scale is None else sm_scale
-        scale_o = 1.0 if o_scale is None else o_scale
-
-        if self._is_sm90:
-            return self._run_quantized_sm90(q_view, k_cache, v_cache, scale_pool,
-                                            out, scale_s, scale_o, out_was_3d)
-
-        from ._sm100.fold_runtime import launch_fold, pscale_lp_for_pool
-
-        device = q.device
-        if out is None:
-            out_4d = torch.empty(
-                (self._batch_size, 1, self._num_qo_heads, self._head_dim),
-                dtype=self._o_data_type, device=device)
-            user_out = None
-        else:
-            user_out = out
-            out_4d = out.view(self._batch_size, 1, self._num_qo_heads,
-                              self._head_dim) if out.dim() == 3 else out
-
-        m = o_partial = l_partial = m_partial = None
-        if self._has_workspace:
-            m, o_partial = self._m, self._o_partial
-            l_partial, m_partial = self._l_partial, self._m_partial
-            # The kernel atomic-maxes into `m`, so it must hold the identity
-            # -inf at the start of EVERY launch. This fill is the kernel's own
-            # precondition, not benchmark overhead.
-            m.fill_(float("-inf"))
-
-        if pscale_lp is None:
-            # A device sync (`.max().item()` over the pool). Hoist it: the
-            # value only changes when the scale pool's max s_v changes, so a
-            # serving loop should compute it on cache writes and pass it here.
-            pscale_lp = pscale_lp_for_pool(
-                scale_pool, self._k_quant, self._v_quant,
-                page_size=self._page_size, head_dim=self._head_dim)
-
-        launch_fold(
-            self._compiled_fold,
-            kv_splits=self._kv_splits,
-            seqlens=self._seqlens,
-            table_offsets=self._table_offsets,
-            page_table=self._page_table,
-            q_bshd=q_view,
-            o_bshd=out_4d,
-            m=m, o_partial=o_partial, l_partial=l_partial, m_partial=m_partial,
-            scale_s=scale_s, scale_o=scale_o,
-            mKq=k_cache, mVq=v_cache, mScale=scale_pool,
-            pscale_lp=pscale_lp,
-            enable_pdl=enable_pdl,
-        )
-
-        if user_out is not None:
-            return user_out
-        if out_was_3d:
-            return out_4d.view(-1, self._num_qo_heads, self._head_dim)
-        return out_4d
-
-    def _run_quantized_sm90(self, q_view, k_cache, v_cache, scale_pool, out,
-                            scale_s, scale_o, out_was_3d) -> torch.Tensor:
-        """Validated on H100 SXM5.
-
-        The SM90 kernel's tensors are 3-D ``[B, HQ, D]`` (no prediction axis)
-        and its query is bf16, so this is not a shape-for-shape copy of the
-        SM100 path. It launches through ``pingpong_runtime.launch_pingpong``.
-        """
-        from ._sm90.pingpong_runtime import launch_pingpong
-
-        q_bhd = q_view[:, 0]
-        if out is None:
-            out_bhd = torch.zeros((self._batch_size, self._num_qo_heads,
-                                   self._head_dim), dtype=self._o_data_type,
-                                  device=q_bhd.device)
-        else:
-            out_bhd = out.view(self._batch_size, self._num_qo_heads, self._head_dim)
-        ws = self._sm90_ws
-        launch_pingpong(
-            self._compiled_fold, self._compiled_combine,
-            q_bhd=q_bhd, mKq=k_cache, mVq=v_cache, mScale=scale_pool,
-            block_table=self._sm90_block_table, seq_lens=self._seqlens,
-            o_partial=ws["o_partial"], out_bhd=out_bhd, lse=ws["lse"],
-            counters=ws["counters"], scale_s=scale_s, scale_o=scale_o,
-            outer_splits=self._kv_splits, num_kv_heads=self._num_kv_heads,
-            batch=self._batch_size,
-        )
-        if out is not None:
-            return out
-        if out_was_3d:
-            return out_bhd
-        return out_bhd.view(self._batch_size, 1, self._num_qo_heads, self._head_dim)
+                f"{name} has shape {tuple(shape)}; the plan is for [{b}, {hq}, {d}] or "
+                f"[{b}, 1, {hq}, {d}] (batch, query heads, head dimension)")
+        if not x.is_contiguous():
+            raise ValueError(f"{name} must be C-contiguous; got strides {tuple(x.stride())}")
+        if x.data_ptr() % 16:
+            raise ValueError(f"{name} must start 16-byte aligned")
+        return three_d
 
     @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
+        kv_cache: QuantKVCache = None,
+        *retired_positional,
         out: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
         o_scale: Optional[float] = None,
-        skip_softmax_threshold_scale_factor: Optional[float] = None,
-        lse: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
-        scale_pool: Optional[torch.Tensor] = None,
-        pscale_lp: Optional[float] = None,
-        k_pool_order: Optional[str] = None,
+        lse: Optional[torch.Tensor] = None,
+        q_descale: Optional[torch.Tensor] = None,
+        **retired,
     ) -> torch.Tensor:
-        """Run paged GQA decode.
+        """Decode one layer: attend each request's query over its pages of ``kv_cache``.
 
         Parameters
         ----------
         q : torch.Tensor
-            ``[batch_size * q_len_per_req, num_qo_heads, head_dim]`` or
-            ``[batch_size, q_len_per_req, num_qo_heads, head_dim]``.
-            ``q_len_per_req`` is read from ``q.shape`` at run time; it does
-            not have to match the value passed to :meth:`plan` (which is
-            only a compile-time tile-size hint).
-        k_cache, v_cache : torch.Tensor
-            Logical shape ``[num_pages, page_size, num_kv_heads, head_dim]``.
-            Both NHD-contiguous layouts and HND layouts (presented as a
-            transposed view) are accepted; the kernel handles arbitrary
-            strides as long as ``head_dim`` is innermost.
+            ``[batch_size, num_qo_heads, head_dim]`` or ``[batch_size, 1, num_qo_heads,
+            head_dim]`` with exactly the planned sizes, C-contiguous and 16-byte aligned, in the
+            planned query dtype (fp8 e4m3 on SM100, bf16 on SM90). A query sliced out of a fused
+            QKV projection is not contiguous; pass ``q.contiguous()``.
+        kv_cache : QuantKVCache
+            The layer's cache, built by ``layout.allocate`` or ``layout.bind`` for the layout
+            this plan was made with; a cache of any other layout is refused, even one whose
+            pools have the same shapes. It replaces the ``k_cache``, ``v_cache``,
+            ``scale_pool=``, ``pscale_lp=`` and ``k_pool_order=`` arguments, each of which
+            raises: the pools, their orders and the scale dtype all come from the cache's
+            layout, which ``create()`` resolved from the reader's own predicates, so there is
+            nothing left for a caller to declare.
         out : Optional[torch.Tensor]
-            Pre-allocated output buffer.  For atomic reduction it must be
-            zero-initialized before being passed in.
+            Keyword only. The output buffer, with the query's batch, head and dimension
+            sizes in either form, C-contiguous, 16-byte aligned, in the planned output dtype.
+            ``None`` allocates one per call; a serving loop should pass its own.
         sm_scale : Optional[float]
             Per-call override of the softmax scale set at plan() time.
         o_scale : Optional[float]
-            Output scale applied to the final O before it is written. The
-            cute-dsl kernel folds this in for free in the reduction
-            epilogue (no separate post-kernel multiply). Defaults to 1.0.
-        skip_softmax_threshold_scale_factor : Optional[float]
-            BLASST skip-softmax scale factor. The kernel divides this by
-            each batch's KV seqlen to obtain the per-request effective
-            threshold. Must be > 0 when set. ``None`` (default) dispatches
-            to the standard kernel; a value triggers lazy compile of the
-            BLASST variant on first use, or hits the precompiled cache if
-            ``plan(precompile_skip_softmax_kernel=True)`` was used.
+            Output scale applied to the final O before it is written, in the kernel's
+            epilogue. Defaults to 1.0.
+        enable_pdl : bool
+            Programmatic dependent launch on SM100.
         lse : Optional[torch.Tensor]
-            Pre-allocated float32 buffer of shape
-            ``(batch_size, q_len_per_req, num_qo_heads)`` (or the flat
-            equivalent ``(batch_size * q_len_per_req, num_qo_heads)``) to
-            receive the log-sum-exp (log2 base, matching flashinfer
-            convention). When ``None`` (default) the kernel skips the LSE
-            write; otherwise an LSE variant is lazily compiled on first
-            use.
-        scale_pool : Optional[torch.Tensor]
-            QUANTIZED MODE ONLY (``plan(bits=...)``), and REQUIRED there: the
-            per-(page, kv-head) affine block.  With the default
-            ``("token", head_dim)`` granularity for both tensors this is the
-            legacy interleaved f32 pool ``[num_pages, num_kv_heads,
-            page_size, 4] = (s_k, z_k, s_v, z_v)``; with any flex granularity
-            it is the flat sectioned block ``[num_pages, num_kv_heads,
-            block_tot]`` (see ``quant_layout.quant_block_offsets``) in
-            the dtype recorded by :attr:`scale_pool_dtype`.
-            In this mode ``k_cache``/``v_cache`` carry the packed uint8 code
-            pools (mKq/mVq) rather than dense K/V.
-            V has no pool-order declaration or runtime layout check. For the
-            main SM100 kernel, rebuild INT4 V caches created before the
-            K-major V alignment: their shape is unchanged but their byte
-            order is incompatible. Resolve the writer's order with
-            ``fosca.pool.v_store_perm_sm100_f4(bits)``; see
-            ``docs/K_STORE_PERM.md``. INT2 layouts are unchanged by that
-            alignment. On Hopper both code pools are in the chunk16 order that
-            ``IntPingPongDecodeSm90.code_pool_order`` names,
-            ``[num_pages, num_kv_heads, per/16, 128, 16]``, and a row-major
-            ``[num_pages, num_kv_heads, 128, per]`` pool is refused by shape
-            (``_sm90/serving_cache.py``, CODE POOL ORDERS). A row-major pool
-            RESHAPED to that shape is not detectable and reads wrong at INT4;
-            convert with ``serving_cache.code_rows_to_order``.
-        pscale_lp : Optional[float]
-            QUANTIZED MODE ONLY: the launch-global P-scale exponent
-            ``floor(log2(448 / max s_v))``.  ``None`` (default) derives it
-            from ``scale_pool``, which costs a device sync per call — pass it
-            explicitly in a serving loop and recompute it only when the pool's
-            max scale changes.
-        k_pool_order : Optional[str]
-            QUANTIZED MODE ONLY, and MANDATORY for every configuration that reads
-            a permuted K pool: INT4 at every configuration (the raw-feed store
-            shuffle) and INT2 with the E2M1 feed at either K axis. A caller
-            that omits it where it is required is refused rather than run wrong.
-            ``"permuted"`` says the K codes were reordered by
-            ``fosca.pool.k_store_perm_sm100_f4`` before packing; ``"logical"``
-            says they are in plain ``pack_rows`` order. ``None`` is accepted
-            only for configurations that read logical order: dense callers and
-            the INT2 e4m3 feed.
+            Keyword only. An fp32 ``[batch_size, num_qo_heads]`` tensor, C-contiguous, 16-byte
+            aligned, on this wrapper's device, that receives each query row's log-sum-exp in
+            the NATURAL log: the log of the normalizer the kernel divides O by,
+            ``LSE[b, h] = ln sum_j exp(z_j)`` over the kernel's own scores ``z_j``, so merging
+            ``(out, lse)`` with another attention state by the natural-log rule (SGLang's
+            ``merge_state``) reproduces this decode's output exactly. With token-wise K the
+            scores are ``z_j = sm_scale * d_{b,h} * (q_{b,h} . k_j)``: ``sm_scale`` the call's
+            softmax scale, ``d`` the SM100 query descale (1 without one), ``q`` the query the
+            kernel reads (fp8 e4m3 on SM100, bf16 on SM90) and ``k_j`` the dequantized key.
+            With channel-wise K the kernel first multiplies the query by each channel's K scale
+            and rounds the product to its MMA operand (e4m3 on SM100; bf16 on SM90, with the
+            softmax scale in it), so its scores, and the LSE, differ from that formula by that
+            rounding (docs/integration.md gives its size). ``o_scale`` is in neither. Every
+            request must have ``seq_len >= 1``:
+            a row of length 0 gets an unspecified LSE (and, in SM100's unsplit builds, an
+            unspecified output row). The first call with ``lse`` compiles the variant that
+            stores it, where one is needed (docs/integration.md); SM90's one-split plans
+            return it from the plan's own kernel.
+        q_descale : Optional[torch.Tensor]
+            SM100 only: an fp32 device tensor ``[batch_size, num_qo_heads]``, any strides (a
+            per-tensor value may be a stride-0 expand), with the effective query
+            ``q_fp8 * q_descale``. SM90 reads a bf16
+            query and refuses it. Every factor must be finite and strictly positive: the
+            kernel takes each row's score maximum before it applies the factor, so a zero,
+            negative or non-finite factor gives wrong output without an error (a value check
+            would wait for the device, so none is made). With ``q_descale``, ``sm_scale`` stays
+            the model's attention scale; fold a per-tensor descale into ``sm_scale`` only when
+            ``q_descale`` is None, or it is applied twice.
 
-            IT IS REQUIRED BECAUSE NOTHING IN THE POOL REVEALS IT. Both orders
-            have the same dtype, the same shape and the same byte count, and the
-            wrong pairing decodes to finite, plausible values with every K channel
-            taken from the wrong slot inside its packed-word group (16 channels
-            at INT2, 8 at INT4). This argument
-            is checked against the planned configuration, so a declaration that
-            contradicts the plan raises; a declaration that contradicts the POOL
-            cannot be caught here, which is why a caller should resolve it from
-            ``IntDecodeSm100.k_pool_is_permuted``. That is what a pool writer and
-            this guard both ask. The kernel itself no longer consults it to
-            select a deposit: its f4 K read is unconditional two masks.
-            See ``docs/K_STORE_PERM.md``.
+        Returns the output: ``out`` when passed, else a new tensor shaped like ``q``.
         """
+        if retired_positional or retired or not isinstance(kv_cache, QuantKVCache):
+            _refuse_retired(
+                "PagedDecodeWrapper.run", retired_positional, retired, _RETIRED_RUN_ARGS,
+                "build the cache with layout.allocate() or layout.bind() and call "
+                "run(q, kv_cache, out=...)")
+            raise TypeError(f"PagedDecodeWrapper.run: kv_cache must be a QuantKVCache; got "
+                            f"{type(kv_cache).__name__}. The tensor form run(q, k_cache, "
+                            f"v_cache, scale_pool=, pscale_lp=, k_pool_order=) is retired")
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
-        if self._bits is not None:
-            if skip_softmax_threshold_scale_factor is not None or lse is not None:
-                raise NotImplementedError(
-                    "quantized decode supports neither BLASST skip-softmax nor "
-                    "an LSE output (the fold kernels have no l_bsh wiring)")
-            return self._run_quantized(q, k_cache, v_cache, scale_pool, out,
-                                       sm_scale, o_scale, pscale_lp, enable_pdl,
-                                       k_pool_order=k_pool_order)
-        raise RuntimeError(
-            "unreachable: run() requires a quantized plan. plan() rejects a "
-            "missing `bits`, so self._bits cannot be None here."
+        # IDENTITY FIRST, so the usual case costs one pointer comparison; the field-wise
+        # comparison of two frozen dataclasses is the fallback, and it tells apart layouts
+        # whose pools have identical shapes (K channel-64 against channel-128).
+        layout = kv_cache.layout
+        if layout is not self._layout and layout != self._layout:
+            raise ValueError(
+                f"kv_cache was built for another layout than this plan's:\n  cache: {layout}\n"
+                f"  plan:  {self._layout}")
+        if kv_cache.device != self.device:
+            raise ValueError(f"kv_cache is on {kv_cache.device}; this wrapper plans for "
+                             f"{self.device}")
+        out_was_3d = self._check_tensor("q", q, self._q_data_type)
+        if lse is not None:
+            # The kernels store [B, HQ] through a compact view and assume 16-byte alignment.
+            if (lse.dtype != torch.float32 or lse.device != self.device
+                    or lse.shape != (self._batch_size, self._num_qo_heads)
+                    or not lse.is_contiguous() or lse.data_ptr() % 16):
+                raise ValueError(
+                    f"lse must be a C-contiguous, 16-byte aligned fp32 "
+                    f"[{self._batch_size}, {self._num_qo_heads}] tensor on {self.device}; got "
+                    f"{lse.dtype} {tuple(lse.shape)} strides {tuple(lse.stride())} on "
+                    f"{lse.device}")
+        if out is not None:
+            self._check_tensor("out", out, self._o_data_type)
+        if q_descale is not None:
+            if self._is_sm90:
+                raise ValueError(
+                    "q_descale is for SM100's fp8 query; the SM90 decode reads a bf16 query")
+            if q_descale.dtype != torch.float32 or q_descale.device != self.device \
+                    or q_descale.shape != (self._batch_size, self._num_qo_heads):
+                raise ValueError(
+                    f"q_descale must be an fp32 [{self._batch_size}, {self._num_qo_heads}] "
+                    f"tensor on {self.device}; got {q_descale.dtype} "
+                    f"{tuple(q_descale.shape)} on {q_descale.device}")
+        scale_s = self._sm_scale if sm_scale is None else sm_scale
+        scale_o = 1.0 if o_scale is None else o_scale
+        with _utils.on_device(self.device):
+            return self._run_quantized(q, kv_cache, out, scale_s, scale_o, enable_pdl,
+                                       out_was_3d, q_descale, lse)
+
+    def update(self, lengths) -> None:
+        """Graph mode's per-step call (`_GraphDecodeWrapper.update`); an eager wrapper plans
+        each step with `plan()` instead."""
+        raise RuntimeError("update() is graph mode's per-step call: build the wrapper with "
+                           "use_cuda_graph=True and plan() it first")
+
+    def _run_quantized(self, q, kv_cache, out, scale_s, scale_o, enable_pdl,
+                       out_was_3d, q_descale=None, lse=None) -> torch.Tensor:
+        """The launch, after `run()`'s checks: SM90 through `_run_quantized_sm90`, SM100 here."""
+        if self._is_sm90:
+            return self._run_quantized_sm90(q, kv_cache, out, scale_s, scale_o, out_was_3d,
+                                            lse)
+        from ._sm100.fold_runtime import launch_fold
+
+        b, hq, d = self._batch_size, self._num_qo_heads, self._head_dim
+        q_bshd = q.view(b, 1, hq, d)
+        out_4d = (torch.empty((b, 1, hq, d), dtype=self._o_data_type, device=self.device)
+                  if out is None else out.view(b, 1, hq, d))
+
+        o_partial = l_partial = m_partial = None
+        if self._has_workspace:
+            o_partial = self._o_partial
+            l_partial, m_partial = self._l_partial, self._m_partial
+
+        # THE VARIANT FOLLOWS FROM THE CALL (`_fold_variant`): the plan's own kernel, or the one
+        # that reads a query descale, returns the log-sum-exp, or both.
+        variant = (q_descale is not None, lse is not None)
+        compiled = (self._compiled_fold if variant == (False, False)
+                    else self._fold_variant(*variant))
+        launch_fold(
+            compiled,
+            kv_splits=self._kv_splits,
+            seqlens=self._seqlens,
+            table_offsets=self._table_offsets,
+            page_table=self._page_table,
+            q_bshd=q_bshd,
+            o_bshd=out_4d,
+            o_partial=o_partial, l_partial=l_partial, m_partial=m_partial,
+            scale_s=scale_s, scale_o=scale_o,
+            mKq=kv_cache.k_codes, mVq=kv_cache.v_codes, mScale=kv_cache.scales,
+            v_max_hist=kv_cache.v_max_hist if self._reads_v_max_hist else None,
+            q_descale=q_descale,
+            lse=None if lse is None else lse.view(b, 1, hq),
+            enable_pdl=enable_pdl,
         )
+        if out is not None:
+            return out
+        return out_4d.view(b, hq, d) if out_was_3d else out_4d
+
+    def _fold_variant(self, has_q_descale: bool, has_lse: bool):
+        """The plan's SM100 kernel in the variant a call asks for, compiled on first use and
+        kept in `_fold_variants`: at most four objects per plan, the plan's own and the ones
+        that read a query descale, return the log-sum-exp, or both. A split build's decode
+        kernel is the same either way; only its reduction kernel stores the LSE
+        (`IntDecodeSm100.__call__`)."""
+        key = (has_q_descale, has_lse)
+        compiled = self._fold_variants.get(key)
+        if compiled is None:
+            compiled, _ = _get_compiled_fold_kernel(
+                *self._fold_key, has_q_descale=has_q_descale, has_lse=has_lse)
+            self._fold_variants[key] = compiled
+        return compiled
+
+    def _sm90_lse_kernel(self):
+        """The SM90 split plan's merge that returns the log-sum-exp, compiled on first use and
+        kept in `_sm90_lse_merge`: the fused-combine decode built with `has_lse` when the plan
+        fuses its combine, else `SplitKCombineLse`, which runs after the plan's own decode."""
+        if self._sm90_lse_merge is None:
+            self._sm90_lse_merge = (
+                _get_compiled_pingpong_kernel(*self._sm90_compile_args, True)
+                if self._sm90_fused_combine else
+                _get_compiled_splitk_combine(self._head_dim, self._o_data_type, True))
+        return self._sm90_lse_merge
+
+    def _run_quantized_sm90(self, q, kv_cache, out, scale_s, scale_o,
+                            out_was_3d, lse=None) -> torch.Tensor:
+        """Validated on H100 SXM5.
+
+        The SM90 kernel's tensors are 3-D ``[B, HQ, D]`` (no prediction axis)
+        and its query is bf16, so this is not a shape-for-shape copy of the
+        SM100 path. It launches through ``pingpong_runtime.launch_pingpong``.
+
+        ``lse`` takes one of three routes, each the smallest change to its plan. A one-split
+        plan's decode already writes every split's natural-log LSE, so it is handed the
+        caller's tensor viewed ``[1, B, HQ]`` in place of the workspace's, and the kernel is
+        the plan's own. A split plan returns it from its merge: the fused-combine decode built
+        with ``has_lse``, or, after the plan's own decode, ``SplitKCombineLse``.
+        """
+        from ._sm90.pingpong_runtime import launch_pingpong
+
+        b, hq, d = self._batch_size, self._num_qo_heads, self._head_dim
+        q_bhd = q.view(b, hq, d)
+        out_bhd = (torch.zeros((b, hq, d), dtype=self._o_data_type, device=self.device)
+                   if out is None else out.view(b, hq, d))
+        ws = self._sm90_ws
+        compiled, combine, split_lse, lse_out = (
+            self._compiled_fold, self._compiled_combine, ws["lse"], None)
+        if lse is not None:
+            if self._kv_splits == 1:
+                split_lse = lse.view(1, b, hq)
+            elif self._sm90_fused_combine:
+                compiled, lse_out = self._sm90_lse_kernel(), lse
+            else:
+                combine, lse_out = self._sm90_lse_kernel(), lse
+        launch_pingpong(
+            compiled, combine,
+            q_bhd=q_bhd, mKq=kv_cache.k_codes, mVq=kv_cache.v_codes, mScale=kv_cache.scales,
+            block_table=self._sm90_block_table, seq_lens=self._seqlens,
+            o_partial=ws["o_partial"], out_bhd=out_bhd, lse=split_lse,
+            counters=ws["counters"], scale_s=scale_s, scale_o=scale_o,
+            outer_splits=self._kv_splits, num_kv_heads=self._num_kv_heads,
+            batch=b, lse_out=lse_out,
+        )
+        if out is not None:
+            return out
+        return out_bhd if out_was_3d else out_bhd.view(b, 1, hq, d)
+
+
+class _GraphDecodeWrapper(PagedDecodeWrapper):
+    """CUDA-graph mode (module docstring): what ``PagedDecodeWrapper(workspace,
+    use_cuda_graph=True)`` builds. It shares eager mode's `run()` checks, kernels' compile
+    arguments and unsplit builds, and replaces only `plan()`, `update()` and the launch, so
+    that eager mode's own `plan()` and `run()` run no graph-mode code."""
+
+    def __init__(self, float_workspace_buffer: torch.Tensor, use_cuda_graph: bool = True) -> None:
+        super().__init__(float_workspace_buffer, use_cuda_graph)
+        #: the bucket's `_GraphPlan`, set by its one `plan()` and kept for the wrapper's life
+        self._graph = None
+
+    @flashinfer_api
+    def plan(self, indptr=None, indices=None, seq_lens=None, num_qo_heads=None, layout=None,
+             *retired_positional, q_data_type=None, o_data_type=None, sm_scale=None,
+             kv_splits=None, reduction="auto", q_len_per_req=1, max_kv_len=None,
+             non_blocking=True, page_table=None, lse=False, q_descale=False,
+             **retired) -> None:
+        """Graph mode's plan: ONE per wrapper, for one captured batch size (a bucket).
+
+        ``page_table`` (int32 ``[B, max_pages]``, row-major, row stride ``max_pages``) and
+        ``seq_lens`` (int32 ``[B]``) are the engine's own device buffers, which it keeps in step
+        with the lengths it passes to `update`; their addresses are recorded and no value is
+        read. ``max_kv_len`` is the bucket's largest context, which every `update` length must
+        stay within. ``lse`` and ``q_descale`` declare whether every `run` passes them, so that
+        exactly the builds the bucket launches are compiled here and none inside a capture.
+
+        It decides the bucket's build class (`graph_plan.Bucket`): a bucket that can split runs
+        the graph split build over a work list, and any other bucket runs eager's unsplit build
+        for its batch, reading the engine's buffers in place. It allocates the bucket's private
+        buffers (the device work list, the pinned host buffers, Hopper's fused-combine
+        counters), carves its scratch from the shared workspace (`graph_workspace_bytes`),
+        writes a one-chunk-per-request plan at length 1 so that a warm-up or capture before the
+        first `update` runs correctly, and waits for the device once, at set-up.
+
+        A second call raises, so that nothing a captured graph points at is ever freed or
+        replaced while the wrapper lives, and so does a call under stream capture, before any
+        set-up.
+        """
+        if self._graph is not None:
+            raise RuntimeError(
+                "a graph-mode wrapper plans once: a captured graph keeps the addresses of its "
+                "work list, counters and scratch for the wrapper's life; build one wrapper per "
+                "captured batch size")
+        # Before any set-up: plan() compiles, allocates and waits for the device once, none of
+        # which a stream capture may contain.
+        with _utils.on_device(self.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "plan() runs once, before capture: it compiles, allocates and waits for the "
+                    "device, which a stream capture may not contain")
+        if retired_positional or retired or not isinstance(layout, QuantKVLayout):
+            _refuse_retired(
+                "PagedDecodeWrapper.plan", retired_positional, retired, _RETIRED_PLAN_ARGS,
+                "graph mode plans with plan(page_table=, seq_lens=, num_qo_heads=, layout=, "
+                "max_kv_len=)")
+            raise TypeError(f"PagedDecodeWrapper.plan: layout must be a QuantKVLayout; got "
+                            f"{type(layout).__name__}")
+        if indptr is not None or indices is not None:
+            raise TypeError("graph mode's plan() takes the engine's page_table=, not indptr and "
+                            "indices")
+        if kv_splits is not None or reduction != "auto":
+            raise TypeError("graph mode plans each step's splits in update(); kv_splits= and "
+                            "reduction= are eager mode's")
+        if non_blocking is not True:
+            raise TypeError("non_blocking= is eager mode's; graph mode copies nothing at plan()")
+        if q_len_per_req != 1:
+            raise NotImplementedError(
+                f"quantized decode is plain decode only; got q_len_per_req={q_len_per_req}")
+        for name, flag in (("lse", lse), ("q_descale", q_descale)):
+            if not isinstance(flag, bool):
+                raise TypeError(f"graph mode's {name}= declares whether every run() passes "
+                                f"{name}; it is a bool, got {flag!r}")
+        arch = _utils.require_arch(self.device)
+        if layout.arch != arch:
+            raise ValueError(
+                f"the layout was resolved for {layout.arch} and this wrapper's device "
+                f"{self.device} is {arch}; create the layout for the device that decodes it")
+        _utils.require_dsl_target(arch)
+        _check_num_qo_heads(arch, num_qo_heads, layout.num_kv_heads)
+        if arch == "sm100" and layout.head_dim != 128:
+            raise NotImplementedError("SM100 head_dim=256 is eager-only; CUDA graphs retain D=128")
+        ratio = num_qo_heads // layout.num_kv_heads
+        if ratio > 8 or (arch == "sm100" and ratio < 3):
+            raise NotImplementedError(
+                f"graph {arch} decode supports GQA ratios "
+                + ("3--8" if arch == "sm100" else "1--8")
+                + f"; ratio {ratio} is supported in eager mode only")
+        if q_descale and arch == "sm90":
+            raise ValueError("q_descale is for SM100's fp8 query; the SM90 decode reads bf16")
+        for name, t, rank in (("page_table", page_table, 2), ("seq_lens", seq_lens, 1)):
+            if not isinstance(t, torch.Tensor) or t.dtype != torch.int32 or t.dim() != rank \
+                    or t.device != self.device or not t.is_contiguous():
+                raise ValueError(
+                    f"graph mode's {name} is the engine's contiguous int32 {rank}-D buffer on "
+                    f"{self.device}; got "
+                    + (f"{t.dtype} {tuple(t.shape)} strides {tuple(t.stride())} on {t.device}"
+                       if isinstance(t, torch.Tensor) else type(t).__name__))
+        batch, max_pages = page_table.shape
+        if batch == 0 or seq_lens.shape != (batch,):
+            raise ValueError(f"page_table holds {batch} rows and seq_lens {tuple(seq_lens.shape)}; "
+                             f"a bucket has one length per row, and at least one row")
+        if batch * max_pages > 2**31 - 1:
+            raise ValueError(f"the page table's {batch} x {max_pages} entries exceed int32 offsets")
+        if (isinstance(max_kv_len, bool) or not isinstance(max_kv_len, int)
+                or not 1 <= max_kv_len <= min(_GRAPH_MAX_KV_LEN, _QUANT_PAGE_SIZE * max_pages)):
+            raise ValueError(
+                f"max_kv_len is the bucket's largest context, an int in [1, "
+                f"{min(_GRAPH_MAX_KV_LEN, _QUANT_PAGE_SIZE * max_pages)}] (at most 2^31 - 64, "
+                f"and the {max_pages} pages a page-table row holds); got {max_kv_len!r}")
+        q_data_type, o_data_type = _resolve_io_dtypes(arch, layout, q_data_type, o_data_type)
+        bucket = _graph_bucket(arch, layout, batch, max_kv_len, get_num_sm(self.device))
+        graph = _GraphPlan(bucket, page_table, seq_lens, lse, q_descale)
+        try:
+            self._layout, self._arch, self._is_sm90 = layout, arch, arch == "sm90"
+            self._bits, self._k_quant, self._v_quant = layout.bits, layout.k_quant, layout.v_quant
+            self._q_data_type, self._o_data_type = q_data_type, o_data_type
+            self._num_qo_heads, self._num_kv_heads = num_qo_heads, layout.num_kv_heads
+            self._head_dim, self._page_size = layout.head_dim, _QUANT_PAGE_SIZE
+            self._sm_scale = layout.head_dim**-0.5 if sm_scale is None else sm_scale
+            self._batch_size, self._max_kv_len = batch, max_kv_len
+            self._quant_kernel_kwargs = dict(layout._kernel_kwargs)
+            with _utils.on_device(self.device):
+                if self._is_sm90:
+                    self._plan_graph_sm90(graph)
+                else:
+                    self._plan_graph_sm100(graph)
+                if bucket.split_capable:
+                    self._graph_buffers(graph)
+                torch.cuda.synchronize(self.device)
+        except Exception:
+            self._invalidate_plan()
+            raise
+        self._graph = graph
+        self._planned = True
+
+    def _graph_scratch(self, words):
+        """The first `words` f32 words of the shared workspace, refusing a workspace too small."""
+        workspace = self._float_workspace_buffer.view(torch.float32)
+        if workspace.numel() < words:
+            raise RuntimeError(
+                f"this graph bucket's launch uses {4 * words} bytes of workspace, and the "
+                f"workspace holds {workspace.nbytes}; size it with graph_workspace_bytes()")
+        return workspace[:words]
+
+    def _plan_graph_sm90(self, graph) -> None:
+        """Hopper's builds and scratch for a graph bucket: eager's unsplit build, or the graph split
+        build with the merge eager would use at the same batch, the fused last-CTA combine at
+        B * HKV <= 16 and the external combine above (`scheduler.plan_fused_combine`)."""
+        from ._sm90.scheduler import plan_fused_combine
+
+        bucket, b, hq, d = graph.bucket, self._batch_size, self._num_qo_heads, self._head_dim
+        fused = False
+        if bucket.split_capable:
+            fused = plan_fused_combine(b, self._num_kv_heads, bucket.s_tight)
+            override = self._quant_kernel_kwargs.get("fused_combine")
+            if override is not None:
+                fused = bool(override)
+        args = (self._page_size, hq, self._num_kv_heads, d, self._bits,
+                graph_plan.SPLIT_CTAS_PER_SM["sm90"], fused, tuple(self._k_quant),
+                tuple(self._v_quant), self._layout.scale_dtype, self._o_data_type)
+        if bucket.split_capable:
+            graph.decode = _get_compiled_pingpong_graph_kernel(*args, graph.lse and fused)
+            if not fused:
+                graph.combine = _get_compiled_splitk_combine_graph(d, self._o_data_type,
+                                                                   graph.lse)
+        else:
+            graph.decode = _get_compiled_pingpong_kernel(*args)
+        self._sm90_fused_combine = fused
+        scratch = self._graph_scratch(bucket.s_tight * b * hq * (d + 1))
+        graph.o_partial = scratch[:bucket.s_tight * b * hq * d].view(bucket.s_tight, b, hq, d)
+        graph.split_lse = scratch[bucket.s_tight * b * hq * d:].view(bucket.s_tight, b, hq)
+        graph.counters = torch.zeros(b * self._num_kv_heads, dtype=torch.int32,
+                                     device=self.device)
+
+    def _plan_graph_sm100(self, graph) -> None:
+        """Blackwell's builds for a graph bucket: eager's unsplit build for the batch, planned by
+        eager's own step (`_plan_quantized_sm100` at one split), persistent or one item per CTA
+        by eager's rule, which reads the engine's page table through `table_offsets[b] = b *
+        max_pages`; or the graph split build with the reduction kernel
+        (`_get_compiled_fold_graph_kernel`), which computes that offset itself, its partials at
+        the bucket's split capacity carved from the shared workspace."""
+        from ._sm100.fold_runtime import reads_v_max_hist
+
+        bucket = graph.bucket
+        if not bucket.split_capable:
+            self._plan_quantized_sm100(1, "none")
+            graph.decode = (self._fold_variant(graph.q_descale, graph.lse)
+                            if graph.q_descale or graph.lse else self._compiled_fold)
+            graph.table_offsets = torch.arange(self._batch_size, dtype=torch.int32,
+                                               device=self.device) * graph.page_table.shape[1]
+            return
+        # the layout's kernel arguments, as eager's plan passes them (`_plan_quantized_sm100`)
+        kkw = dict(self._quant_kernel_kwargs)
+        if (self._k_quant, self._v_quant) != (("token", self._head_dim),) * 2:
+            kkw["k_quant"], kkw["v_quant"] = self._k_quant, self._v_quant
+        self._reads_v_max_hist = reads_v_max_hist(self._page_size, self._head_dim, kkw)
+        graph.decode, applied = _get_compiled_fold_graph_kernel(
+            self._page_size, self._num_qo_heads, self._num_kv_heads, self._head_dim, self._bits,
+            _torch_to_cutlass(self._o_data_type), tuple(sorted(kkw.items())), graph.q_descale,
+            graph.lse)
+        self._assert_bits_tuning_applied(applied)
+        graph.o_partial, graph.l_partial, graph.m_partial = _slice_workspace(
+            self._float_workspace_buffer, bucket.s_tight, self._batch_size, 1,
+            self._num_qo_heads, self._head_dim)
+
+    def _graph_buffers(self, graph) -> None:
+        """A split bucket's device work list, holding the one-chunk plan at length 1 until the
+        first `update`, and the pinned host buffers each `update` writes into in turn."""
+        bucket = graph.bucket
+        words = graph_plan.words(bucket.wave, bucket.batch)
+        ones = np.ones(bucket.batch, dtype=np.int64)
+        initial = np.empty(words, dtype=np.int32)
+        bucket.write(initial, ones, bucket.chunks(ones))
+        graph.work = torch.from_numpy(initial).to(self.device)
+        for _ in range(_GRAPH_HOST_BUFFERS):
+            host = _pinned_words(words)
+            graph.host.append(host)
+            graph.host_words.append(host.numpy())
+            graph.events.append(torch.cuda.Event())
+
+    def update(self, lengths) -> None:
+        """Graph mode, once per step, outside the graph and before its replay: plan the step from
+        its host `lengths` (one integer per request of the bucket, each in [1, max_kv_len]; a list,
+        a numpy array or a CPU tensor) and copy the work list to the device.
+
+        It runs on the stream the graph replays on, the same stream at every call, and refuses
+        to run under stream capture, because a captured update would replay one frozen plan.
+        It never waits for the device as a whole: it writes the plan into the next of
+        `_GRAPH_HOST_BUFFERS` pinned buffers, waiting first for that buffer's previous copy, and
+        enqueues one asynchronous copy of the whole work list. A bucket that cannot split has no
+        work list and reads the lengths from the engine's `seq_lens`, so its `update` checks the
+        lengths and the stream, and copies nothing. One update serves every layer of the step.
+        """
+        graph = self._graph
+        if graph is None:
+            raise RuntimeError("update() follows the graph-mode wrapper's plan(); plan() it "
+                               "first")
+        with _utils.on_device(self.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "update() runs outside the graph, before each replay: under capture it "
+                    "would freeze one step's plan into every replay")
+            lengths = _graph_host_lengths(lengths, self._batch_size, self._max_kv_len)
+            stream = torch.cuda.current_stream()
+            if graph.stream is None:
+                graph.stream = stream
+            elif stream != graph.stream:
+                raise RuntimeError(
+                    "update() runs on the stream the graph replays on, the stream of its first "
+                    f"call ({graph.stream}); this call is on {stream}")
+            if graph.work is None:
+                return
+            slot = graph.next_host
+            graph.next_host = (slot + 1) % _GRAPH_HOST_BUFFERS
+            if graph.recorded[slot]:
+                graph.events[slot].synchronize()
+            bucket = graph.bucket
+            splits = bucket.chunks(lengths)
+            if graph.host_splits[slot] is not None and np.array_equal(graph.host_splits[slot],
+                                                                       splits):
+                bucket.write_lengths(graph.host_words[slot], lengths, splits)
+            else:
+                bucket.write(graph.host_words[slot], lengths, splits)
+                graph.host_splits[slot] = splits
+            graph.work.copy_(graph.host[slot], non_blocking=True)
+            graph.events[slot].record(stream)
+            graph.recorded[slot] = True
+
+    def _run_quantized(self, q, kv_cache, out, scale_s, scale_o, enable_pdl,
+                       out_was_3d, q_descale=None, lse=None) -> torch.Tensor:
+        """Graph mode's launch, after `run()`'s checks, which this mode shares with eager's:
+        only host comparisons and the launches of the builds `plan()` compiled, so that a
+        captured call allocates, compiles and reads nothing. ``out`` is required, and the call
+        must pass exactly the variants the plan declared."""
+        graph = self._graph
+        if out is None:
+            raise ValueError("graph mode's run() needs out=: a captured call writes a buffer the "
+                             "engine owns, and allocates nothing")
+        if (lse is not None) != graph.lse or (q_descale is not None) != graph.q_descale:
+            raise ValueError(
+                f"this bucket was planned with lse={graph.lse} and q_descale={graph.q_descale}, "
+                f"and plan() compiled only those builds; this call passes "
+                f"lse={'a tensor' if lse is not None else None} and "
+                f"q_descale={'a tensor' if q_descale is not None else None}")
+        b, hq, d = self._batch_size, self._num_qo_heads, self._head_dim
+        if self._is_sm90:
+            from ._sm90.pingpong_runtime import launch_pingpong, launch_pingpong_graph
+
+            q_bhd, out_bhd = q.view(b, hq, d), out.view(b, hq, d)
+            pools = dict(mKq=kv_cache.k_codes, mVq=kv_cache.v_codes, mScale=kv_cache.scales)
+            if graph.work is not None:
+                slots, splits = graph.work_views()
+                launch_pingpong_graph(
+                    graph.decode, graph.combine, q_bhd=q_bhd, **pools,
+                    block_table=graph.page_table, o_partial=graph.o_partial, out_bhd=out_bhd,
+                    lse=graph.split_lse, counters=graph.counters, work=slots, splits=splits,
+                    scale_s=scale_s, scale_o=scale_o, num_kv_heads=self._num_kv_heads,
+                    lse_out=lse)
+            else:
+                # eager's one-split launch, whose decode stores the LSE where it is pointed
+                launch_pingpong(
+                    graph.decode, None, q_bhd=q_bhd, **pools, block_table=graph.page_table,
+                    seq_lens=graph.seq_lens, o_partial=graph.o_partial, out_bhd=out_bhd,
+                    lse=graph.split_lse if lse is None else lse.view(1, b, hq),
+                    counters=graph.counters, scale_s=scale_s, scale_o=scale_o, outer_splits=1,
+                    num_kv_heads=self._num_kv_heads, batch=b)
+            return out
+        from ._sm100.fold_runtime import launch_fold, launch_fold_graph
+
+        common = dict(
+            page_table=graph.page_table.view(-1), q_bshd=q.view(b, 1, hq, d),
+            o_bshd=out.view(b, 1, hq, d), scale_s=scale_s, scale_o=scale_o,
+            mKq=kv_cache.k_codes, mVq=kv_cache.v_codes, mScale=kv_cache.scales,
+            v_max_hist=kv_cache.v_max_hist if self._reads_v_max_hist else None,
+            q_descale=q_descale, lse=None if lse is None else lse.view(b, 1, hq),
+            enable_pdl=enable_pdl)
+        if graph.work is not None:
+            slots, splits = graph.work_views()
+            launch_fold_graph(graph.decode, seqlens=graph.seq_lens, o_partial=graph.o_partial,
+                              l_partial=graph.l_partial, m_partial=graph.m_partial, work=slots,
+                              split_counts=splits, max_pages=graph.page_table.shape[1],
+                              **common)
+        else:
+            launch_fold(graph.decode, kv_splits=1, seqlens=graph.seq_lens,
+                        table_offsets=graph.table_offsets, **common)
+        return out

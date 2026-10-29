@@ -3,20 +3,13 @@
 """`run()` inside a CUDA graph, on the device.
 
 A serving engine captures its decode step, so the call has to be capturable and
-has to replay the same answer. Both architectures are checked here with the fast
-path a capture needs: a caller-owned `out` buffer, and the planned scale factor
-passed in rather than derived, since deriving it is a device synchronisation.
+has to replay the same answer. The capture uses the fast path it needs: a
+caller-owned `out` buffer.
 """
 import pytest
 import torch
 
-from fosca import (
-    PagedDecodeWrapper,
-    get_capabilities,
-    is_supported,
-    pool,
-    pool_sm90,
-)
+from fosca import PagedDecodeWrapper, QuantKVLayout, get_capabilities, is_supported
 
 pytestmark = [
     pytest.mark.gpu,
@@ -28,51 +21,29 @@ BATCH, KV = 2, 8192
 
 
 def _planned(bits):
-    """Build pools for the running architecture and return (call, out, wrapper)."""
-    nt = KV // PS
+    device = "cuda"
     arch = get_capabilities()["arch"]
-    w = PagedDecodeWrapper(torch.empty(256 * 1024 * 1024, dtype=torch.uint8,
-                                       device="cuda"))
-    indptr = torch.arange(BATCH + 1, device="cuda", dtype=torch.int32) * nt
+    q_dtype = torch.float8_e4m3fn if arch == "sm100" else torch.bfloat16
+    nt = KV // PS
+    npages = BATCH * nt
+    tokens = BATCH * KV
 
-    if arch == "sm100":
-        k = torch.randn(BATCH * nt, PS, HKV, D, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn_like(k)
-        k_perm = pool.k_store_perm_sm100_f4(bits)
-        v_perm = pool.v_store_perm_sm100_f4(bits)
-        mKq, mVq, mScale = pool.build_pools(k, v, bits,
-                                                k_store_perm=k_perm,
-                                                v_store_perm=v_perm)
-        seq = torch.full((BATCH,), KV, device="cuda", dtype=torch.int32)
-        q_bf16 = torch.randn(BATCH, HQ, D, device="cuda", dtype=torch.bfloat16)
-        q, q_scale = pool.quantize_q_fp8(q_bf16)
-        w.plan(indptr, torch.arange(BATCH * nt, device="cuda", dtype=torch.int32),
-               seq, num_qo_heads=HQ, num_kv_heads=HKV, head_dim=D, page_size=PS,
-               q_data_type=torch.float8_e4m3fn, bits=bits,
-               sm_scale=D ** -0.5 / q_scale, max_kv_len=KV)
-        lp = w.pscale_lp(mScale)
-        out = torch.empty(BATCH, HQ, D, device="cuda", dtype=torch.bfloat16)
-
-        def call():
-            w.run(q, mKq, mVq, out=out, scale_pool=mScale, pscale_lp=lp,
-                  k_pool_order="permuted")
-
-        return call, out
-
-    k = torch.randn(BATCH, HKV, KV, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(tokens, HKV, D, device=device, dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    seq = torch.full((BATCH,), KV, device="cuda", dtype=torch.int32)
-    cache = pool_sm90.build_pools_sm90(k, v, bits, seq_lens=seq)
-    q = torch.randn(BATCH, HQ, D, device="cuda", dtype=torch.bfloat16)
-    w.plan(indptr, cache.block_table.reshape(-1).to(torch.int32), seq,
-           num_qo_heads=HQ, num_kv_heads=HKV, head_dim=D, page_size=PS,
-           q_data_type=torch.bfloat16, bits=bits, max_kv_len=KV)
-    out = torch.empty(BATCH, HQ, D, device="cuda", dtype=torch.bfloat16)
+    layout = QuantKVLayout.create(bits=bits, head_dim=D, num_kv_heads=HKV, device=device)
+    cache = layout.allocate(npages)
+    cache.append(k, v, torch.arange(tokens, device=device, dtype=torch.int64))
 
-    def call():
-        w.run(q, cache.codes_k, cache.codes_v, out=out, scale_pool=cache.scales)
+    indptr = torch.arange(BATCH + 1, device=device, dtype=torch.int32) * nt
+    indices = torch.arange(npages, device=device, dtype=torch.int32)
+    seq = torch.full((BATCH,), KV, device=device, dtype=torch.int32)
 
-    return call, out
+    q = torch.randn(BATCH, HQ, D, device=device, dtype=torch.bfloat16).to(q_dtype)
+    w = PagedDecodeWrapper(torch.empty(256 * 1024 * 1024, dtype=torch.uint8,
+                                       device=device))
+    w.plan(indptr, indices, seq, num_qo_heads=HQ, layout=layout)
+    out = torch.empty(BATCH, HQ, D, device=device, dtype=torch.bfloat16)
+    return (lambda: w.run(q, cache, out=out)), out
 
 
 @pytest.mark.parametrize("bits", [2, 4])

@@ -1,21 +1,15 @@
-# Copyright 2026 Donglin Zhuang
-# SPDX-License-Identifier: Apache-2.0
-"""Quantized-KV paged GQA decode for Hopper (SM90) and Blackwell (SM100).
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+"""fosca: standalone CuTe DSL GQA paged-decode kernels for SM90/SM100.
 
-The public API is architecture-agnostic: `PagedDecodeWrapper` dispatches to the
-right kernel and gates the features that kernel supports. Pool construction lives in
-`fosca.pool` (SM100) and `fosca.pool_sm90` (SM90).
+Public API is arch-agnostic; internal SM90/SM100 dispatch + feature gating are hidden.
+`QuantKVLayout` resolves a layer's cache layout against the device's reader,
+`QuantKVCache` holds that layer's pools and writes them, and `PagedDecodeWrapper`
+plans and runs the decode over a cache of its planned layout.
 """
-from . import pool, pool_sm90
 from ._utils import get_capabilities, is_supported
-from .wrapper import PagedDecodeWrapper
+from .kv_cache import QuantKVCache, QuantKVLayout
+from .wrapper import PagedDecodeWrapper, graph_workspace_bytes
 
 __version__ = "0.1.0"
-__all__ = [
-    "PagedDecodeWrapper",
-    "get_capabilities",
-    "is_supported",
-    "pool",
-    "pool_sm90",
-    "__version__",
-]
+__all__ = ["PagedDecodeWrapper", "QuantKVCache", "QuantKVLayout", "get_capabilities",
+           "graph_workspace_bytes", "is_supported", "__version__"]
