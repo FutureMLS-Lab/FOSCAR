@@ -150,24 +150,20 @@ same Q dtype.
 
 ## Benchmarks
 
-Decode latency on one NVIDIA B200, against FlashInfer and TensorRT-LLM's
-`trtllm-gen` decode kernels. The figure plots each kernel's latency divided by
-FlashInfer bf16's at the same shape, so the dashed line at 1.00 is bf16 and every
-other series reads as a fraction of it. The table gives the latency itself, in
-microseconds.
+Decode latency on one NVIDIA B200 at long context, against FlashInfer and
+TensorRT-LLM's `trtllm-gen` decode kernels. The figure plots the speedup over
+FlashInfer bf16 at the same shape, which is bf16's latency divided by the
+kernel's, so the dashed line at 1.00 is bf16 and higher is better. The table
+gives the latency itself, in microseconds.
 
-![Decode latency relative to FlashInfer bf16, against batch size at KV lengths 8K and 32K](docs/decode-latency.png)
+![Decode speedup over FlashInfer bf16, against batch size at KV lengths 32K and 128K](docs/decode-latency.png)
 
 | Batch | KV len | int2 | int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 8K | **11.5** | 12.4 | 16.1 | 12.5 | 13.0 |
-| 1 | 32K | **16.6** | 19.7 | 35.3 | 22.9 | 18.5 |
-| 8 | 8K | **22.9** | 28.2 | 55.5 | 31.6 | 22.9 |
-| 8 | 32K | **63.0** | 75.7 | 166.9 | 95.5 | 69.2 |
-| 32 | 8K | **65.1** | 75.2 | 170.2 | 95.5 | 72.2 |
-| 32 | 32K | **214.1** | 257.0 | 602.4 | 317.9 | 250.7 |
-| 128 | 8K | **214.6** | 248.0 | 600.4 | 314.8 | 223.3 |
-| 128 | 32K | **765.9** | 877.7 | 2323.6 | 1189.8 | 832.7 |
+| 1 | 32K | **17.0** | 19.3 | 35.5 | 23.3 | 18.0 |
+| 1 | 128K | **37.6** | 45.8 | 98.3 | 59.3 | 41.2 |
+| 8 | 32K | **63.8** | 75.7 | 166.7 | 95.5 | 70.0 |
+| 8 | 128K | **219.4** | 256.8 | 596.1 | 309.2 | 246.3 |
 
 What the columns store per cached value, including the scale and offset:
 
@@ -177,19 +173,19 @@ What the columns store per cached value, including the scale and offset:
 
 Two things follow from that table and are worth stating plainly.
 
-The 2-bit kernel reads about 1.8 times fewer bytes than NVFP4 and takes 0.86 to
-1.00 of its latency, so the traffic saving does not turn into latency: the
-dequantization and the on-chip work absorb most of it. Against bf16, which
-stores 6.4 times as many bits per value, it sits at 0.33 to 0.71 of the line.
+The 2-bit kernel is 2.09 to 2.72 times faster than bf16, which stores 6.4 times
+as many bits per value. Against NVFP4, which stores 1.8 times as many, it is 1.06
+to 1.12 times faster: at these lengths the traffic saving does reach the latency,
+but most of it is still absorbed by dequantization and the on-chip work.
 
 At 4 bits, where this package and NVFP4 store the same number of bits per value,
-the two are close and TRT-LLM is faster at seven of the eight shapes. The 2-bit
-setting is where this kernel wins.
+TRT-LLM is faster at every shape. The 2-bit setting is where this kernel wins,
+and the gap widens with context length.
 
 Measurement conditions: one query token per request, 32 query heads over 8 KV
 heads, `head_dim` 128, page size 64, paged cache, fp8 Q for this package and for
 TRT-LLM, bf16 for FlashInfer. All five columns were measured on the same B200
-card on 2026-10-28, in one session, through one timing function. The reported
+card on 2026-10-29, in one session, through one timing function. The reported
 number is the CUDA kernel span from CUPTI, over a cold L2, as the median of the
 fully observed iterations. It excludes host dispatch and the paged-attention
 wrapper around the kernel, so it is not an end-to-end serving latency.

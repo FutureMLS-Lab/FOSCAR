@@ -1,9 +1,9 @@
 """Render the decode-latency figure from `decode_latency.csv`.
 
-Two panels, one per KV length, with batch on a log axis. The y axis is each
-kernel's decode latency divided by FlashInfer bf16's at the same shape, so the
-dashed line at 1.00 is bf16 and every other series reads as a fraction of it.
-The absolute latencies are in the README table.
+Two panels, one per KV length, with batch on a log axis. The y axis is the
+speedup over FlashInfer bf16 at the same shape, which is bf16's latency divided by
+the kernel's, so the dashed line at 1.00 is bf16 and higher is better. The
+absolute latencies are in the README table.
 
 Run from the repository root:
 
@@ -58,7 +58,7 @@ for ax, kv in zip(axes, kv_lens):
             val = us(key, b, kv)
             if base and val:
                 xs.append(b)
-                ys.append(val / base)
+                ys.append(base / val)
         ax.plot(xs, ys, color=color, linewidth=2, marker=marker, markersize=5,
                 markeredgecolor="#ffffff", markeredgewidth=1.2, label=label,
                 zorder=3)
@@ -71,8 +71,8 @@ for ax, kv in zip(axes, kv_lens):
     ax.set_yscale("log")
     ax.set_xticks(batches)
     ax.set_xticklabels([str(b) for b in batches])
-    ax.set_yticks([0.3, 0.4, 0.5, 0.6, 0.8, 1.0])
-    ax.set_yticklabels(["0.3", "0.4", "0.5", "0.6", "0.8", "1.0"])
+    ax.set_yticks([1.0, 1.5, 2.0, 2.5, 3.0])
+    ax.set_yticklabels(["1.0", "1.5", "2.0", "2.5", "3.0"])
     ax.minorticks_off()
     ax.set_xlabel("batch size", color=INK_2, fontsize=9)
     ax.set_title(f"KV length {kv // 1024}K", color=INK, fontsize=10, pad=8)
@@ -83,7 +83,7 @@ for ax, kv in zip(axes, kv_lens):
         ax.spines[side].set_color(GRID)
     ax.tick_params(colors=INK_2, labelsize=8, length=3, width=0.8)
 
-axes[0].set_ylabel("decode latency / FlashInfer bf16", color=INK_2, fontsize=9)
+axes[0].set_ylabel("speedup over FlashInfer bf16", color=INK_2, fontsize=9)
 
 handles, labels = axes[0].get_legend_handles_labels()
 fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False,
