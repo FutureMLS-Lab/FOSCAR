@@ -1,9 +1,9 @@
-"""Render the decode-latency figure from `decode_latency.csv`.
+"""Render the decode-speedup figure from `decode_latency.csv`.
 
-Two panels, one per KV length, with batch on a log axis. The y axis is the
-speedup over FlashInfer bf16 at the same shape, which is bf16's latency divided by
-the kernel's, so the dashed line at 1.00 is bf16 and higher is better. The
-absolute latencies are in the README table.
+Two panels, one per batch size, with context length on a log axis. The y axis is
+the speedup over FlashInfer bf16 at the same shape, which is bf16's latency
+divided by the kernel's, so the dashed line at 1.00 is bf16 and higher is better.
+The latencies themselves are in the README table.
 
 Run from the repository root:
 
@@ -49,33 +49,32 @@ def us(kernel, batch, kv):
 fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.6), sharey=True)
 fig.patch.set_facecolor("#ffffff")
 
-for ax, kv in zip(axes, kv_lens):
+for ax, batch in zip(axes, batches):
     ax.set_facecolor("#ffffff")
     for key, label, color, marker in SERIES:
         xs, ys = [], []
-        for b in batches:
-            base = us(BASE, b, kv)
-            val = us(key, b, kv)
+        for kv in kv_lens:
+            base = us(BASE, batch, kv)
+            val = us(key, batch, kv)
             if base and val:
-                xs.append(b)
+                xs.append(kv)
                 ys.append(base / val)
         ax.plot(xs, ys, color=color, linewidth=2, marker=marker, markersize=5,
                 markeredgecolor="#ffffff", markeredgewidth=1.2, label=label,
                 zorder=3)
 
     ax.axhline(1.0, color=REF, linewidth=1.2, linestyle=(0, (4, 3)), zorder=2)
-    ax.annotate("FlashInfer bf16", xy=(batches[0], 1.0), xytext=(0, 6),
+    ax.annotate("FlashInfer bf16", xy=(kv_lens[0], 1.0), xytext=(0, 6),
                 textcoords="offset points", color=REF, fontsize=8, zorder=4)
 
     ax.set_xscale("log", base=2)
-    ax.set_yscale("log")
-    ax.set_xticks(batches)
-    ax.set_xticklabels([str(b) for b in batches])
+    ax.set_xticks(kv_lens)
+    ax.set_xticklabels([f"{kv // 1024}K" for kv in kv_lens])
     ax.set_yticks([1.0, 1.5, 2.0, 2.5, 3.0])
     ax.set_yticklabels(["1.0", "1.5", "2.0", "2.5", "3.0"])
     ax.minorticks_off()
-    ax.set_xlabel("batch size", color=INK_2, fontsize=9)
-    ax.set_title(f"KV length {kv // 1024}K", color=INK, fontsize=10, pad=8)
+    ax.set_xlabel("context length", color=INK_2, fontsize=9)
+    ax.set_title(f"batch {batch}", color=INK, fontsize=10, pad=8)
     ax.grid(True, which="major", color=GRID, linewidth=0.8, zorder=0)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)

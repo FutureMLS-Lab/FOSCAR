@@ -18,17 +18,20 @@ Blackwell requires `cu13`.
 ## Running the tests
 
 ```sh
-pytest -q                    # CPU suite: no GPU and no nvidia-cutlass-dsl needed
-pytest -q -m gpu             # GPU tests, on an SM90 or SM100 device
+pytest -q
 ```
 
+Most modules need no device and run anywhere; the ones that do skip when there is
+none. `pytest -m gpu` selects only the device tests.
+
 The `_cpu` suffix on a test module means it must pass with no GPU. A module
-without the suffix needs hardware.
+without the suffix needs hardware, and is where a change to either kernel or to a
+pool builder is gated.
 
 ## What a change must satisfy
 
-- **CPU suite green.** Every change, including documentation-only ones, runs the
-  CPU suite.
+- **The suite is green.** Every change, including documentation-only ones, runs
+  `pytest -q` on a machine with a supported GPU.
 - **Kernel changes are measured.** A change to either decode kernel needs a
   timing comparison on the affected architecture, and a change to a split
   planner needs its self-test re-pinned rather than loosened.

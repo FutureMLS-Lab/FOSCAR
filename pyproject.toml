@@ -48,7 +48,7 @@ conflicts = [[{ extra = "cu12" }, { extra = "cu13" }]]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["gpu: needs an SM90 or SM100 device"]
-addopts = "-m 'not gpu' --strict-markers"
+addopts = "--strict-markers"
 
 [tool.ruff]
 line-length = 100

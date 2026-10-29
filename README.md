@@ -150,78 +150,42 @@ same Q dtype.
 
 ## Benchmarks
 
-Decode latency on one NVIDIA B200 at long context, against FlashInfer and
-TensorRT-LLM's `trtllm-gen` decode kernels. The figure plots the speedup over
-FlashInfer bf16 at the same shape, which is bf16's latency divided by the
-kernel's, so the dashed line at 1.00 is bf16 and higher is better. The table
-gives the latency itself, in microseconds.
+Decode latency in microseconds on one NVIDIA B200. The figure plots the speedup
+over FlashInfer bf16 at the same shape, so the dashed line at 1.00 is bf16.
 
-![Decode speedup over FlashInfer bf16, against batch size at KV lengths 32K and 128K](docs/decode-latency.png)
+![Decode speedup over FlashInfer bf16, against context length at batch 1 and 8](docs/decode-latency.png)
 
-| Batch | KV len | int2 | int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
+| Batch | Context | int2 | int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 32K | **17.0** | 19.3 | 35.5 | 23.3 | 18.0 |
-| 1 | 128K | **37.6** | 45.8 | 98.3 | 59.3 | 41.2 |
-| 8 | 32K | **63.8** | 75.7 | 166.7 | 95.5 | 70.0 |
-| 8 | 128K | **219.4** | 256.8 | 596.1 | 309.2 | 246.3 |
-
-What the columns store per cached value, including the scale and offset:
-
-| | int2 | int4 | NVFP4 | FP8 | bf16 |
-|---|---:|---:|---:|---:|---:|
-| bits per value | 2.5 | 4.5 | 4.5 | 8 | 16 |
-
-Two things follow from that table and are worth stating plainly.
-
-The 2-bit kernel is 2.09 to 2.72 times faster than bf16, which stores 6.4 times
-as many bits per value. Against NVFP4, which stores 1.8 times as many, it is 1.06
-to 1.12 times faster: at these lengths the traffic saving does reach the latency,
-but most of it is still absorbed by dequantization and the on-chip work.
-
-At 4 bits, where this package and NVFP4 store the same number of bits per value,
-TRT-LLM is faster at every shape. The 2-bit setting is where this kernel wins,
-and the gap widens with context length.
+| 1 | 32K | **16.9** | 19.4 | 35.4 | 23.6 | 18.5 |
+| 1 | 128K | **37.2** | 45.8 | 98.3 | 59.5 | 41.6 |
+| 1 | 256K | **63.5** | 77.6 | 171.1 | 101.5 | 69.7 |
+| 1 | 512K | **116.0** | 136.3 | 313.6 | 176.3 | 122.5 |
+| 8 | 32K | **63.3** | 75.9 | 168.0 | 96.1 | 69.2 |
+| 8 | 128K | **220.6** | 256.5 | 595.2 | 309.3 | 246.3 |
+| 8 | 256K | **400.5** | 461.9 | 1170.4 | 594.2 | 479.3 |
+| 8 | 512K | **760.3** | 874.0 | 2323.3 | 1166.7 | 947.7 |
 
 Measurement conditions: one query token per request, 32 query heads over 8 KV
 heads, `head_dim` 128, page size 64, paged cache, fp8 Q for this package and for
-TRT-LLM, bf16 for FlashInfer. All five columns were measured on the same B200
-card on 2026-10-29, in one session, through one timing function. The reported
-number is the CUDA kernel span from CUPTI, over a cold L2, as the median of the
-fully observed iterations. It excludes host dispatch and the paged-attention
-wrapper around the kernel, so it is not an end-to-end serving latency.
+TRT-LLM, bf16 for FlashInfer. All five columns ran on the same B200 card on
+2026-10-29, in one session, through one timing function. The number is the CUDA
+kernel span from CUPTI over a cold L2, the median of the fully observed
+iterations. It excludes host dispatch and the paged-attention wrapper, so it is
+not an end-to-end serving latency.
 
-Which code produced each column:
-
-- **int2 and int4** were measured by driving `PagedDecodeWrapper` from this
-  release. `benchmarks/decode_latency.csv` holds the values and
-  `benchmarks/plot_decode.py` renders the figure above.
-- **FlashInfer and TRT-LLM** were measured by the project's benchmark harness,
-  which is not part of this release. Those three columns cannot be regenerated
-  from this repository.
+The two columns for this package were measured by driving `PagedDecodeWrapper`
+from this release; `benchmarks/decode_latency.csv` holds the values and
+`benchmarks/plot_decode.py` renders the figure. The three competitor columns were
+measured by the project's benchmark harness, which is not part of this release.
 
 ## Testing
 
 ```sh
-pytest -q            # everything that needs no GPU
-pytest -m gpu        # the pool builders, on the hardware their kernel runs on
+pytest -q
 ```
 
-A test module whose name ends in `_cpu` must pass with no GPU and no CUDA
-toolkit. Most of the package is host code, and these tests cover it: the
-planners, the pool builders, the kernel cache, the constructor contract, and the
-static geometry of the kernels, such as shared-memory bank models and fragment
-maps. The whole run takes about ten seconds, and on a GPU host the same command
-also runs the modules that need one.
-
-With a CUDA device and the CuTe DSL installed, the modules that need them run
-instead of skipping. The GPU test builds pools with the builder this package
-ships for the running architecture, runs the decode kernel on them, and scores
-the output against a storage-matched reference, so the pool contract and the
-kernel are one gate.
-
-Both architectures were checked that way: an H100 for `pool_sm90`, a B200 for
-`pool`. The worst per-(batch, head) relative L2 is under 3e-3 at int2 and int4
-on both.
+Modules that need a device skip when there is none.
 
 ## Limitations
 
