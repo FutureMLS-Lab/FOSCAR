@@ -220,8 +220,10 @@ On SM90 it accepts only `fused_combine`, which selects the in-kernel split-K mer
 
 ## CUDA graph capture
 
-`run()` is graph-capturable.
-Both launch paths bind the kernel to torch's current stream, so no stream setup is needed around the call.
+`run()` is graph-capturable, and a replay returns exactly what the eager call
+returned: `tests/test_graph_gpu.py` captures and replays on both architectures
+and asserts the two outputs are equal. Both launch paths bind the kernel to
+torch's current stream, so no stream setup is needed around the call.
 
 ```python
 static_out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
