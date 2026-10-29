@@ -1,7 +1,8 @@
 """Render the decode-speedup figures from `decode_latency.csv`.
 
-One figure per GPU, each with two panels, one per batch size, and context length
-on a log axis. The y axis is the speedup over FlashInfer bf16 at the same shape,
+One figure per GPU, each with two panels, one per batch size. Context lengths are
+placed at even spacing rather than by value, so the four points read at the same
+interval. The y axis is the speedup over FlashInfer bf16 at the same shape,
 which is bf16's latency divided by the kernel's, so the dashed line at 1.00 is
 bf16 and higher is better. The latencies themselves are in the README tables.
 
@@ -58,23 +59,23 @@ def render(gpu, out):
         ax.set_facecolor("#ffffff")
         for key, label, color, marker in present:
             xs, ys = [], []
-            for kv in kv_lens:
+            for i, kv in enumerate(kv_lens):
                 base = us(gpu, BASE, batch, kv)
                 val = us(gpu, key, batch, kv)
                 if base and val:
-                    xs.append(kv)
+                    xs.append(i)
                     ys.append(base / val)
             ax.plot(xs, ys, color=color, linewidth=2, marker=marker, markersize=5,
                     markeredgecolor="#ffffff", markeredgewidth=1.2, label=label,
                     zorder=3)
 
         ax.axhline(1.0, color=REF, linewidth=1.2, linestyle=(0, (4, 3)), zorder=2)
-        ax.annotate("FlashInfer bf16", xy=(kv_lens[0], 1.0), xytext=(0, 6),
+        ax.annotate("FlashInfer bf16", xy=(0, 1.0), xytext=(0, 6),
                     textcoords="offset points", color=REF, fontsize=8, zorder=4)
 
-        ax.set_xscale("log", base=2)
-        ax.set_xticks(kv_lens)
+        ax.set_xticks(range(len(kv_lens)))
         ax.set_xticklabels([f"{kv // 1024}K" for kv in kv_lens])
+        ax.set_xlim(-0.25, len(kv_lens) - 0.75)
         ax.set_yticks([1.0, 2.0, 3.0, 4.0, 5.0])
         ax.set_yticklabels(["1.0", "2.0", "3.0", "4.0", "5.0"])
         ax.minorticks_off()
