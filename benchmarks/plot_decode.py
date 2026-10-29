@@ -17,6 +17,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter, MaxNLocator
 
 HERE = pathlib.Path(__file__).resolve().parent
 DOCS = HERE.parent / "docs"
@@ -54,6 +55,7 @@ def render(gpu, out):
 
     fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.6), sharey=True)
     fig.patch.set_facecolor("#ffffff")
+    top = 1.0
 
     for ax, batch in zip(axes, batches):
         ax.set_facecolor("#ffffff")
@@ -68,6 +70,8 @@ def render(gpu, out):
             ax.plot(xs, ys, color=color, linewidth=2, marker=marker, markersize=5,
                     markeredgecolor="#ffffff", markeredgewidth=1.2, label=label,
                     zorder=3)
+            if ys:
+                top = max(top, max(ys))
 
         ax.axhline(1.0, color=REF, linewidth=1.2, linestyle=(0, (4, 3)), zorder=2)
         ax.annotate("FlashInfer bf16", xy=(0, 1.0), xytext=(0, 6),
@@ -76,8 +80,6 @@ def render(gpu, out):
         ax.set_xticks(range(len(kv_lens)))
         ax.set_xticklabels([f"{kv // 1024}K" for kv in kv_lens])
         ax.set_xlim(-0.25, len(kv_lens) - 0.75)
-        ax.set_yticks([1.0, 2.0, 3.0, 4.0, 5.0])
-        ax.set_yticklabels(["1.0", "2.0", "3.0", "4.0", "5.0"])
         ax.minorticks_off()
         ax.set_xlabel("context length", color=INK_2, fontsize=9)
         ax.set_title(f"batch {batch}", color=INK, fontsize=10, pad=8)
@@ -88,6 +90,11 @@ def render(gpu, out):
             ax.spines[side].set_color(GRID)
         ax.tick_params(colors=INK_2, labelsize=8, length=3, width=0.8)
 
+    # Fit the axis to the data: the bf16 reference at 1.00 always stays in view, and
+    # the top is the highest point plus a little headroom rather than a fixed 5.0.
+    axes[0].set_ylim(0.95, top * 1.08)
+    axes[0].yaxis.set_major_locator(MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10]))
+    axes[0].yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
     axes[0].set_ylabel("speedup over FlashInfer bf16", color=INK_2, fontsize=9)
 
     handles, labels = axes[0].get_legend_handles_labels()
