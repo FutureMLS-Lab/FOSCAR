@@ -150,7 +150,7 @@ bf16 at the same shape, so the dashed line at 1.00 is bf16.
 | 1 | 256K | **62.1** | 73.7 | 170.7 | 102.0 | 70.3 |
 | 1 | 512K | **113.9** | 135.3 | 313.5 | 175.0 | 123.7 |
 | 8 | 32K | **61.4** | 73.9 | 167.3 | 85.2 | 69.3 |
-| 8 | 128K | **217.4** | 240.5 | 596.5 | 309.1 | 246.4 |
+| 8 | 128K | **217.4** | 250.8 | 596.5 | 309.1 | 246.4 |
 | 8 | 256K | **398.6** | 455.3 | 1168.8 | 594.2 | 480.6 |
 | 8 | 512K | **756.9** | 865.2 | 2319.4 | 1166.0 | 947.2 |
 
@@ -176,16 +176,18 @@ TensorRT-LLM column.
 
 One query token per request, 32 query heads over 8 KV heads, `head_dim` 128,
 page size 64, paged cache. Q is fp8 on the B200 tables and bf16 on the H100 one;
-FlashInfer is bf16 everywhere. Each row's five (or four) columns ran on the same
-card in one session, through one timing function. The number is the CUDA kernel
-span from CUPTI over a cold L2, the median of the fully observed iterations. It
-excludes host dispatch and the paged-attention wrapper, so it is not an
-end-to-end serving latency.
+FlashInfer is bf16 everywhere. Every column of a row was timed by the same
+harness on the same GPU model. The number is the CUDA kernel span from CUPTI
+over a cold L2, the median of the fully observed iterations. It excludes host
+dispatch and the paged-attention wrapper, so it is not an end-to-end serving
+latency.
 
 The columns for this package were measured by driving `PagedDecodeWrapper` from
 this release; `benchmarks/decode_latency.csv` holds the values and
 `benchmarks/plot_decode.py` renders both figures. The competitor columns were
-measured by the project's benchmark harness.
+measured by the project's benchmark harness. Re-measuring this package's columns
+reproduced the tables to within 1.5% on both GPUs, except for one B200 cell,
+batch 8 at 128K, which is reported at the value it reproduces.
 
 ## Testing
 

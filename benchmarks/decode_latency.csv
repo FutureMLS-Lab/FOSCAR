@@ -25,7 +25,7 @@ b200,8,32768,flashinfer_bf16,167.3
 b200,8,32768,trtllm_fp8,85.2
 b200,8,32768,trtllm_nvfp4,69.3
 b200,8,131072,ours_int2,217.4
-b200,8,131072,ours_int4,240.5
+b200,8,131072,ours_int4,250.8
 b200,8,131072,flashinfer_bf16,596.5
 b200,8,131072,trtllm_fp8,309.1
 b200,8,131072,trtllm_nvfp4,246.4
