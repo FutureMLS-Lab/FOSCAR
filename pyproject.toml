@@ -23,7 +23,14 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["torch>=2.4", "numpy>=1.21"]
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.21",
+    # The DSL compiles with `enable_tvm_ffi=True` and every launch binds torch's
+    # stream through `tvm_ffi.use_torch_stream`, so a kernel cannot be built or
+    # launched without it.
+    "apache-tvm-ffi>=0.1.8",
+]
 
 [project.optional-dependencies]
 cu12 = ["nvidia-cutlass-dsl==4.8.0", "cuda-python>=12.4,<13"]

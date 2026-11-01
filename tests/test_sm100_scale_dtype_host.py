@@ -118,15 +118,30 @@ def test_quant_cfg_rejects_unknown_scale_dtype(sdtype, fold_runtime):
         )
 
 
-def test_bf16_remains_illegal_outside_k_token64(fold_runtime):
+def test_bf16_is_legal_at_128_and_refused_at_256(fold_runtime):
     runtime = fold_runtime
-    with pytest.raises(ValueError, match="only legal with K token-64"):
+    kq, vq, sdtype, offsets = runtime.quant_cfg_of(
+        64,
+        128,
+        {
+            "k_quant": ("channel", 128),
+            "v_quant": ("token", 128),
+            "sdtype": "bf16",
+        },
+    )
+    assert (kq, vq, sdtype) == (("channel", 128), ("token", 128), "bf16")
+    assert offsets["ring_tot"] == 128
+    assert runtime.scale_pool_dtype_of(
+        64, 128,
+        {"k_quant": ("channel", 128), "v_quant": ("token", 128), "sdtype": "bf16"},
+    ) is torch.bfloat16
+    with pytest.raises(ValueError, match="at head_dim=256"):
         runtime.quant_cfg_of(
             64,
-            128,
+            256,
             {
-                "k_quant": ("channel", 128),
-                "v_quant": ("token", 128),
+                "k_quant": ("token", 256),
+                "v_quant": ("token", 256),
                 "sdtype": "bf16",
             },
         )

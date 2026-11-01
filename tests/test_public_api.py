@@ -108,7 +108,6 @@ def test_identical_pool_shapes_still_compare_unequal():
     ("sm90", 4, {"head_dim": 256, "k_quant": ("channel", 64)}, "token-wise K and V"),
     ("sm90", 2, {"k_quant": ("token", 64), "scale_dtype": torch.float32}, "bfloat16 scale"),
     ("sm100", 2, {"k_quant": ("token", 64), "scale_dtype": torch.float32}, "bfloat16"),
-    ("sm100", 2, {"scale_dtype": torch.bfloat16}, "float32"),
     ("sm100", 2, {"k_quant": ("channel", 32)}, "outside the decode's envelope"),
     ("sm90", 2, {"v_quant": ("token", 64)}, "outside the decode's envelope"),
     ("sm100", 3, {}, "bits must be one of"),
@@ -123,11 +122,14 @@ def test_create_refuses_what_the_reader_refuses(arch, bits, kw, match):
         _layout(arch, bits, **kw)
 
 
-def test_hopper_takes_either_scale_dtype_at_128_and_blackwell_one_per_pair():
+def test_both_arches_take_either_scale_dtype_at_128():
     assert _layout("sm90", 4, scale_dtype=torch.bfloat16).scale_dtype is torch.bfloat16
+    assert _layout("sm100", 4, scale_dtype=torch.bfloat16).scale_dtype is torch.bfloat16
     assert _layout("sm90", 2, k_quant=("token", 64)).scale_dtype is torch.bfloat16
     assert _layout("sm100", 2, k_quant=("token", 64)).scale_dtype is torch.bfloat16
     assert _layout("sm100", 2, v_quant=("channel", 64)).scale_dtype is torch.float32
+    assert _layout("sm100", 2, v_quant=("channel", 64),
+                   scale_dtype=torch.bfloat16).scale_dtype is torch.bfloat16
     assert _layout("sm90", 4, head_dim=256).scale_dtype is torch.float32
 
 

@@ -15,6 +15,8 @@ All notable changes to this project are documented here. The format follows
 - `head_dim` 256 on Blackwell, eager decode.
 - KV heads from 1 to 128 at 128 query heads.
 - CUDA graph mode, with `graph_workspace_bytes()` and a plan per captured batch.
+- A `bfloat16` scale pool at `head_dim` 128 on Blackwell, for any quantization
+  granularity. `head_dim` 256 keeps the `float32` pool.
 
 ### Changed
 

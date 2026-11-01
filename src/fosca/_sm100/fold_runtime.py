@@ -99,10 +99,10 @@ def quant_cfg_of(page_size, head_dim, kernel_kwargs=None):
     if sdt not in ("f32", "bf16"):
         raise ValueError(
             f"sdtype must be 'f32' or 'bf16'; got {sdt!r}")
-    if sdt == "bf16" and kq != ("token", head_dim // 2):
+    if head_dim != 128 and sdt != "f32":
         raise ValueError(
-            "sdtype='bf16' is only legal with K token-64; every other "
-            "IntDecodeSm100 configuration uses an f32 scale pool")
+            f"at head_dim={head_dim} IntDecodeSm100 uses an f32 scale pool; "
+            f"got sdtype={sdt!r}")
     qoff = quant_block_offsets(kq, vq, N=page_size, D=head_dim)
     return kq, vq, sdt, qoff
 
@@ -524,13 +524,13 @@ def compile_fold(
                                    v_row_bytes),
                    stride_order=(3, 2, 1, 0), assumed_align=16)
     kq_cfg, vq_cfg, sdt, qoff = quant_cfg_of(page_size, head_dim, kernel_kwargs)
+    sdt_cutlass = cutlass.BFloat16 if sdt == "bf16" else cutlass.Float32
     if qoff["legacy"]:
-        mScale_fake = fct(cutlass.Float32,
+        mScale_fake = fct(sdt_cutlass,
                           (sym_virtual_pages, num_kv_heads, page_size, 4),
                           stride_order=(3, 2, 1, 0), assumed_align=16)
     else:
         # flex configs: flat sectioned block, sdtype elements
-        sdt_cutlass = cutlass.BFloat16 if sdt == "bf16" else cutlass.Float32
         mScale_fake = fct(sdt_cutlass,
                           (sym_virtual_pages, num_kv_heads, qoff["block_tot"]),
                           stride_order=(2, 1, 0), assumed_align=16)

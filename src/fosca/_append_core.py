@@ -418,7 +418,7 @@ def envelope_refusal(layout, arch):
     name = {"torch.float32": "f32", "torch.bfloat16": "bf16"}.get(str(layout.scale_dtype))
     if k_quant == half:
         allowed = ("bf16",)
-    elif arch == "sm90" and D == 128:
+    elif D == 128:
         allowed = ("f32", "bf16")
     else:
         allowed = ("f32",)

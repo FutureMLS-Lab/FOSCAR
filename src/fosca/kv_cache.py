@@ -218,19 +218,14 @@ def _derive(arch, bits, head_dim, num_kv_heads, k_quant, v_quant, scale_dtype, k
         orders = dict(code_pool_order=IntPingPongDecodeSm90.code_pool_order,
                       k_pool_permuted=None, v_pool_permuted=None)
     else:
-        from ._sm100.fold_runtime import scale_pool_dtype_of
         from ._sm100.int_fold_decode import IntDecodeSm100
-        # Blackwell has one scale dtype per pair: bfloat16 for token-wise K over D/2 and f32 for
-        # every other pair, which is what `scale_pool_dtype_of` resolves when no `sdtype` is
-        # named. `quant_cfg_of` would also resolve an explicit f32 for K over D/2, which the
-        # constructor then refuses, so a layout never names one.
-        want = scale_pool_dtype_of(PAGE_SIZE, head_dim,
-                                   {"k_quant": k_quant, "v_quant": v_quant})
-        if scale_dtype != want:
-            raise ValueError(f"k_quant={k_quant} v_quant={v_quant} needs a {want} scale pool "
-                             f"on Blackwell; got {scale_dtype}")
+        # Token-wise K over D/2 keeps two (s, z) pairs per token, and a bfloat16 element is what
+        # funds the second pair's shared memory (`IntDecodeSm100.__init__`), matching Hopper.
+        if k_quant == token_half and scale_dtype != torch.bfloat16:
+            raise ValueError(f"k_quant={k_quant} needs a bfloat16 scale pool on Blackwell; got "
+                             f"{scale_dtype}")
         if kkw:
-            _require_buildable(bits, head_dim, k_quant, v_quant, kkw)
+            _require_buildable(bits, head_dim, k_quant, v_quant, scale_dtype, kkw)
         feed = _sm100_feed(kkw)
         orders = dict(code_pool_order=None,
                       k_pool_permuted=bool(IntDecodeSm100.k_pool_is_permuted(
@@ -249,7 +244,7 @@ def _sm100_feed(kernel_kwargs):
                 fold_scale_zero=bool(int(kernel_kwargs.get("fold_scale_zero", 1) or 0)))
 
 
-def _require_buildable(bits, head_dim, k_quant, v_quant, kernel_kwargs):
+def _require_buildable(bits, head_dim, k_quant, v_quant, scale_dtype, kernel_kwargs):
     """Refuse harness kernel keyword arguments the Blackwell reader refuses.
 
     The reader's constructor is the authority, so it is asked: constructed as `compile_fold`
@@ -262,9 +257,10 @@ def _require_buildable(bits, head_dim, k_quant, v_quant, kernel_kwargs):
     from ._sm100.int_fold_decode import IntDecodeSm100
 
     knobs = {**BITS_TUNING.get(bits, {}), **kernel_kwargs}
+    sdtype = "bf16" if scale_dtype == torch.bfloat16 else "f32"
     try:
         IntDecodeSm100(PAGE_SIZE, head_dim, 4, bits=bits, reduction_mode="kernel",
-                       k_quant=k_quant, v_quant=v_quant, **knobs)
+                       k_quant=k_quant, v_quant=v_quant, sdtype=sdtype, **knobs)
     except (AssertionError, TypeError, ValueError, NotImplementedError) as error:
         raise ValueError(f"IntDecodeSm100 refuses kernel_kwargs={kernel_kwargs} at bits={bits}, "
                          f"k_quant={k_quant}, v_quant={v_quant}: "
@@ -324,9 +320,9 @@ class QuantKVLayout:
         `bits` is 2 or 4. `k_quant` and `v_quant` are `(axis, group)` pairs, `("token",
         head_dim)` by default (the shipped layout); see `quant_layout.validate_quant_flex` for
         the envelope. `scale_dtype` defaults to the reader's: bfloat16 for token-wise K over
-        `head_dim // 2`, float32 otherwise; Hopper at head dimension 128 also takes bfloat16 for
-        the other pairs. The architecture of `device` selects the reader; a device with no
-        decode kernel is refused.
+        `head_dim // 2`, float32 otherwise; at head dimension 128 either reader also takes
+        bfloat16 for the other pairs. The architecture of `device` selects the reader; a device
+        with no decode kernel is refused.
         """
         return cls._create(_utils.require_arch(device), bits=bits, head_dim=head_dim,
                            num_kv_heads=num_kv_heads, k_quant=k_quant, v_quant=v_quant,

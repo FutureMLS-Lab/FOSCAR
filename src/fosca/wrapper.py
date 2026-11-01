@@ -43,10 +43,13 @@ that does not match the plan, before anything is launched.
 """
 
 import functools
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:  # `cutlass` is imported where it is used, so a host import stays cheap
+    import cutlass
 
 from . import _utils
 from ._utils import (
@@ -897,6 +900,8 @@ class PagedDecodeWrapper:
         if self._head_dim != 128 or k_quant != ("token", self._head_dim) or v_quant != ("token", self._head_dim):
             kkw["k_quant"] = k_quant
             kkw["v_quant"] = v_quant
+        if self._layout.scale_dtype == torch.bfloat16 and k_quant != ("token", self._head_dim // 2):
+            kkw["sdtype"] = "bf16"
         cfg_k, cfg_v, scale_sdtype, _ = quant_cfg_of(self._page_size, self._head_dim, kkw)
         assert (cfg_k, cfg_v) == (k_quant, v_quant), (
             f"quant_cfg_of drifted from the layout: "

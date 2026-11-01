@@ -26,7 +26,10 @@ WHAT IS DELIBERATELY NOT UNIFIED, because unifying it would be wrong rather than
 hard. This file normalizes the SPELLING of `sdtype`; it does not decide which sdtype a
 configuration may use, and the two kernels genuinely disagree there:
 
-    SM100   bf16 iff K is token-(D/2); every other configuration is ASSERTED f32.
+    SM100   at D=128, bf16 REQUIRED when K is token-(D/2), because token-64 doubles its
+            ring section and the halved scale element is what funds it; elsewhere bf16
+            is permitted alongside the f32 default, matching SM90. At D=256 SM100
+            builds only token-wise K and V over all D channels with an f32 pool.
     SM90    at D=128, bf16 REQUIRED when K is token-(D/2), because token-64 doubles its
             ring section and the halved scale element is what funds it; elsewhere bf16
             is merely PERMITTED, there being no assert against it. At any other head

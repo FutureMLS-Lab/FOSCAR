@@ -1057,7 +1057,9 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
             if cutlass.const_expr(K_CH):
                 k_group_idx = global_tile_idx // Int32(gtk)
                 k_plane = k_group_idx % 2
-                if k_group_idx != prev_k_group:
+                if cutlass.const_expr(gtk <= 2):
+                    cute.arch.barrier(barrier_id=7 + consumer_wg_idx + 5 * k_plane, number_of_threads=160)
+                elif k_group_idx != prev_k_group:
                     # barrier ids are PER (wg x plane parity): the builder runs up to two
                     # groups ahead, and consecutive groups sharing one id would accumulate
                     # arrivals across phases (partial release / phase slip).
@@ -1073,8 +1075,12 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                     prev_k_group = k_group_idx
             if cutlass.const_expr(V_CH):
                 v_group_idx = global_tile_idx // Int32(gtv)
-                v_group_ends = (wg_tile_idx + 1 == wg_tile_count) | ((global_tile_idx + 2) // Int32(gtv) != v_group_idx)
-                if (wg_tile_idx == 0) | ((global_tile_idx - 2) // Int32(gtv) != v_group_idx):
+                v_group_ends = (Int32(1) == Int32(1)) if cutlass.const_expr(gtv <= 2) else (
+                    (wg_tile_idx + 1 == wg_tile_count) | ((global_tile_idx + 2) // Int32(gtv) != v_group_idx))
+                if cutlass.const_expr(gtv <= 2):
+                    for z in cutlass.range_constexpr(accum_fragment_size):
+                        rOutAccumLo[z] = Float32(0.0); rOutAccumHi[z] = Float32(0.0); rLcAccum[z] = Float32(0.0)
+                elif (wg_tile_idx == 0) | ((global_tile_idx - 2) // Int32(gtv) != v_group_idx):
                     # first own tile of a V group: fresh group-local accumulators
                     for z in cutlass.range_constexpr(accum_fragment_size):
                         rOutAccumLo[z] = Float32(0.0); rOutAccumHi[z] = Float32(0.0); rLcAccum[z] = Float32(0.0)
@@ -1226,7 +1232,9 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                     # the group.  One arrive per (WG, group); arrivals on one parity id are
                     # separated by a full builder round-trip (RDY(g+2) needs the build of g+2
                     # which needed this FREE), so counting phases stay aligned.
-                    if (wg_tile_idx + 1 == wg_tile_count) | ((global_tile_idx + 2) // Int32(gtk) != k_group_idx):
+                    if cutlass.const_expr(gtk <= 2):
+                        cute.arch.barrier_arrive(barrier_id=9 + consumer_wg_idx + 5 * k_plane, number_of_threads=160)
+                    elif (wg_tile_idx + 1 == wg_tile_count) | ((global_tile_idx + 2) // Int32(gtk) != k_group_idx):
                         # FREE: 9 + WG for plane 0, 14 + WG for plane 1, computed as RDY's is
                         cute.arch.barrier_arrive(barrier_id=9 + consumer_wg_idx + 5 * k_plane, number_of_threads=160)
             global_tile_idx = split_idx * tiles_per_cta + 2 * wg_tile_idx + consumer_wg_idx   # this WG's global tile
@@ -1296,10 +1304,6 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                             rOutAccumLo[j] = rOutAccumLo[j] * rMaxCorrection[j]   # cols match: cS_pv[j][1] == cS_qk[j][1]
                             rOutAccumHi[j] = rOutAccumHi[j] * rMaxCorrection[j]
                             rLcAccum[j] = rLcAccum[j] * rMaxCorrection[j]
-                            if cutlass.const_expr(V_CH):
-                                rOutGlobLo[j] = rOutGlobLo[j] * rMaxCorrection[j]
-                                rOutGlobHi[j] = rOutGlobHi[j] * rMaxCorrection[j]
-                                rLTotal[j] = rLTotal[j] * rMaxCorrection[j]
                     rVCodeWords = cute.make_rmem_tensor(v_code_bytes_per_thread // 4, Int32)
                     sVCodeRow = sVCodeWords[(wg_thread_idx, None, consumer_state.index)]
                     cute.autovec_copy(cute.make_tensor(sVCodeRow.iterator.align(16), sVCodeRow.layout), rVCodeWords)
@@ -1413,7 +1417,13 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                             _wgmma_n8k16_bf16(rLcAccum, rLcOnes[0], rLcOnes[1], rLcOnes[2], rLcOnes[3], smem_b_desc, 1, 0)
                         elif cutlass.const_expr(not self.fold):
                             _wgmma_n8k16_bf16(rLcAccum, rLcOneZero[0], rLcOneZero[1], rLcOneZero[0], rLcOneZero[1], smem_b_desc, 1, 0)
-                    _wgmma_commit(); _wgmma_wait0()
+                    _wgmma_commit()
+                    if cutlass.const_expr(V_CH):
+                        for j in cutlass.range_constexpr(accum_fragment_size):
+                            rOutGlobLo[j] = rOutGlobLo[j] * rMaxCorrection[j]
+                            rOutGlobHi[j] = rOutGlobHi[j] * rMaxCorrection[j]
+                            rLTotal[j] = rLTotal[j] * rMaxCorrection[j]
+                    _wgmma_wait0()
                     if cutlass.const_expr(self.pv_tile_restart):
                         # THE LC WGMMA, after the PV wgmmas have retired, so that neither its A
                         # operand nor its sums are live while they are in flight (issued with

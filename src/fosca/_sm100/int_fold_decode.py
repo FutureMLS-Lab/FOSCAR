@@ -598,20 +598,18 @@ class IntDecodeSm100(GQAPagedDecode):
     #: value every measured flex configuration uses.
     #:
     #: Keyed on the FULL (k_quant, v_quant) pair, not on v_axis, and that is
-    #: load-bearing in three separate ways:
+    #: load-bearing in two ways:
     #:   * V-ch256 CANNOT take 128 -- it fails the `sequence_tile % v_group`
     #:     assert below (128 % 256).
     #:   * tile 128 made V-ch128 21.2% WORSE, so channel-V alone is the wrong
     #:     predicate for the tile.
-    #:   * K-ch128/V-ch128 is BOTH axes; o_stages feeds the channel-K Q'-plane
-    #:     ring depth (`(o_stages + 2) * k_parts`) and the builder's kb_ahead
-    #:     window, so o_stages=2 there is a different, unmeasured kernel.
     #: Deliberately bits-blind: at bits=4 the tile change also halves scale_stages,
-    #: which moves kv_stages. int2 is measured; if int4 regresses this table grows
-    #: a bits dimension.
+    #: which moves kv_stages. int2 and int4 are measured; if a future width regresses
+    #: this table grows a bits dimension.
     QUANT_TILING = {
         (("token", 128), ("channel", 64)): (128, 3),
         (("token", 128), ("channel", 128)): (256, 2),
+        (("channel", 128), ("channel", 128)): (256, 2),
     }
 
     @classmethod
@@ -1120,10 +1118,10 @@ class IntDecodeSm100(GQAPagedDecode):
             assert sdtype == "bf16", (
                 "K token-64 requires sdtype='bf16' (the doubled K ring "
                 "section is funded by the halved scale bytes — SM90 rule)")
-        else:
+        elif head_dim != 128:
             assert sdtype == "f32", (
-                "sdtype='bf16' is only legal with K token-64; every other "
-                "config keeps the f32 scale pool")
+                f"at head_dim={head_dim} IntDecodeSm100 uses an f32 scale pool; "
+                f"got sdtype={sdtype!r}")
         self.scale_sdtype = sdtype
         self.scale_dtype = BFloat16 if sdtype == "bf16" else Float32
         assert self.qoff["block_tot"] % 128 == 0, self.qoff  # TMA box shape
@@ -1454,7 +1452,9 @@ class IntDecodeSm100(GQAPagedDecode):
             f"stores V {'exactly like K (token rows)' if self.v_token_rows else 'in channel rows'}; "
             "pools written in the other layout must be rebuilt")
         if cutlass.const_expr(self.qoff["legacy"]):
-            assert mScale.dtype is Float32
+            assert mScale.dtype is self.scale_dtype, (
+                f"legacy mScale must be {self.scale_sdtype}"
+            )
         else:
             # flex: flat sectioned block [NP, HKV, block_tot] in sdtype
             assert mScale.dtype is self.scale_dtype, (
@@ -1671,24 +1671,26 @@ class IntDecodeSm100(GQAPagedDecode):
         scale_stage_bits = scale_ring_elems * self.scale_dtype.width
         smem_alloc_bits += self.scale_stages * (scale_stage_bits + pipe_stage_bits)
         if cutlass.const_expr(self.v_axis == "channel"):
-            # channel-V: pre-reduced [colsum | l] smem ring
-            # ([nL, 4 warps] f32 per virtual slot) + its pipeline mbars
-            nL_c = blk_tile_n * 2
-            smem_alloc_bits += (o_ring_c + v_parts_c) * (
-                nL_c * warpgroup_warps * acc_dtype.width + pipe_stage_bits
+            # channel-V: pre-reduced [colsum | l_0 | ... | l_{v_parts-1}] smem ring
+            # ([(1 + v_parts) * blk_tile_n, 4 warps] f32 per tile) + its pipeline mbars
+            lc_vec_c = (1 + v_parts_c) * blk_tile_n
+            smem_alloc_bits += (o_stages + 1) * (
+                lc_vec_c * warpgroup_warps * acc_dtype.width + pipe_stage_bits
             )
         if cutlass.const_expr(self.k_axis == "channel"):
             # channel-K: Q'-plane ring (B-operand-sized e4m3 stages) + bias
-            # ring ([lift[g] | bias[g]] f32 entries). There are no amax slots and
-            # no round mbarrier: the lift is per row, so no cross-warp rendezvous
-            # exists.
+            # ring ([lift[g] | bias[g]] f32 entries), with one pipeline
+            # mbarrier stage per sequence tile (`qp_tile_st_c`).
             k_parts_c = max(self.sequence_tile // self.k_group, 1)
-            qp_st_c = (self._o_stages + 2) * k_parts_c
-            qp_stages_bits = qp_st_c * (
-                mma_tile_n * mma_tile_k * mma_dtype.width + pipe_stage_bits
+            qp_tile_st_c = self._o_stages + 2
+            qp_st_c = qp_tile_st_c * k_parts_c
+            qp_stages_bits = (
+                qp_st_c * mma_tile_n * mma_tile_k * mma_dtype.width
+                + qp_tile_st_c * pipe_stage_bits
             )
-            qp_stages_bits += qp_st_c * (
-                2 * blk_tile_n * acc_dtype.width + pipe_stage_bits
+            qp_stages_bits += (
+                qp_st_c * 2 * blk_tile_n * acc_dtype.width
+                + qp_tile_st_c * pipe_stage_bits
             )
             smem_alloc_bits += qp_stages_bits
         alignment_bits = 1024 - (smem_alloc_bits % 1024)
@@ -1925,7 +1927,7 @@ class IntDecodeSm100(GQAPagedDecode):
         # Issued by tma_qk alongside K (same -1 OOB page-index zero-fill
         # pattern, making the K-fold self-masking on OOB pages), consumed
         # by the softmax WG (K-fold + P-quant of tile i share the stage).
-        if cutlass.const_expr(self.qoff["legacy"]):
+        if cutlass.const_expr(self.qoff["legacy"] and self.scale_sdtype == "f32"):
             mSC_mkl = pool_view(mScale)  # (64, 4, (h_k, NP))
             smem_layout_scale_box = cute.make_layout(
                 (self.page_size, 4), stride=(4, 1)
@@ -1935,18 +1937,27 @@ class IntDecodeSm100(GQAPagedDecode):
                 (self.page_size, 4)
             )
         else:
-            # Flex: the block is FLAT [NP, HKV, block_tot]; the TMA box
-            # covers only the RING prefix as (128, ring_tot/128) columns
+            # Flex (or legacy bf16, whose 4-element minor dim is 8B < 16B):
+            # the TMA box covers the RING prefix as (128, ring_tot/128) columns
             # of 128 contiguous elements (>= 16B inner box at bf16).
             # Channel sections ride the SAME per-page block but are read
             # by gmem LDG per group (mSC_flat below), not the ring.
             ring_cols = scale_ring_elems // 128
-            mSC_flat = cute.make_tensor(
-                mScale.iterator,
-                cute.group_modes(
-                    cute.select(mScale.layout, (2, 1, 0)), 1, 3
-                ),
-            )  # (block_tot, (h_k, NP)) — gmem LDG view (channel sections)
+            if cutlass.const_expr(self.qoff["legacy"]):
+                mSC_flat = cute.make_tensor(
+                    mScale.iterator,
+                    cute.make_layout(
+                        (scale_ring_elems, (h_k, mScale.shape[0])),
+                        stride=(1, (scale_ring_elems, h_k * scale_ring_elems)),
+                    ),
+                )
+            else:
+                mSC_flat = cute.make_tensor(
+                    mScale.iterator,
+                    cute.group_modes(
+                        cute.select(mScale.layout, (2, 1, 0)), 1, 3
+                    ),
+                )  # (block_tot, (h_k, NP)) — gmem LDG view (channel sections)
             mSC_mkl = cute.flat_divide(
                 mSC_flat, (128,)
             )  # (128, block_cols, (h_k, NP))
@@ -2276,24 +2287,12 @@ class IntDecodeSm100(GQAPagedDecode):
             k_token = kq_ring.try_wait()
 
             s_handle = s_producer.acquire_and_advance(s_token)
-            # Q'-plane acquire, three mutually exclusive shapes:
-            #   k_parts == 1            -> one plane per SEQUENCE tile
-            #   k_parts == tiles_sm > 1 -> one plane per M-tile
-            #   k_parts == 2*tiles_sm   -> two planes per M-tile (straddle)
-            # The `k_parts > 1` is load-bearing, not defensive: at
-            # sequence_tile == mma_tile_m (tiles_sm == 1) with Gt == 128,
-            # `k_parts == 1` and `k_parts == tiles_sm` are BOTH true, and
-            # without it this warp would acquire and release the plane
-            # ring twice per tile against one produced stage. It is a
-            # no-op at the shipped sequence_tile=256, where tiles_sm == 2.
-            if cutlass.const_expr(k_channel and k_parts == 1):
+            # Q'-plane acquire: one mbarrier stage per sequence tile, holding
+            # k_parts plane buffers at qp_handle.index * k_parts + kp.
+            if cutlass.const_expr(k_channel):
                 qp_handle = qp_consumer.wait_and_advance()
             for sm in cutlass.range_constexpr(tiles_sm):
                 tiled_mma_kq.set(tcgen05.Field.ACCUMULATE, False)
-                if cutlass.const_expr(
-                    k_channel and k_parts == tiles_sm and k_parts > 1
-                ):
-                    qp_handle = qp_consumer.wait_and_advance()
                 for dk in cutlass.range_constexpr(tiles_dk):
                     k_handle = kq_ring.wait_and_advance(k_token)
                     is_last_iter = sm == tiles_sm - 1 and dk == tiles_dk - 1
@@ -2311,7 +2310,9 @@ class IntDecodeSm100(GQAPagedDecode):
                         # (the softmax selects per token page-half).
                         mmas_k2 = cute.size(tAsK.shape[2])
                         for gsub in cutlass.range_constexpr(2):
-                            qp_h2 = qp_consumer.wait_and_advance()
+                            qp_plane_idx = (
+                                qp_handle.index * k_parts + 2 * sm + gsub
+                            )
                             tiled_mma_kq.set(
                                 tcgen05.Field.ACCUMULATE, False
                             )
@@ -2337,7 +2338,7 @@ class IntDecodeSm100(GQAPagedDecode):
                                     ],
                                     tBsQp_desc[
                                         None, None, mma_k,
-                                        qp_h2.index,
+                                        qp_plane_idx,
                                     ],
                                     cS_g,
                                 )
@@ -2346,15 +2347,19 @@ class IntDecodeSm100(GQAPagedDecode):
                                         tcgen05.Field.ACCUMULATE,
                                         True,
                                     )
-                            qp_h2.release()
                         k_handle.release()
                         continue
 
                     mmas_k = cute.size(tAsK.shape[2])
                     for mma_k in cutlass.range_constexpr(mmas_k):
                         if cutlass.const_expr(k_channel):
+                            qp_plane_idx = (
+                                qp_handle.index * k_parts + sm
+                                if (k_parts == tiles_sm and k_parts > 1)
+                                else qp_handle.index
+                            )
                             b_desc = tBsQp_desc[
-                                None, None, mma_k, qp_handle.index
+                                None, None, mma_k, qp_plane_idx
                             ]
                         else:
                             b_desc = tBsQ_desc[None, None, mma_k, dk]
@@ -2395,11 +2400,7 @@ class IntDecodeSm100(GQAPagedDecode):
                                     tcgen05.Field.ACCUMULATE, True
                                 )
                     k_handle.release()
-                if cutlass.const_expr(
-                    k_channel and k_parts == tiles_sm and k_parts > 1
-                ):
-                    qp_handle.release()
-            if cutlass.const_expr(k_channel and k_parts == 1):
+            if cutlass.const_expr(k_channel):
                 qp_handle.release()
             s_handle.commit()
 
@@ -3132,7 +3133,7 @@ class IntDecodeSm100(GQAPagedDecode):
         # alongside K with the SAME rPT-sourced page index (so a -1
         # OOB page zero-fills the scale stage exactly like the code
         # stages: s_t = z_t = 0 -> folded S = 0, self-masking).
-        if cutlass.const_expr(not qflex):
+        if cutlass.const_expr(not qflex and self.scale_sdtype == "f32"):
             sSC = cute.make_tensor(
                 sScale.iterator,
                 cute.make_layout(
@@ -4242,7 +4243,7 @@ class IntDecodeSm100(GQAPagedDecode):
                                 scale_consumer.wait_and_advance()
                             )
                         sc_stage0 = sc_handles[0].index
-                        rSZ4 = cute.make_rmem_tensor(4, acc_dtype)
+                        rSZ4 = cute.make_rmem_tensor(4, self.scale_dtype)
                         for pj in cutlass.range_constexpr(pages_s):
                             stg_j = (sc_stage0 + pj) % scale_stages
                             for _q in cutlass.range_constexpr(2 * kf_runs):
@@ -4251,11 +4252,13 @@ class IntDecodeSm100(GQAPagedDecode):
                                         sScale.iterator
                                         + (kfs_rows[_q] * 4
                                            + stg_j * page_size * 4)
-                                    ).align(16),
+                                    ).align((4 * self.scale_dtype.width) // 8),
                                     cute.make_layout(4),
                                 )
                                 cute.autovec_copy(sSZ, rSZ4)
-                                ks_b, kz_b = dq_coeffs(rSZ4[0], rSZ4[1])
+                                ks_b, kz_b = dq_coeffs(
+                                    Float32(rSZ4[0]), Float32(rSZ4[1])
+                                )
                                 rTabK[pj, _q, 0] = ks_b
                                 rTabK[pj, _q, 1] = kz_b
                         # generic-proxy LDS -> async-proxy fence ->
@@ -4455,7 +4458,7 @@ class IntDecodeSm100(GQAPagedDecode):
                                 scale_consumer.wait_and_advance()
                             )
                         scv_stage0 = scv_handles[0].index
-                        rSZ4v = cute.make_rmem_tensor(4, acc_dtype)
+                        rSZ4v = cute.make_rmem_tensor(4, self.scale_dtype)
                         for pj in cutlass.range_constexpr(pages_s):
                             stg_jv = (scv_stage0 + pj) % scale_stages
                             sSZv = cute.make_tensor(
@@ -4463,11 +4466,13 @@ class IntDecodeSm100(GQAPagedDecode):
                                     sScale.iterator
                                     + (i4v_unit * 4
                                        + stg_jv * page_size * 4)
-                                ).align(16),
+                                ).align((4 * self.scale_dtype.width) // 8),
                                 cute.make_layout(4),
                             )
                             cute.autovec_copy(sSZv, rSZ4v)
-                            vs_b, vz_b = dq_coeffs(rSZ4v[2], rSZ4v[3])
+                            vs_b, vz_b = dq_coeffs(
+                                Float32(rSZ4v[2]), Float32(rSZ4v[3])
+                            )
                             rTabV[pj, 0] = vs_b
                             rTabV[pj, 1] = vz_b
                         # generic-proxy LDS -> async-proxy fence -> warp
@@ -4790,13 +4795,13 @@ class IntDecodeSm100(GQAPagedDecode):
         colsum_p = cute.make_rmem_tensor((nL, o_stages), Float32)
         colsum_p.fill(Float32(0))
 
-        def build_kgroup(s_buf, z_buf, kp, qp_h, qb_h):
+        def build_kgroup(s_buf, z_buf, kp_w, qp_idx, qb_idx):
             # placeholder: closure-captured by the loop regions
             # even when every call site is const-pruned (non-
             # channel-K); the real def below overwrites it.
             raise AssertionError("build_kgroup unused")
 
-        def load_kscales(tb, kp, s_buf, z_buf):
+        def load_kscales(tb, kp_w, s_buf, z_buf):
             raise AssertionError("load_kscales unused")
 
         # ---- channel-K Q'-plane builder ----
@@ -4841,30 +4846,30 @@ class IntDecodeSm100(GQAPagedDecode):
             )
             sQ_d4 = cute.flat_divide(sQ_nk, (1, 4))
             sQP_d4 = cute.flat_divide(sQP_nk, (1, 4))
-            kb_rows = (blk_tile_n + warpgroup_warps - 1) // warpgroup_warps
+            if cutlass.const_expr(warpgroup_warps % k_parts == 0):
+                warps_per_part = warpgroup_warps // k_parts
+                parts_per_warp = 1
+                kp_base = warpgroup_widx // warps_per_part
+                w_sub = warpgroup_widx % warps_per_part
+            else:
+                warps_per_part = warpgroup_warps
+                parts_per_warp = k_parts
+                kp_base = Int32(0)
+                w_sub = warpgroup_widx
+            kb_rows = (blk_tile_n + warps_per_part - 1) // warps_per_part
             rQh = cute.make_rmem_tensor((kb_rows, 4), acc_dtype)
             rQh.fill(Float32(0))
-            # PER-ROW |Q|: rMaxq[rr, j] is row (rr*4 + widx)'s own
-            # |Q[.., 4*lane + j]|, NOT maxed across the warp's rows.
-            # At g == 8 (kb_rows == 2) a warp owns two rows and the
-            # old single-row-slot version deliberately collapsed
-            # them; keeping them separate is what makes the lift
-            # per row.
-            rMaxq = cute.make_rmem_tensor((kb_rows, 4), acc_dtype)
-            rMaxq.fill(Float32(0))
             rq4b = cute.make_rmem_tensor((1, 4), mma_dtype)
             rqfb = cute.make_rmem_tensor((1, 4), acc_dtype)
             for rr in cutlass.range_constexpr(kb_rows):
-                n_h = rr * warpgroup_warps + warpgroup_widx
+                n_h = rr * warps_per_part + w_sub
                 if n_h < blk_tile_n:
                     cute.autovec_copy(
                         sQ_d4[None, None, n_h, lane_idx, 0], rq4b
                     )
                     rqfb.store(rq4b.load().to(acc_dtype))
                     for j in cutlass.range_constexpr(4):
-                        qv_h = rqfb[0, j]
-                        rQh[rr, j] = qv_h
-                        rMaxq[rr, j] = cute.arch.fmax(qv_h, -qv_h)
+                        rQh[rr, j] = rqfb[0, j]
             gPT_k = cute.make_tensor(
                 page_table_iter + table_offset, (page_count,)
             )
@@ -4886,27 +4891,24 @@ class IntDecodeSm100(GQAPagedDecode):
             kz_col = (k_ch_off + self.head_dim) // 4
 
             def load_kscales(
-                tb, kp, s_buf, z_buf,
+                tb, kp_w, s_buf, z_buf,
                 mSC_d4=mSC_d4, gPT_k=gPT_k,
                 kv_splits=kv_splits, kv_split_idx=kv_split_idx,
                 pages_s=pages_s, k_pages=k_pages,
                 ks_col=ks_col, kz_col=kz_col,
                 page_count=page_count,
                 coord_hk=coord_hk, lane_idx=lane_idx,
+                kp_base=kp_base,
                 scale_dtype=self.scale_dtype, acc_dtype=acc_dtype,
             ):
-                # raw (s_d, z_d) for this lane's d-run into slot
-                # `kp` of the caller's per-part buffer (zeros on OOB).
-                # PER-PART storage, not one shared register set: two
-                # builds that alias the same s_raw serialize on a
-                # write-after-read no matter how the acquires are
-                # ordered.
+                # raw (s_d, z_d) for this lane's d-run of part
+                # `kp_base + kp_w` (zeros on OOB).
                 for j in cutlass.range_constexpr(4):
-                    s_buf[kp, j] = Float32(0)
-                    z_buf[kp, j] = Float32(0)
+                    s_buf[kp_w, j] = Float32(0)
+                    z_buf[kp_w, j] = Float32(0)
                 lp0b = (
                     tb * kv_splits + kv_split_idx
-                ) * pages_s + kp * k_pages
+                ) * pages_s + (kp_base + kp_w) * k_pages
                 if lp0b < page_count:
                     phys_b = gPT_k[lp0b]
                     rs4 = cute.make_rmem_tensor(4, scale_dtype)
@@ -4926,33 +4928,40 @@ class IntDecodeSm100(GQAPagedDecode):
                         rz4,
                     )
                     for j in cutlass.range_constexpr(4):
-                        s_buf[kp, j] = rs4[j].to(acc_dtype)
-                        z_buf[kp, j] = rz4[j].to(acc_dtype)
+                        s_buf[kp_w, j] = rs4[j].to(acc_dtype)
+                        z_buf[kp_w, j] = rz4[j].to(acc_dtype)
 
             def build_kgroup(
-                s_buf, z_buf, kp, qp_h, qb_h,
-                rQh=rQh, rMaxq=rMaxq, sQB=sQB,
+                s_buf, z_buf, kp_w, qp_idx, qb_idx,
+                rQh=rQh, sQB=sQB,
                 sQP_d4=sQP_d4,
                 kb_rows=kb_rows, acc_dtype=acc_dtype,
                 mma_dtype=mma_dtype, kch_s_mul=kch_s_mul,
                 kch_lift_mul=kch_lift_mul,
                 kch_beta=kch_beta, lane_idx=lane_idx,
-                warpgroup_widx=warpgroup_widx,
+                w_sub=w_sub,
                 blk_tile_n=blk_tile_n,
-                warpgroup_warps=warpgroup_warps,
+                warps_per_part=warps_per_part,
             ):
                 s_eff = cute.make_rmem_tensor(4, acc_dtype)
                 z_eff = cute.make_rmem_tensor(4, acc_dtype)
                 for j in cutlass.range_constexpr(4):
-                    s_eff[j] = s_buf[kp, j] * Float32(kch_s_mul)
-                    z_eff[j] = (
-                        z_buf[kp, j]
-                        - Float32(kch_beta) * s_buf[kp, j]
-                    )
+                    if cutlass.const_expr(kch_s_mul == 1.0):
+                        s_eff[j] = s_buf[kp_w, j]
+                    else:
+                        s_eff[j] = s_buf[kp_w, j] * Float32(kch_s_mul)
+                    if cutlass.const_expr(kch_beta == 0.0):
+                        z_eff[j] = z_buf[kp_w, j]
+                    else:
+                        z_eff[j] = (
+                            z_buf[kp_w, j]
+                            - Float32(kch_beta) * s_buf[kp_w, j]
+                        )
                 rv4b = cute.make_rmem_tensor((1, 4), acc_dtype)
                 rp4b = cute.make_rmem_tensor((1, 4), mma_dtype)
+                rProd = cute.make_rmem_tensor(4, acc_dtype)
                 for rr in cutlass.range_constexpr(kb_rows):
-                    n_b = rr * warpgroup_warps + warpgroup_widx
+                    n_b = rr * warps_per_part + w_sub
                     # EXACT per-row amax: products at the true
                     # argmax equal the elementwise form's (same f32
                     # values, same ladder m). `warp_fmax` covers
@@ -4962,8 +4971,10 @@ class IntDecodeSm100(GQAPagedDecode):
                     # lane, hence outside the n_b guard below.
                     amax_p = Float32(0)
                     for j in cutlass.range_constexpr(4):
+                        p_j = s_eff[j] * rQh[rr, j]
+                        rProd[j] = p_j
                         amax_p = cute.arch.fmax(
-                            amax_p, s_eff[j] * rMaxq[rr, j]
+                            amax_p, cute.arch.fmax(p_j, -p_j)
                         )
                     amax = warp_fmax(amax_p)
                     m_g = _lift_exp(amax)
@@ -4975,90 +4986,75 @@ class IntDecodeSm100(GQAPagedDecode):
                         # bytes and the ladder m stay unchanged
                         # — see kch_lift_mul at its definition.
                         lift_v = lift_v * Float32(kch_lift_mul)
-                    if n_b < blk_tile_n:
+                    row_ok = (
+                        True
+                        if (blk_tile_n % warps_per_part == 0 or rr < kb_rows - 1)
+                        else (n_b < blk_tile_n)
+                    )
+                    if row_ok:
                         for j in cutlass.range_constexpr(4):
-                            rv4b[0, j] = (
-                                s_eff[j] * rQh[rr, j] * inv_m
-                            )
+                            rv4b[0, j] = rProd[j] * inv_m
                         rp4b.store(rv4b.load().to(mma_dtype))
                         cute.autovec_copy(
                             rp4b,
                             sQP_d4[
                                 None, None, n_b, lane_idx,
-                                qp_h.index,
+                                qp_idx,
                             ],
                         )
                         if lane_idx == 0:
                             # bias ring rows [0, g) = per-row lift
-                            sQB[n_b, qb_h.index] = lift_v
+                            sQB[n_b, qb_idx] = lift_v
                 # FENCE COALESCING: the bias is computed and stored
                 # BEFORE the fence, so ONE `fence_view_async_shared`
                 # orders both payloads and both handles commit after
-                # it. Publishing QP after the bias butterfly is free
-                # here because the builder runs `kb_ahead + 1` tiles
-                # ahead of every consumer, so the plane is not awaited
-                # when it is produced.
+                # it.
                 for rr in cutlass.range_constexpr(kb_rows):
-                    n_b = rr * warpgroup_warps + warpgroup_widx
+                    n_b = rr * warps_per_part + w_sub
                     bp = Float32(0)
                     for j in cutlass.range_constexpr(4):
                         bp += z_eff[j] * rQh[rr, j]
                     bn = cute.arch.warp_reduction_sum(bp)
-                    if n_b < blk_tile_n:
+                    row_ok = (
+                        True
+                        if (blk_tile_n % warps_per_part == 0 or rr < kb_rows - 1)
+                        else (n_b < blk_tile_n)
+                    )
+                    if row_ok:
                         if lane_idx == 0:
                             # rows [g, 2g) = per-row bias
-                            sQB[blk_tile_n + n_b, qb_h.index] = bn
-                # NO fence and NO commit here: the CALLER publishes
-                # all k_parts payloads behind ONE fence. A fence is a
-                # reordering barrier, so leaving it per-build would stop
-                # ptxas interleaving the independent plane builds even
-                # after the per-part acquires are hoisted -- and the
-                # per-part acquire + fence pair IS the serializer (the
-                # k_parts loop is range_constexpr, so its bodies are
-                # already independent unrolled code).
+                            sQB[blk_tile_n + n_b, qb_idx] = bn
 
             # seed the build-ahead window BEFORE the sM preamble
             # reads (those need softmax(0..o-1), which need the
             # planes — building after would deadlock)
             n_seed = cutlass.min(Int32(kb_ahead + 1), iters_s)
-            # ONE SLOT PER PART. Two builds that alias one scale register
-            # set serialize on a write-after-read however the acquires are
-            # ordered, so per-part slots are what make the k_parts bodies
-            # genuinely independent.
-            # Part-major (row-major) slots: each part's 4-channel run is contiguous, so
-            # the f32 pairs a DSL >= 4.6 register tensor is packed into are (j, j+1) of
-            # ONE part and match the halves of that part's 128-bit scale load. Column-major
-            # slots pair two parts' channels, and under DSL 4.8.0 the repacking stalls
-            # on each load and costs INT2 channel-wise-K builds 25-32%.
             rSKB_pf = cute.make_rmem_tensor(
-                cute.make_layout((k_parts, 4), stride=(4, 1)), acc_dtype)
+                cute.make_layout((parts_per_warp, 4), stride=(4, 1)), acc_dtype)
             rZKB_pf = cute.make_rmem_tensor(
-                cute.make_layout((k_parts, 4), stride=(4, 1)), acc_dtype)
-            # Every part's loads are issued before the first acquire. An acquire is a
-            # wait loop the compiler does not move loads across, so a part's loads
-            # placed after the previous part's acquire start one page-table round trip
-            # later, once per part.
+                cute.make_layout((parts_per_warp, 4), stride=(4, 1)), acc_dtype)
             for tb_s in cutlass.range(n_seed, unroll=1):
-                for kp_s in cutlass.range_constexpr(k_parts):
-                    load_kscales(tb_s, kp_s, rSKB_pf, rZKB_pf)
-                qp_hs, qb_hs = [], []
-                for kp_s in cutlass.range_constexpr(k_parts):
-                    qp_hs.append(qp_producer.acquire_and_advance())
-                    qb_hs.append(qb_producer.acquire_and_advance())
-                for kp_s in cutlass.range_constexpr(k_parts):
-                    build_kgroup(rSKB_pf, rZKB_pf, kp_s,
-                                 qp_hs[kp_s], qb_hs[kp_s])
+                for kp_w in cutlass.range_constexpr(parts_per_warp):
+                    load_kscales(tb_s, kp_w, rSKB_pf, rZKB_pf)
+                qp_hs = qp_producer.acquire_and_advance()
+                qb_hs = qb_producer.acquire_and_advance()
+                for kp_w in cutlass.range_constexpr(parts_per_warp):
+                    kp_idx_s = kp_base + kp_w
+                    build_kgroup(
+                        rSKB_pf, rZKB_pf, kp_w,
+                        qp_hs.index * k_parts + kp_idx_s,
+                        qb_hs.index * k_parts + kp_idx_s,
+                    )
                 cute.arch.fence_view_async_shared()
-                for kp_s in cutlass.range_constexpr(k_parts):
-                    qp_hs[kp_s].commit()
-                    qb_hs[kp_s].commit()
+                qp_hs.commit()
+                qb_hs.commit()
             rSKB_pf.fill(Float32(0))
             rZKB_pf.fill(Float32(0))
             pf_go = Int32(kb_ahead + 1 < iters_s)
             for _pf in cutlass.range(pf_go, unroll=1):
-                for kp_s in cutlass.range_constexpr(k_parts):
+                for kp_w in cutlass.range_constexpr(parts_per_warp):
                     load_kscales(
-                        Int32(kb_ahead + 1), kp_s,
+                        Int32(kb_ahead + 1), kp_w,
                         rSKB_pf, rZKB_pf
                     )
 
@@ -5115,8 +5111,9 @@ class IntDecodeSm100(GQAPagedDecode):
             rAcc.fill(Float32(0))
             rAccZ = cute.make_rmem_tensor(blk_tile_n, acc_dtype)
             rAccZ.fill(Float32(0))
-            colsum_acc_v = cute.make_rmem_tensor(nL, acc_dtype)
+            colsum_acc_v = cute.make_rmem_tensor(blk_tile_n, acc_dtype)
             colsum_acc_v.fill(Float32(0))
+            sLC_d = cute.flat_divide(sLC, (blk_tile_n,))
             m_prev_v = sM_hist[0]
             gPT_c = cute.make_tensor(
                 page_table_iter + table_offset, (page_count,)
@@ -5173,54 +5170,67 @@ class IntDecodeSm100(GQAPagedDecode):
                     tb_n = s + kb_ahead + 1
                     nb_go = Int32(tb_n < iters_s)
                     for _bb in cutlass.range(nb_go, unroll=1):
-                        # OVERLAP the k_parts plane builds. Every
-                        # per-part acquire happens FIRST, then the build
-                        # bodies run back to back with nothing between
-                        # them, then ONE fence publishes every payload.
-                        # Previously each part was
-                        # acquire -> build -> fence -> commit, and BOTH
-                        # the mbarrier acquire and the fence are barriers
-                        # ptxas cannot schedule across, so the builds ran
-                        # strictly serially however independent their
-                        # arithmetic was. The bodies read DISJOINT slots
-                        # of rSKB_pf/rZKB_pf, so no register aliasing
-                        # serializes them either.
-                        #
-                        # Holding k_parts handles live at once is safe:
-                        # `acquire()` returns an ImmutableResourceHandle
-                        # built from `self.__state.clone()`, i.e. a value
-                        # SNAPSHOT, not an alias of the producer's live
-                        # state.
-                        qp_hn, qb_hn = [], []
-                        for kp_n in cutlass.range_constexpr(k_parts):
-                            qp_hn.append(
-                                qp_producer.acquire_and_advance()
+                        phys_k_pf = []
+                        for kp_w in cutlass.range_constexpr(parts_per_warp):
+                            lp_k_pf = (
+                                (tb_n + 1) * kv_splits + kv_split_idx
+                            ) * pages_s + (kp_base + kp_w) * k_pages
+                            phys_k_pf.append(
+                                gPT_k[cutlass.min(lp_k_pf, page_count - 1)]
                             )
-                            qb_hn.append(
-                                qb_producer.acquire_and_advance()
-                            )
-                        for kp_n in cutlass.range_constexpr(k_parts):
+                        qp_hn = qp_producer.acquire_and_advance()
+                        qb_hn = qb_producer.acquire_and_advance()
+                        for kp_w in cutlass.range_constexpr(parts_per_warp):
+                            kp_idx_n = kp_base + kp_w
                             build_kgroup(
-                                rSKB_pf, rZKB_pf, kp_n,
-                                qp_hn[kp_n], qb_hn[kp_n],
+                                rSKB_pf, rZKB_pf, kp_w,
+                                qp_hn.index * k_parts + kp_idx_n,
+                                qb_hn.index * k_parts + kp_idx_n,
                             )
                         cute.arch.fence_view_async_shared()
-                        for kp_n in cutlass.range_constexpr(k_parts):
-                            qp_hn[kp_n].commit()
-                            qb_hn[kp_n].commit()
+                        qp_hn.commit()
+                        qb_hn.commit()
                         # prefetch the NEXT target's scales straight
-                        # into the per-part slots (the compiler already
-                        # sinks the wait past a staging copy, so a copy
-                        # buys nothing)
-                        nx_go = Int32(tb_n + 1 < iters_s)
-                        for _px in cutlass.range(nx_go, unroll=1):
-                            for kp_n in cutlass.range_constexpr(
-                                k_parts
-                            ):
-                                load_kscales(
-                                    tb_n + 1, kp_n,
-                                    rSKB_pf, rZKB_pf
+                        # into this warp's owned part slot(s), using
+                        # the page-table index prefetched above.
+                        for kp_w in cutlass.range_constexpr(
+                            parts_per_warp
+                        ):
+                            for j in cutlass.range_constexpr(4):
+                                rSKB_pf[kp_w, j] = Float32(0)
+                                rZKB_pf[kp_w, j] = Float32(0)
+                            lp_k_pf = (
+                                (tb_n + 1) * kv_splits + kv_split_idx
+                            ) * pages_s + (kp_base + kp_w) * k_pages
+                            if (tb_n + 1 < iters_s) and (lp_k_pf < page_count):
+                                phys_kn = phys_k_pf[kp_w]
+                                rs4_n = cute.make_rmem_tensor(4, self.scale_dtype)
+                                rz4_n = cute.make_rmem_tensor(4, self.scale_dtype)
+                                cute.autovec_copy(
+                                    mSC_d4[
+                                        None, ks_col + lane_idx,
+                                        (coord_hk, phys_kn),
+                                    ],
+                                    rs4_n,
                                 )
+                                cute.autovec_copy(
+                                    mSC_d4[
+                                        None, kz_col + lane_idx,
+                                        (coord_hk, phys_kn),
+                                    ],
+                                    rz4_n,
+                                )
+                                for j in cutlass.range_constexpr(4):
+                                    rSKB_pf[kp_w, j] = rs4_n[j].to(acc_dtype)
+                                    rZKB_pf[kp_w, j] = rz4_n[j].to(acc_dtype)
+
+                phys_v_pf = []
+                if cutlass.const_expr(v_channel):
+                    for pp in cutlass.range_constexpr(v_parts):
+                        lp_v_pf = (
+                            (s + 1) * kv_splits + kv_split_idx
+                        ) * pages_s + pp * v_pages
+                        phys_v_pf.append(gPT_c[lp_v_pf])
 
                 # Acquire O of s-2 FIRST and issue its (fold: 2g-wide)
                 # tmem load immediately. The correction WG is the
@@ -5242,6 +5252,22 @@ class IntDecodeSm100(GQAPagedDecode):
                         tOtO[None, dm, softmax_phase],
                         tOrO_s2[None, dm],
                     )
+                o_handles_p = []
+                tOrO_parts = []
+                if cutlass.const_expr(v_channel):
+                    for pp in cutlass.range_constexpr(1, v_parts, 1):
+                        oh_p = o_consumer.wait_and_advance()
+                        o_handles_p.append(oh_p)
+                        tOrO_p = cute.make_rmem_tensor(
+                            (*tOsO_w.shape[:1], tiles_dm), acc_dtype
+                        )
+                        for dm in cutlass.range_constexpr(tiles_dm):
+                            cute.copy(
+                                tmem_load_atom_o,
+                                tOtO[None, dm, oh_p.index],
+                                tOrO_p[None, dm],
+                            )
+                        tOrO_parts.append(tOrO_p)
 
                 # Load colmax of s
                 sM_producer_nbar.arrive_and_wait()
@@ -5257,14 +5283,16 @@ class IntDecodeSm100(GQAPagedDecode):
                 # head n - g -> factor of head n % g); the pscale is one
                 # exponent for the whole pool, so O needs no pscale re-base
                 # here and l/c stay in true units.
-                correction_lane = exp2(sM_hist[0] - sM_lane)
-                correction_r = cute.make_rmem_tensor(nL, acc_dtype)
-                for n in cutlass.range_constexpr(nL):
-                    correction_r[n] = cute.arch.shuffle_sync(
-                        correction_lane, n % blk_tile_n
-                    )
-                correction = correction_r.load()
-                correction_om = correction
+                correction = correction_om = None
+                if cutlass.const_expr(not v_channel):
+                    correction_lane = exp2(sM_hist[0] - sM_lane)
+                    correction_r = cute.make_rmem_tensor(nL, acc_dtype)
+                    for n in cutlass.range_constexpr(nL):
+                        correction_r[n] = cute.arch.shuffle_sync(
+                            correction_lane, n % blk_tile_n
+                        )
+                    correction = correction_r.load()
+                    correction_om = correction
                 corr_v_r = None
                 if cutlass.const_expr(v_channel):
                     # drain rebase: previous drained tile's max ->
@@ -5272,10 +5300,12 @@ class IntDecodeSm100(GQAPagedDecode):
                     corr_v_lane = exp2(m_prev_v - sM_hist[0])
                     m_prev_v = sM_hist[0]
                     corr_v_r = cute.make_rmem_tensor(nL, acc_dtype)
-                    for n in cutlass.range_constexpr(nL):
-                        corr_v_r[n] = cute.arch.shuffle_sync(
-                            corr_v_lane, n % blk_tile_n
+                    for n in cutlass.range_constexpr(blk_tile_n):
+                        cv_n = cute.arch.shuffle_sync(
+                            corr_v_lane, n
                         )
+                        corr_v_r[n] = cv_n
+                        corr_v_r[blk_tile_n + n] = cv_n
                 for j in cutlass.range_constexpr(o_stages - 1):
                     sM_hist[j] = sM_hist[j + 1]
                 sM_hist[o_stages - 1] = sM_lane
@@ -5310,25 +5340,31 @@ class IntDecodeSm100(GQAPagedDecode):
 
                 z_dp = Float32(0)
                 if cutlass.const_expr(v_channel):
-                    # DRAIN tile s's slot: fetch this tile's group
-                    # (s_d, z_d) for this thread's d-row from the
-                    # tile's first page (channel sections are
-                    # duplicated per page; groups are tile-
-                    # contained), rebase rAcc and add the scaled
-                    # slot; the slot is CONSUMED — release after
-                    # the LDTM view retires, no store-back.
+                    # DRAIN tile s's slots: all v_parts LDTMs were issued
+                    # before the sM rendezvous above, so they are ready here
+                    # and share one TMEM load fence before releasing.
                     s_dp = rSVD_pf[0][0] * Float32(vch_s_mul)
-                    z_dp = (
-                        rZVD_pf[0][0]
-                        - Float32(vch_beta) * rSVD_pf[0][0]
-                    )
-                    rAcc.store(
+                    rAcc_cur = (
                         corr_v_r.load() * rAcc.load()
                         + s_dp
                         * tOrO_s2.load().reshape((nL, tiles_dm))
                     )
+                    for pp in cutlass.range_constexpr(1, v_parts, 1):
+                        s_dp2 = (
+                            rSVD_pf[pp][0] * Float32(vch_s_mul)
+                        )
+                        rAcc_cur = (
+                            rAcc_cur
+                            + s_dp2
+                            * tOrO_parts[pp - 1].load().reshape(
+                                (nL, tiles_dm)
+                            )
+                        )
+                    rAcc.store(rAcc_cur)
                     cute.arch.fence_view_async_tmem_load()
                     o_handle.release()
+                    for pp in cutlass.range_constexpr(1, v_parts, 1):
+                        o_handles_p[pp - 1].release()
                 else:
                     rmw_release_o()
 
@@ -5338,101 +5374,51 @@ class IntDecodeSm100(GQAPagedDecode):
                 # gates the softmax's slot reuse a full window later, so
                 # it does not belong on the VP-blocking segment above.
                 if cutlass.const_expr(v_channel):
-                    # consume this tile's part-0 [colsum | l]
-                    # entry (pre-reduced per warp by the softmax
-                    # WG; fixed-order 4-slot sum = deterministic),
-                    # then the remaining parts (same running-max
-                    # frame -> corr == 1 exactly).
+                    # consume this tile's single sLC stage holding
+                    # [colsum | l_0 | ... | l_{v_parts-1}].
                     lch = lc_consumer.wait_and_advance()
-                    lcf = cute.make_rmem_tensor(nL, acc_dtype)
-                    for n in cutlass.range_constexpr(nL):
-                        a0 = sLC[n, 0, lch.index]
+                    rLC_w = cute.make_rmem_tensor(blk_tile_n, acc_dtype)
+                    rLC_sum = cute.make_rmem_tensor(blk_tile_n, acc_dtype)
+                    cute.autovec_copy(
+                        sLC_d[None, 0, 0, lch.index], rLC_sum
+                    )
+                    for w in cutlass.range_constexpr(
+                        1, warpgroup_warps, 1
+                    ):
+                        cute.autovec_copy(
+                            sLC_d[None, 0, w, lch.index], rLC_w
+                        )
+                        rLC_sum.store(rLC_sum.load() + rLC_w.load())
+                    for n in cutlass.range_constexpr(blk_tile_n):
+                        rAccZ[n] = corr_v_r[n] * rAccZ[n]
+                        colsum_acc_v[n] = (
+                            corr_v_r[n] * colsum_acc_v[n] + rLC_sum[n]
+                        )
+                    for pp in cutlass.range_constexpr(v_parts):
+                        if cutlass.const_expr(vch_beta == 0.0):
+                            z_dp_p = rZVD_pf[pp][0]
+                        else:
+                            z_dp_p = (
+                                rZVD_pf[pp][0]
+                                - Float32(vch_beta) * rSVD_pf[pp][0]
+                            )
+                        cute.autovec_copy(
+                            sLC_d[None, 1 + pp, 0, lch.index], rLC_sum
+                        )
                         for w in cutlass.range_constexpr(
                             1, warpgroup_warps, 1
                         ):
-                            a0 += sLC[n, w, lch.index]
-                        lcf[n] = a0
+                            cute.autovec_copy(
+                                sLC_d[None, 1 + pp, w, lch.index], rLC_w
+                            )
+                            rLC_sum.store(rLC_sum.load() + rLC_w.load())
+                        for n in cutlass.range_constexpr(blk_tile_n):
+                            rAccZ[n] = rAccZ[n] + z_dp_p * rLC_sum[n]
                     lch.release()
-                    colsum_acc_v.store(
-                        corr_v_r.load() * colsum_acc_v.load()
-                        + lcf.load()
-                    )
-                    for n in cutlass.range_constexpr(blk_tile_n):
-                        rAccZ[n] = (
-                            corr_v_r[n] * rAccZ[n]
-                            + z_dp * lcf[blk_tile_n + n]
-                        )
-                    for pp in cutlass.range_constexpr(
-                        1, v_parts, 1
-                    ):
-                        o_handle_p = o_consumer.wait_and_advance()
-                        tOrO_pp = cute.make_rmem_tensor(
-                            (*tOsO_w.shape[:1], tiles_dm),
-                            acc_dtype,
-                        )
-                        for dm in cutlass.range_constexpr(tiles_dm):
-                            cute.copy(
-                                tmem_load_atom_o,
-                                tOtO[None, dm, o_handle_p.index],
-                                tOrO_pp[None, dm],
-                            )
-                        s_dp2 = (
-                            rSVD_pf[pp][0] * Float32(vch_s_mul)
-                        )
-                        z_dp2 = (
-                            rZVD_pf[pp][0]
-                            - Float32(vch_beta) * rSVD_pf[pp][0]
-                        )
-                        rAcc.store(
-                            rAcc.load()
-                            + s_dp2
-                            * tOrO_pp.load().reshape(
-                                (nL, tiles_dm)
-                            )
-                        )
-                        cute.arch.fence_view_async_tmem_load()
-                        o_handle_p.release()
-                        lch2 = lc_consumer.wait_and_advance()
-                        lcf2 = cute.make_rmem_tensor(nL, acc_dtype)
-                        for n in cutlass.range_constexpr(nL):
-                            a2 = sLC[n, 0, lch2.index]
-                            for w in cutlass.range_constexpr(
-                                1, warpgroup_warps, 1
-                            ):
-                                a2 += sLC[n, w, lch2.index]
-                            lcf2[n] = a2
-                        lch2.release()
-                        colsum_acc_v.store(
-                            colsum_acc_v.load() + lcf2.load()
-                        )
-                        for n in cutlass.range_constexpr(
-                            blk_tile_n
-                        ):
-                            rAccZ[n] = (
-                                rAccZ[n]
-                                + z_dp2 * lcf2[blk_tile_n + n]
-                            )
-                    # PREFETCH tile s+1's drain scales (consumed
-                    # by the next iteration, or by the tail's first
-                    # tile — a full tile of latency budget for the
-                    # page-table + scale LDGs). NOTE: this sits
-                    # inside `if keep_tile` — if BLASST skipping is
-                    # ever enabled for flex configs (currently
-                    # ctor-asserted off), a skipped tile would also
-                    # skip the NEXT tile's prefetch and a later kept
-                    # tile would read stale scales.
-                    # The loads need no page guard. This loop stops o_stages tiles
-                    # before the split's last tile, and the constructor admits only
-                    # o_stages 2 and 3, so tile s + 1 is never the split's last tile and
-                    # therefore never the sequence's last, partial one: every part of it
-                    # starts on a page inside the sequence. A guarded load would reach
-                    # its slot through a copy at the branch join, and that copy waits
-                    # for the load right here instead of at the next tile's drain.
+                    # PREFETCH tile s+1's drain scales using `phys_v_pf`
+                    # prefetched at the top of this iteration.
                     for pp in cutlass.range_constexpr(v_parts):
-                        lp_pf = (
-                            (s + 1) * kv_splits + kv_split_idx
-                        ) * pages_s + pp * v_pages
-                        phys_pf = gPT_c[lp_pf]
+                        phys_pf = phys_v_pf[pp]
                         rSVD_pf[pp][0] = Float32(
                             mSC_flat[
                                 v_ch_off + warpgroup_tidx,
@@ -5489,23 +5475,27 @@ class IntDecodeSm100(GQAPagedDecode):
         # weight o-1 == 1 and is not materialized. Empty slots
         # (iters_s < o_stages) carry zeros and a finite don't-care
         # weight thanks to the preamble's history padding.
-        corr_tail_r = cute.make_rmem_tensor((nL, o_stages - 1), acc_dtype)
-        for j in cutlass.range_constexpr(o_stages - 1):
-            w_lane = exp2(sM_hist[j] - sM_hist[o_stages - 1])
-            for n in cutlass.range_constexpr(nL):
-                corr_tail_r[n, j] = cute.arch.shuffle_sync(
-                    w_lane, n % blk_tile_n
-                )
-        correction = corr_tail_r[None, 0].load()
-        correction_om = correction
+        corr_tail_r = correction = correction_om = colsum_final = None
+        w_lane = Float32(1.0)
+        if cutlass.const_expr(not v_channel):
+            corr_tail_r = cute.make_rmem_tensor((nL, o_stages - 1), acc_dtype)
+            for j in cutlass.range_constexpr(o_stages - 1):
+                w_lane = exp2(sM_hist[j] - sM_hist[o_stages - 1])
+                for n in cutlass.range_constexpr(nL):
+                    corr_tail_r[n, j] = cute.arch.shuffle_sync(
+                        w_lane, n % blk_tile_n
+                    )
+            correction = corr_tail_r[None, 0].load()
+            correction_om = correction
 
         # Correct and accumulate final colsum (+ fold: reduce c_h)
         if cutlass.const_expr(fold_p):
             rC = cute.make_rmem_tensor(blk_tile_n, acc_dtype)
         tail_phase = softmax_phase if enable_blasst else iters_s % o_stages
-        zeros_nL = cute.make_rmem_tensor(nL, Float32)
-        zeros_nL.fill(Float32(0))
-        colsum_final = zeros_nL.load()
+        if cutlass.const_expr(not v_channel):
+            zeros_nL = cute.make_rmem_tensor(nL, Float32)
+            zeros_nL.fill(Float32(0))
+            colsum_final = zeros_nL.load()
         # Read every colsum_p slot HERE, unconditionally, and let the tail branches
         # below only select among these values. nvidia-cutlass-dsl 4.6.1 and 4.8.0
         # miscompile a colsum_p slot read placed inside the `== phase` branches: they
@@ -5667,87 +5657,102 @@ class IntDecodeSm100(GQAPagedDecode):
                                 (coord_hk, phys_pl),
                             ]
                         )
-            for v in cutlass.range(
-                n_tail_tiles * v_parts, unroll=1
+            for jt in cutlass.range(
+                n_tail_tiles, unroll=1
             ):
-                jt = v // v_parts       # tail tile ordinal
-                ppt = v - jt * v_parts  # part within the tile
+                oh_t_list = []
+                tOrO_t_list = []
+                for pp in cutlass.range_constexpr(v_parts):
+                    oh_t = o_consumer.wait_and_advance()
+                    oh_t_list.append(oh_t)
+                    tOrO_t = cute.make_rmem_tensor(
+                        (*tOsO_w.shape[:1], tiles_dm), acc_dtype
+                    )
+                    for dm in cutlass.range_constexpr(tiles_dm):
+                        cute.copy(
+                            tmem_load_atom_o,
+                            tOtO[None, dm, oh_t.index],
+                            tOrO_t[None, dm],
+                        )
+                    tOrO_t_list.append(tOrO_t)
                 j_hist = jt + (Int32(o_stages) - n_tail_tiles)
-                # rebase weight: part 0 of a tile rebases from
-                # the previous drained frame; other parts share
-                # the frame (weight exactly 1). Padded history
-                # entries repeat M[0], so short sequences get
-                # unit weights automatically.
                 w_lane = Float32(1.0)
-                if ppt == 0:
-                    for jj in cutlass.range_constexpr(o_stages):
-                        if j_hist == jj:
-                            if cutlass.const_expr(jj == 0):
-                                w_lane = exp2(
-                                    m_prev_v - sM_hist[0]
-                                )
-                            else:
-                                w_lane = exp2(
-                                    sM_hist[jj - 1] - sM_hist[jj]
-                                )
-                corr_t = cute.make_rmem_tensor(nL, acc_dtype)
-                for n in cutlass.range_constexpr(nL):
-                    corr_t[n] = cute.arch.shuffle_sync(
-                        w_lane, n % blk_tile_n
-                    )
-                oh_t = o_consumer.wait_and_advance()
-                tOrO_t = cute.make_rmem_tensor(
-                    (*tOsO_w.shape[:1], tiles_dm), acc_dtype
-                )
-                for dm in cutlass.range_constexpr(tiles_dm):
-                    cute.copy(
-                        tmem_load_atom_o,
-                        tOtO[None, dm, oh_t.index],
-                        tOrO_t[None, dm],
-                    )
-                # this virtual tile's raw scales, selected out of the
-                # registers loaded before the loop (zeros past the sequence)
-                s_raw_t = Float32(0)
-                z_raw_t = Float32(0)
                 for jj in cutlass.range_constexpr(o_stages):
-                    for pp in cutlass.range_constexpr(v_parts):
-                        if (jt == jj) & (ppt == pp):
+                    if j_hist == jj:
+                        if cutlass.const_expr(jj == 0):
+                            w_lane = exp2(
+                                m_prev_v - sM_hist[0]
+                            )
+                        else:
+                            w_lane = exp2(
+                                sM_hist[jj - 1] - sM_hist[jj]
+                            )
+                corr_t = cute.make_rmem_tensor(nL, acc_dtype)
+                for n in cutlass.range_constexpr(blk_tile_n):
+                    ct_n = cute.arch.shuffle_sync(
+                        w_lane, n
+                    )
+                    corr_t[n] = ct_n
+                    corr_t[blk_tile_n + n] = ct_n
+                lch_t = lc_consumer.wait_and_advance()
+                rLC_tw = cute.make_rmem_tensor(blk_tile_n, acc_dtype)
+                rLC_tsum = cute.make_rmem_tensor(blk_tile_n, acc_dtype)
+                cute.autovec_copy(
+                    sLC_d[None, 0, 0, lch_t.index], rLC_tsum
+                )
+                for w in cutlass.range_constexpr(
+                    1, warpgroup_warps, 1
+                ):
+                    cute.autovec_copy(
+                        sLC_d[None, 0, w, lch_t.index], rLC_tw
+                    )
+                    rLC_tsum.store(rLC_tsum.load() + rLC_tw.load())
+                for n in cutlass.range_constexpr(blk_tile_n):
+                    rAccZ[n] = corr_t[n] * rAccZ[n]
+                    colsum_acc_v[n] = (
+                        corr_t[n] * colsum_acc_v[n] + rLC_tsum[n]
+                    )
+                rAcc_t = corr_t.load() * rAcc.load()
+                for pp in cutlass.range_constexpr(v_parts):
+                    s_raw_t = Float32(0)
+                    z_raw_t = Float32(0)
+                    for jj in cutlass.range_constexpr(o_stages):
+                        if jt == jj:
                             if cutlass.const_expr(jj < pl_first):
                                 s_raw_t = rSVD_pf[pp][0]
                                 z_raw_t = rZVD_pf[pp][0]
                             else:
                                 s_raw_t = rSVT[jj][pp][0]
                                 z_raw_t = rZVT[jj][pp][0]
-                s_dp_t = s_raw_t * Float32(vch_s_mul)
-                z_dp_t = (
-                    z_raw_t - Float32(vch_beta) * s_raw_t
-                )
-                rAcc.store(
-                    corr_t.load() * rAcc.load()
-                    + s_dp_t
-                    * tOrO_t.load().reshape((nL, tiles_dm))
-                )
-                cute.arch.fence_view_async_tmem_load()
-                oh_t.release()
-                lch_t = lc_consumer.wait_and_advance()
-                lcf_t = cute.make_rmem_tensor(nL, acc_dtype)
-                for n in cutlass.range_constexpr(nL):
-                    a_t = sLC[n, 0, lch_t.index]
+                    s_dp_t = s_raw_t * Float32(vch_s_mul)
+                    if cutlass.const_expr(vch_beta == 0.0):
+                        z_dp_t = z_raw_t
+                    else:
+                        z_dp_t = (
+                            z_raw_t - Float32(vch_beta) * s_raw_t
+                        )
+                    cute.autovec_copy(
+                        sLC_d[None, 1 + pp, 0, lch_t.index], rLC_tsum
+                    )
                     for w in cutlass.range_constexpr(
                         1, warpgroup_warps, 1
                     ):
-                        a_t += sLC[n, w, lch_t.index]
-                    lcf_t[n] = a_t
-                lch_t.release()
-                colsum_acc_v.store(
-                    corr_t.load() * colsum_acc_v.load()
-                    + lcf_t.load()
-                )
-                for n in cutlass.range_constexpr(blk_tile_n):
-                    rAccZ[n] = (
-                        corr_t[n] * rAccZ[n]
-                        + z_dp_t * lcf_t[blk_tile_n + n]
+                        cute.autovec_copy(
+                            sLC_d[None, 1 + pp, w, lch_t.index], rLC_tw
+                        )
+                        rLC_tsum.store(rLC_tsum.load() + rLC_tw.load())
+                    for n in cutlass.range_constexpr(blk_tile_n):
+                        rAccZ[n] = rAccZ[n] + z_dp_t * rLC_tsum[n]
+                    rAcc_t = (
+                        rAcc_t
+                        + s_dp_t
+                        * tOrO_t_list[pp].load().reshape((nL, tiles_dm))
                     )
+                lch_t.release()
+                rAcc.store(rAcc_t)
+                cute.arch.fence_view_async_tmem_load()
+                for pp in cutlass.range_constexpr(v_parts):
+                    oh_t_list[pp].release()
             # final colsum -> sL, then the reduction-warp
             # handshake. colsum_acc_v already holds FULL column
             # sums (the sLC entries are pre-reduced per warp), so
@@ -6272,10 +6277,16 @@ class IntDecodeSm100(GQAPagedDecode):
                             (
                                 sScale.iterator
                                 + (tok_row * 4 + stg_j * page_size * 4)
-                            ).align(16),
+                            ).align((4 * self.scale_dtype.width) // 8),
                             cute.make_layout(4),
                         )
-                        cute.autovec_copy(sSZ, rSZ2[None, smi])
+                        if cutlass.const_expr(self.scale_sdtype == "f32"):
+                            cute.autovec_copy(sSZ, rSZ2[None, smi])
+                        else:
+                            rSZ_raw = cute.make_rmem_tensor(4, self.scale_dtype)
+                            cute.autovec_copy(sSZ, rSZ_raw)
+                            for e in cutlass.range_constexpr(4):
+                                rSZ2[e, smi] = Float32(rSZ_raw[e])
                     else:
                         # flex ring sections: K pairs first, V pairs
                         # after (each token's slice of its section)
@@ -6300,7 +6311,7 @@ class IntDecodeSm100(GQAPagedDecode):
                                 cute.make_layout(2),
                             )
                             for e in cutlass.range_constexpr(2):
-                                rSZ2[k_ring_w + e, smi] = sVZ[e]
+                                rSZ2[k_ring_w + e, smi] = Float32(sVZ[e])
                 # ASYNC-PROXY ORDERING before the scale release. The quad LDS above
                 # is a GENERIC-proxy read and the release is the ordinary mbarrier
                 # release/acquire handoff, which lacks the generic->async proxy
@@ -6501,12 +6512,22 @@ class IntDecodeSm100(GQAPagedDecode):
                                                 tok_row * 4
                                                 + stg_j * page_size * 4
                                             )
-                                        ).align(16),
+                                        ).align((4 * self.scale_dtype.width) // 8),
                                         cute.make_layout(4),
                                     )
-                                    cute.autovec_copy(
-                                        sSZ, rSZ2[None, smi]
-                                    )
+                                    if cutlass.const_expr(self.scale_sdtype == "f32"):
+                                        cute.autovec_copy(
+                                            sSZ, rSZ2[None, smi]
+                                        )
+                                    else:
+                                        rSZ_raw = cute.make_rmem_tensor(
+                                            4, self.scale_dtype
+                                        )
+                                        cute.autovec_copy(sSZ, rSZ_raw)
+                                        for e in cutlass.range_constexpr(4):
+                                            rSZ2[e, smi] = Float32(
+                                                rSZ_raw[e]
+                                            )
                                 else:
                                     if cutlass.const_expr(k_ring_w > 0):
                                         sKZ = cute.make_tensor(
@@ -6563,11 +6584,7 @@ class IntDecodeSm100(GQAPagedDecode):
                     # is read PER ROW, one value per head row, never a
                     # plane-wide scalar broadcast into every rSK[n].
                     if cutlass.const_expr(k_channel):
-                        qb_handles = []
-                        for _kp in cutlass.range_constexpr(k_parts):
-                            qb_handles.append(
-                                qb_consumer.wait_and_advance()
-                            )
+                        qb_h = qb_consumer.wait_and_advance()
                         # VECTORIZED coefficient read. `sQB` is
                         # (2*blk_tile_n, qp_stages) with the coefficient
                         # mode at stride 1, so the g lifts are one
@@ -6583,7 +6600,7 @@ class IntDecodeSm100(GQAPagedDecode):
                             # read the coefficient vectors ONCE and reuse
                             # the registers. Previously each M-tile
                             # re-read the identical sQB slot.
-                            qb_read(qb_handles[0].index, rQBs, rQBz)
+                            qb_read(qb_h.index, rQBs, rQBz)
                         for smi in cutlass.range_constexpr(tiles_sm):
                             if cutlass.const_expr(
                                 k_parts == 2 * tiles_sm
@@ -6595,22 +6612,23 @@ class IntDecodeSm100(GQAPagedDecode):
                                 # load only the selected group's vectors
                                 # instead of loading BOTH and blending
                                 # with a multiply/add per row.
-                                iA = qb_handles[2 * smi].index
-                                iB = qb_handles[2 * smi + 1].index
+                                iA = qb_h.index * k_parts + 2 * smi
+                                iB = iA + 1
                                 if tok_half == 0:
                                     qb_read(iA, rQBs, rQBz)
                                 else:
                                     qb_read(iB, rQBs, rQBz)
                             elif cutlass.const_expr(k_parts > 1):
-                                qb_read(qb_handles[smi].index,
-                                        rQBs, rQBz)
+                                qb_read(
+                                    qb_h.index * k_parts + smi,
+                                    rQBs, rQBz,
+                                )
                             for n in cutlass.range_constexpr(
                                 blk_tile_n
                             ):
                                 rSK[n, smi] = rQBs[n]
                                 rZQ[n, smi] = rQBz[n]
-                        for qh in qb_handles:
-                            qh.release()
+                        qb_h.release()
 
                 # Load S from tmem and notify BMM1
                 s_token = s_consumer.try_wait()
@@ -6925,59 +6943,47 @@ class IntDecodeSm100(GQAPagedDecode):
                     for sm in cutlass.range_constexpr(1, tiles_sm, 1):
                         colsum += probs[None, sm]
                     if cutlass.const_expr(v_channel):
-                        # channel-V: PRE-REDUCED [colsum | l] smem
-                        # ring, one entry per group part (the tL
-                        # tmem/named-barrier channel cannot run at
-                        # v_parts rate). Each warp REDUX-sums its 32
-                        # tokens' contributions per column into its
-                        # sLC warp slot; the correction WG sums the 4
-                        # slots in fixed order. A part covers smi =
-                        # pp // psk_s and (when two parts share an
-                        # smi chunk, Gt=64) the tokens of one
-                        # 64-token page half — a thread contributes
-                        # iff its token is in the part (mask).
+                        # channel-V: PRE-REDUCED [colsum | l_0 | ... | l_{v_parts-1}]
+                        # smem ring, one stage per sequence tile. Each warp
+                        # REDUX-sums its 32 tokens' contributions per column
+                        # into its sLC warp slot; the correction WG sums the
+                        # 4 slots in fixed order (deterministic).
                         psk_s = v_parts // tiles_sm
-                        prS = cute.make_rmem_tensor(
-                            (blk_tile_n, tiles_sm), acc_dtype
-                        )
-                        prS.store(probs)
+                        lch = lc_producer.acquire_and_advance()
+                        for n in cutlass.range_constexpr(blk_tile_n):
+                            cv_r = cute.arch.warp_reduction_sum(colsum[n])
+                            if n == lane_idx:
+                                sLC[
+                                    n, warpgroup_widx, lch.index
+                                ] = cv_r
                         for pp in cutlass.range_constexpr(v_parts):
                             smi_p = pp // psk_s if psk_s >= 1 else pp
                             if cutlass.const_expr(psk_s > 1):
                                 mask = Float32(
                                     Int32(tok_half == pp % psk_s)
                                 )
-                            else:
-                                mask = Float32(1.0)
-                            lch = lc_producer.acquire_and_advance()
                             for n in cutlass.range_constexpr(
                                 blk_tile_n
                             ):
-                                if cutlass.const_expr(v_parts > 1):
-                                    cv_p = prS[n, smi_p] * mask
+                                if cutlass.const_expr(psk_s > 1):
                                     lv_p = cvecS[n, smi_p] * mask
+                                elif cutlass.const_expr(v_parts > 1):
+                                    lv_p = cvecS[n, smi_p]
                                 else:
-                                    cv_p = colsum[n]
                                     lv_p = cvec[n]
-                                cv_r = cute.arch.warp_reduction_sum(
-                                    cv_p
-                                )
                                 lv_r = cute.arch.warp_reduction_sum(
                                     lv_p
                                 )
                                 if n == lane_idx:
                                     sLC[
-                                        n, warpgroup_widx, lch.index
-                                    ] = cv_r
-                                    sLC[
-                                        blk_tile_n + n,
+                                        (1 + pp) * blk_tile_n + n,
                                         warpgroup_widx,
                                         lch.index,
                                     ] = lv_r
-                            # order every lane's store before lane
-                            # 0's release arrive
-                            cute.arch.sync_warp()
-                            lch.commit()
+                        # order every lane's store before lane
+                        # 0's release arrive
+                        cute.arch.sync_warp()
+                        lch.commit()
                     else:
                         tSrL = cute.make_rmem_tensor(tSrL_shape, acc_dtype)
                         if cutlass.const_expr(fold_p):
@@ -7198,7 +7204,7 @@ class IntDecodeSm100(GQAPagedDecode):
         v_parts = max(v_parts, 1)
         v_pages = (self.v_group // self.page_size) if v_channel else 0
         o_ring = self._o_stages * v_parts if v_channel else self._o_stages
-        lc_stages = o_ring + v_parts  # one tile of slack over the drain lag
+        lc_stages = self._o_stages + 1  # one tile of slack over the drain lag
         # channel-K: the TMA-QK warp builds per-group Q' planes
         # (e4m3(s'_d * Q * 2^-m_G), the B operand of the QK MMA) + a bias
         # ring entry (2^m_G, bias_G[h] = sum_d z'_d * Q[h, d]) — the hot
@@ -7226,7 +7232,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # softmax bias reads need them, acyclic by construction. The ring
         # must hold the full build-ahead window.
         kb_ahead = self._o_stages if k_channel else 0
-        qp_stages = ((kb_ahead + 2) * k_parts) if k_channel else 0
+        qp_tile_stages = (kb_ahead + 2) if k_channel else 0
+        qp_stages = (qp_tile_stages * k_parts) if k_channel else 0
         # THE P-SCALE EXPONENT. Where s_v rides inside P (the fold with
         # token-wise V), lp = floor(log2(448 / max s_v over the pool)) comes from
         # the cache's count table (`_pool_pscale_lp`): in a one-item CTA the
@@ -7573,8 +7580,8 @@ class IntDecodeSm100(GQAPagedDecode):
             Int64, self.scale_stages * 2
         )
         if cutlass.const_expr(k_channel):
-            qp_pipeline_ptr = smem.allocate_array(Int64, qp_stages * 2)
-            qb_pipeline_ptr = smem.allocate_array(Int64, qp_stages * 2)
+            qp_pipeline_ptr = smem.allocate_array(Int64, qp_tile_stages * 2)
+            qb_pipeline_ptr = smem.allocate_array(Int64, qp_tile_stages * 2)
         s_pipeline_ptr = smem.allocate_array(Int64, self.s_stages * 2)
         p_pipeline_ptr = smem.allocate_array(Int64, self.p_stages * 2)
         o_pipeline_ptr = smem.allocate_array(Int64, o_ring * 2)
@@ -7647,7 +7654,7 @@ class IntDecodeSm100(GQAPagedDecode):
             sLC = smem.allocate_tensor(
                 acc_dtype,
                 cute.make_layout(
-                    (2 * blk_tile_n, warpgroup_warps, lc_stages)
+                    ((1 + v_parts) * blk_tile_n, warpgroup_warps, lc_stages)
                 ),
                 svector_align,
             )
@@ -8006,14 +8013,14 @@ class IntDecodeSm100(GQAPagedDecode):
                 # releases the bias ring; the plane ring's consumer release is
                 # the UMMA-commit mechanism (count 1).
                 qp_producer, qp_consumer = pipeline.PipelineAsyncUmma.create(
-                    num_stages=qp_stages,
+                    num_stages=qp_tile_stages,
                     producer_group=warpgroup_cooperative,
                     consumer_group=mma_group,
                     barrier_storage=qp_pipeline_ptr,
                     defer_sync=True,
                 ).make_participants()
                 qb_producer, qb_consumer = pipeline.PipelineAsync.create(
-                    num_stages=qp_stages,
+                    num_stages=qp_tile_stages,
                     producer_group=warpgroup_cooperative,
                     consumer_group=warpgroup_cooperative,
                     barrier_storage=qb_pipeline_ptr,
