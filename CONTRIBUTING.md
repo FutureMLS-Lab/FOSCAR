@@ -2,8 +2,8 @@
 
 ## Setup
 
-The package is pure Python and JIT-compiles its kernels, so a source checkout is
-all you need:
+FOSCA is pure Python and JIT-compiles its kernels, so a source checkout is all
+you need:
 
 ```sh
 git clone https://github.com/donglinz/fosca.git

@@ -1,4 +1,4 @@
-# Integrating fosca into a decode loop
+# Integrating FOSCA into a decode loop
 
 This page covers the plan/run lifecycle, the page-table inputs, writing the
 cache, what to keep out of the per-step path, and CUDA graph capture.

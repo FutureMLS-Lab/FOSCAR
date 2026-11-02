@@ -27,8 +27,8 @@ BASE = "flashinfer_bf16"
 # the marker, not by colour alone. bf16 is the reference line rather than a
 # series, so it takes no hue.
 SERIES = [
-    ("ours_int2", "this package, int2", "#2a78d6", "o"),
-    ("ours_int4", "this package, int4", "#eb6834", "s"),
+    ("ours_int2", "FOSCA int2", "#2a78d6", "o"),
+    ("ours_int4", "FOSCA int4", "#eb6834", "s"),
     ("trtllm_nvfp4", "TRT-LLM NVFP4", "#1baf7a", "D"),
     ("trtllm_fp8", "TRT-LLM FP8", "#eda100", "^"),
 ]

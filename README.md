@@ -1,4 +1,4 @@
-# fosca
+# FOSCA
 
 Quantized-KV paged GQA decode kernels for Hopper (SM90) and Blackwell (SM100),
 written in CuTe DSL and exposed through one architecture-agnostic wrapper.
@@ -143,7 +143,7 @@ bf16 at the same shape, so the dashed line at 1.00 is bf16.
 
 ![Decode speedup over FlashInfer bf16 on B200, at batch 1 and 8](docs/decode-latency-b200.png)
 
-| Batch | Context | int2 | int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
+| Batch | Context | FOSCA int2 | FOSCA int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 32K | **15.0** | 17.5 | 35.6 | 23.4 | 18.3 |
 | 1 | 128K | **35.5** | 43.7 | 98.4 | 58.9 | 41.7 |
@@ -161,7 +161,7 @@ TensorRT-LLM column.
 
 ![Decode speedup over FlashInfer bf16 on H100, at batch 1 and 8](docs/decode-latency-h100.png)
 
-| Batch | Context | int2 | int4 | FlashInfer bf16 |
+| Batch | Context | FOSCA int2 | FOSCA int4 | FlashInfer bf16 |
 |---:|---:|---:|---:|---:|
 | 1 | 32K | **25.8** | 33.0 | 63.4 |
 | 1 | 128K | **73.7** | 79.7 | 200.6 |
@@ -182,10 +182,10 @@ over a cold L2, the median of the fully observed iterations. It excludes host
 dispatch and the paged-attention wrapper, so it is not an end-to-end serving
 latency.
 
-The columns for this package were measured by driving `PagedDecodeWrapper` from
-this release; `benchmarks/decode_latency.csv` holds the values and
+The FOSCA columns were measured by driving `PagedDecodeWrapper` from this
+release; `benchmarks/decode_latency.csv` holds the values and
 `benchmarks/plot_decode.py` renders both figures. The competitor columns were
-measured by the project's benchmark harness. Re-measuring this package's columns
+measured by the project's benchmark harness. Re-measuring the FOSCA columns
 reproduced the tables to within 1.5% on both GPUs, except for one B200 cell,
 batch 8 at 128K, which is reported at the value it reproduces.
 

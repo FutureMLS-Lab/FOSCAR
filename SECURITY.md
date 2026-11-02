@@ -8,7 +8,7 @@ problem.
 
 ## Scope
 
-This project compiles and launches GPU kernels. Reports of interest include:
+FOSCA compiles and launches GPU kernels. Reports of interest include:
 
 - memory-safety or out-of-bounds access in a kernel, for example through a page
   table or sequence length the planner accepts;

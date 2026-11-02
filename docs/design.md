@@ -1,6 +1,6 @@
 # Design and Internals
 
-This page describes how `fosca` is built: the package layout, how the wrapper
+This page describes how FOSCA is built: the package layout, how the wrapper
 picks a kernel for the device it runs on, the lifecycle of that wrapper, the workspace
 the split-K reduction needs, and how a launch is bound to a CUDA stream. It is written
 for contributors and for integrators wiring the package into a serving engine, who want
