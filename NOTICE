@@ -26,12 +26,17 @@ track upstream and are not drop-in compatible with it.
 Derived work: NVIDIA CUTLASS
 --------------------------------------------------------------------------------
 
-The SM90 decode kernel is also adapted from the Hopper FMHA CuTeDSL example in
-NVIDIA CUTLASS (https://github.com/NVIDIA/cutlass), which is licensed under the
-BSD 3-Clause License, reproduced below.
+`src/fosca/_sm100/gqa_decode.py`, `src/fosca/_sm100/int_fold_decode.py`,
+`src/fosca/_sm100/int_fold_asm.py` and `src/fosca/wrapper.py` are adapted from
+the Hopper FMHA CuTeDSL example in NVIDIA CUTLASS
+(https://github.com/NVIDIA/cutlass), which is licensed under the BSD 3-Clause
+License, reproduced below. These four files carry NVIDIA's copyright notice.
 
 Changes from the upstream work: the dense FMHA pipeline was replaced with a
-quantized paged-decode pipeline.
+quantized paged-decode pipeline. The dense SM90 decode kernel that the example
+was originally adapted into was removed when the package became quantized-only,
+so the modules listed above no longer track upstream and are not drop-in
+compatible with it.
 
 --------------------------------------------------------------------------------
 Redistributed: QuACK
