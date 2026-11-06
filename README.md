@@ -206,8 +206,7 @@ If you find FOSCAR useful in your research or systems, please cite our preprint:
   title   = {{FOSCAR}: Accelerating Decode Attention over 2- and 4-Bit {KV} Caches through Affine Folding},
   author  = {Donglin Zhuang and Pragaash Ponnusamy and Xiaoxia Wu and Shuaiwen Leon Song and Zhongzhu Zhou},
   journal = {arXiv preprint},
-  year    = {2026},
-  url     = {https://github.com/FutureMLS-Lab/FOSCAR}
+  year    = {2026}
 }
 ```
 
