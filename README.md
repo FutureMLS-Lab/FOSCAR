@@ -140,22 +140,14 @@ bf16 at the same shape, so the dashed line at 1.00 is bf16.
 
 ### Shapes
 
-A shape is the attention geometry one GPU decodes: a model's query-head and
-KV-head counts divided by the tensor-parallel width it is served at. The last
-column is what the tables below measure; the second is the model's own counts.
+Head counts are per GPU, after tensor parallelism.
 
-| Model | Heads in the model (Q / KV) | Head dim | Tensor parallel | Heads per GPU (Q / KV) |
-|---|---|---:|---:|---|
-| Qwen3-8B | 32 / 8 | 128 | 1 | 32 / 8 |
-| Inkling, full-attention layers | 64 / 8 | 128 | 8 | 8 / 1 |
+| Model | Tensor parallel | Query heads | KV heads | Head dim |
+|---|---:|---:|---:|---:|
+| Qwen3-8B | 1 | 32 | 8 | 128 |
+| Inkling | 8 | 8 | 1 | 128 |
 
-Inkling's sliding-window layers are 64 query heads over 16 KV heads at the same
-head dimension over a 512-token window, which is a prefill-sized problem and not
-in these tables.
-
-### B200 (SM100), Qwen3-8B
-
-32 query heads over 8 KV heads at head dimension 128, one GPU.
+### B200 (SM100), Qwen3-8B TP1 (HQ=32 HKV=8 D=128)
 
 ![Decode speedup over FlashInfer bf16 on B200, at batch 1 and 8](docs/decode-latency-b200.png)
 
@@ -170,10 +162,7 @@ in these tables.
 | 8 | 256K | **399.1** | 456.2 | 1172.5 | 594.3 | 474.7 |
 | 8 | 512K | **758.1** | 865.7 | 2319.8 | 1166.6 | 932.7 |
 
-### B200 (SM100), Inkling
-
-8 query heads over 1 KV head at head dimension 128, one GPU of the eight that
-serve the model.
+### B200 (SM100), Inkling TP8 (HQ=8 HKV=1 D=128)
 
 ![Decode speedup over FlashInfer bf16 on B200 at the Inkling shape, at batch 1 and 8](docs/decode-latency-b200-inkling.png)
 
@@ -188,17 +177,16 @@ serve the model.
 | 8 | 256K | 71.1 | 78.4 | 171.2 | 101.3 | **70.3** |
 | 8 | 512K | 130.5 | 141.8 | 318.6 | 181.4 | **124.1** |
 
-One KV head serves eight query heads here, so the cache one GPU streams is an
-eighth of the Qwen3-8B table's at the same context length and the decode is
-correspondingly shorter. FOSCAR's lead narrows with it: at batch 8 the
-TensorRT-LLM NVFP4 column is the fastest at 32K, 256K and 512K, and within 2% of
-FOSCAR int2 at 128K. With one KV head the split-K decode has less work per
-split, so the narrower cache stops paying for it.
+One KV head serves eight query heads, so a GPU streams an eighth of the
+Qwen3-8B cache at the same context length. FOSCAR's lead narrows with it: at
+batch 8 the TensorRT-LLM NVFP4 column is fastest at 32K, 256K and 512K, and
+within 2% of FOSCAR int2 at 128K. With one KV head there is less work per split,
+and the narrower cache stops paying for it.
 
-### H100 (SM90), Qwen3-8B
+### H100 (SM90), Qwen3-8B TP1 (HQ=32 HKV=8 D=128)
 
-32 query heads over 8 KV heads at head dimension 128, one GPU. TensorRT-LLM's
-`trtllm-gen` decode is Blackwell only, so this table has no TensorRT-LLM column.
+TensorRT-LLM's `trtllm-gen` decode is Blackwell only, so this table has no
+TensorRT-LLM column.
 
 ![Decode speedup over FlashInfer bf16 on H100, at batch 1 and 8](docs/decode-latency-h100.png)
 
