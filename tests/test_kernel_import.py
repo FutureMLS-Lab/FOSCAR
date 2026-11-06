@@ -1,6 +1,4 @@
 # tests/test_kernel_import.py
-import torch
-import pytest
 
 
 def test_sm100_shared_reduction_library_imports():

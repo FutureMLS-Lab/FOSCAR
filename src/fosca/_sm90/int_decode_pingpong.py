@@ -237,7 +237,9 @@ except Exception:                       # profiling optional; annotations become
     annotate.mark = lambda name: None
     annotate.kernel = lambda name: _NoOpCM()
 
-import torch, cutlass, cutlass.cute as cute
+import torch
+import cutlass
+import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import warpgroup, cpasync
 from cutlass.utils import LayoutEnum

@@ -459,7 +459,7 @@ def make_serving_cache(per_req_codes_k, per_req_codes_v, per_req_scales, seq_len
 # copied here: it is the same contract both decode kernels read, and two copies are free
 # to drift.  See `quant_layout.py` for the sectioned layout it describes.
 # ---------------------------------------------------------------------------------------------
-from ..quant_layout import quant_block_offsets  # noqa: F401  (re-exported for callers)
+from ..quant_layout import quant_block_offsets  # noqa: F401, E402  (re-exported for callers)
 def make_serving_cache_flex(per_req_codes_k, per_req_codes_v, k_sz, v_sz, seq_lens,
                             k_quant=None, v_quant=None, N=64, *, D,
                             sdtype=torch.float32, shuffle=True, identity_block_table=False):

@@ -249,9 +249,6 @@ def compile_pingpong(*, head_dim, num_qo_heads, num_kv_heads, bits,
     Callers of this function get the fold, always. A test that must compile the ablation
     constructs the kernel itself and calls `compile_constructed`.
     """
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.typing import Float32, Int32
 
     from .int_decode_pingpong import IntPingPongDecodeSm90
 

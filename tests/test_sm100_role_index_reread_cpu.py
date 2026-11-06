@@ -358,11 +358,11 @@ def check_rule(src):
                      f"{sorted(PERSISTENCE_INPUTS | PERSISTENCE_BUILTINS)} and attributes set once "
                      f"from them, with nothing else writing or intercepting it; found {bad}")
     binds = _bindings(fn, "persistent")
+    found = [(line, ast.unparse(_assign_of(fn, n)) if kind == "store" else kind)
+             for line, kind, n in binds]
     assert (len(binds) == 1 and isinstance(binds[0][2], ast.Name)
             and ast.dump(_assign_of(fn, binds[0][2]).value) == _expr(PERSISTENT_FLAG)), (
-        f"`kernel` must bind `persistent` once, as `persistent = {PERSISTENT_FLAG}`, found "
-        f"{[(line, ast.unparse(_assign_of(fn, n)) if kind == 'store' else kind)
-            for line, kind, n in binds]}")
+        f"`kernel` must bind `persistent` once, as `persistent = {PERSISTENT_FLAG}`, found {found}")
 
     # 0. The loop is the item loop, a persistent build gives it the item count, and nothing in an
     #    item leaves it early, so the role choices below are the ones every item makes.

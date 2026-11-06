@@ -40,13 +40,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          df -h /
       - name: Install
         run: |
           python -m pip install --upgrade pip
+          # A CPU build of torch first. The default wheel plus its nvidia-* siblings
+          # is several GB, which exhausted the runner's disk and failed this job
+          # during the install, before lint or a single test ran.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[test]"
       - name: Lint
         run: |
-          pip install ruff
+          pip install "ruff==0.17.3"
           ruff check src tests
       - name: CPU test suite
         run: pytest -q
@@ -68,8 +77,11 @@ jobs:
           import glob, zipfile
           wheel = glob.glob("dist/*.whl")[0]
           names = zipfile.ZipFile(wheel).namelist()
+          # The wheel must carry the PEP 561 marker and the vendored tree's
+          # README; the BSD-3 text those files are covered by lives in NOTICE,
+          # which is shipped under dist-info/licenses.
           for required in ("fosca/py.typed",
-                           "fosca/_vendor/LICENSE"):
+                           "fosca/_vendor/README.md"):
               assert required in names, f"{required} missing from the wheel"
           assert any(n.endswith("LICENSE") for n in names), "LICENSE missing"
           assert any(n.endswith("NOTICE") for n in names), "NOTICE missing"
