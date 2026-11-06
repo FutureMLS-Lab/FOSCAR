@@ -141,18 +141,21 @@ bf16 at the same shape, so the dashed line at 1.00 is bf16.
 ### Shapes
 
 A shape is the attention geometry one GPU decodes: a model's query-head and
-KV-head counts divided by the tensor-parallel width it is served at.
+KV-head counts divided by the tensor-parallel width it is served at. The last
+column is what the tables below measure; the second is the model's own counts.
 
-| Model | Query heads | KV heads | Head dim | Tensor parallel |
-|---|---:|---:|---:|---:|
-| Qwen3-8B | 32 | 8 | 128 | 1 |
-| Inkling | 8 | 1 | 128 | 8 |
+| Model | Heads in the model (Q / KV) | Head dim | Tensor parallel | Heads per GPU (Q / KV) |
+|---|---|---:|---:|---|
+| Qwen3-8B | 32 / 8 | 128 | 1 | 32 / 8 |
+| Inkling, full-attention layers | 64 / 8 | 128 | 8 | 8 / 1 |
 
-Inkling's full-attention layers have 64 query heads and 8 KV heads at head
-dimension 128, so each of the eight GPUs serving it decodes eight query heads
-against one KV head.
+Inkling's sliding-window layers are 64 query heads over 16 KV heads at the same
+head dimension over a 512-token window, which is a prefill-sized problem and not
+in these tables.
 
 ### B200 (SM100), Qwen3-8B
+
+32 query heads over 8 KV heads at head dimension 128, one GPU.
 
 ![Decode speedup over FlashInfer bf16 on B200, at batch 1 and 8](docs/decode-latency-b200.png)
 
@@ -168,6 +171,9 @@ against one KV head.
 | 8 | 512K | **758.1** | 865.7 | 2319.8 | 1166.6 | 932.7 |
 
 ### B200 (SM100), Inkling
+
+8 query heads over 1 KV head at head dimension 128, one GPU of the eight that
+serve the model.
 
 ![Decode speedup over FlashInfer bf16 on B200 at the Inkling shape, at batch 1 and 8](docs/decode-latency-b200-inkling.png)
 
@@ -191,8 +197,8 @@ split, so the narrower cache stops paying for it.
 
 ### H100 (SM90), Qwen3-8B
 
-TensorRT-LLM's `trtllm-gen` decode is Blackwell only, so this table has no
-TensorRT-LLM column.
+32 query heads over 8 KV heads at head dimension 128, one GPU. TensorRT-LLM's
+`trtllm-gen` decode is Blackwell only, so this table has no TensorRT-LLM column.
 
 ![Decode speedup over FlashInfer bf16 on H100, at batch 1 and 8](docs/decode-latency-h100.png)
 
