@@ -66,7 +66,7 @@ import pathlib
 
 import pytest
 
-_SRC = pathlib.Path(__file__).resolve().parents[1] / "src/fosca"
+_SRC = pathlib.Path(__file__).resolve().parents[1] / "src/foscar"
 SOURCE = _SRC / "_sm100/gqa_decode.py"
 HOPPER = _SRC / "_sm90/int_decode_pingpong.py"
 BLACKWELL = _SRC / "_sm100/int_fold_decode.py"

@@ -27,8 +27,8 @@ def _load(name, rel):
     return module
 
 
-gp = _load("_graph_plan_under_test", "src/fosca/graph_plan.py")
-sch90 = _load("_sm90_scheduler_for_graph_plan", "src/fosca/_sm90/scheduler.py")
+gp = _load("_graph_plan_under_test", "src/foscar/graph_plan.py")
+sch90 = _load("_sm90_scheduler_for_graph_plan", "src/foscar/_sm90/scheduler.py")
 
 CONTIGUOUS, STRIDED = "contiguous", "strided"
 #: (arch, kernel tile, the kernel's partition): every tile the graph builds take.

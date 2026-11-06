@@ -2,7 +2,7 @@
 """Library-side compile/launch glue for ``IntPingPongDecodeSm90`` (SM90 quantized KV).
 
 The Hopper sibling of ``_sm100/fold_runtime.py``: it is what
-:class:`fosca.PagedDecodeWrapper` calls when ``plan(..., layout)`` runs on
+:class:`foscar.PagedDecodeWrapper` calls when ``plan(..., layout)`` runs on
 an SM90 device, so the quantized path has ONE public entry point on both
 architectures.
 

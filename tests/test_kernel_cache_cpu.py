@@ -30,12 +30,12 @@ import pytest
 
 torch = pytest.importorskip("torch", reason="kernel_cache serialises torch dtypes")
 
-# Loaded by file, not through the package: `fosca/__init__.py` imports cutlass,
+# Loaded by file, not through the package: `foscar/__init__.py` imports cutlass,
 # which a CPU box does not have, and the cache module itself imports the DSL only inside
 # the functions the fakes below stand in for.
 _SPEC = importlib.util.spec_from_file_location(
     "kernel_cache_under_test",
-    Path(__file__).resolve().parents[1] / "src" / "fosca" / "kernel_cache.py",
+    Path(__file__).resolve().parents[1] / "src" / "foscar" / "kernel_cache.py",
 )
 kc = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = kc          # dataclasses resolves the class's module by name
@@ -240,7 +240,7 @@ def test_miss_then_hit_round_trip(isolated):
     rec = kc.record_of(first)
     assert rec.origin == "traced" and rec.reason == ""
     assert isinstance(first, FakeLoaded), "a miss hands back the reloaded object too"
-    assert first.symbol == rec.symbol == f"fosca_sm100_K_{rec.key[:16]}"
+    assert first.symbol == rec.symbol == f"foscar_sm100_K_{rec.key[:16]}"
     obj = Path(rec.path)
     side = obj.with_suffix(".json")
     assert obj.read_bytes() == b"OBJ" and side.is_file()

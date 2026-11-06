@@ -5,8 +5,7 @@ The Blackwell decode reads its K and V pools in a fixed order within each
 without `QuantKVCache.append`: an engine that swaps a cache in, converts one from
 another format, or copies pages between devices. The cache API is described in
 [Writing the cache](../README.md#writing-the-cache); this page is the statement
-of the order itself. Hopper stores its pools in another order and is out of
-scope here.
+of the order itself. Hopper stores its pools in another order.
 
 ## Pools
 
@@ -104,5 +103,4 @@ and after a copy into the buffer that bypasses `append`, call
 
 To check the order, read the bytes back with `cache.dequantize(...)` and compare
 against the values you packed. It decodes through the reader, so a wrong order
-shows up as channels taken from the wrong slot of their word, and nothing
-cheaper sees it.
+shows up as channels taken from the wrong slot of their word.

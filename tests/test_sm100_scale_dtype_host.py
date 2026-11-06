@@ -12,10 +12,10 @@ import pytest
 import torch
 
 
-PACKAGE_DIR = Path(__file__).resolve().parents[1] / "src/fosca"
+PACKAGE_DIR = Path(__file__).resolve().parents[1] / "src/foscar"
 SM100_DIR = PACKAGE_DIR / "_sm100"
-HOST_PACKAGE = "_fosca_sm100_host_test"
-HOST_PARENT = "_fosca_host_test_parent"
+HOST_PACKAGE = "_foscar_sm100_host_test"
+HOST_PARENT = "_foscar_host_test_parent"
 #: Every synthetic sys.modules name this fixture installs, so it can undo them.
 _INSTALLED: list[str] = []
 
@@ -27,7 +27,7 @@ def _load_fold_runtime():
     synthetic package needs a PARENT for that relative import to resolve; without one
     it fails with "attempted relative import beyond top-level package". The parent is
     built here and the layout module preloaded into it, which keeps the fixture
-    torch-only: `fosca/quant_layout.py` imports nothing at all.
+    torch-only: `foscar/quant_layout.py` imports nothing at all.
 
     Every synthetic name is recorded in `_INSTALLED` so `_unload_fold_runtime` can take
     them back out; without that, whichever test ran first would fix the module identity

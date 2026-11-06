@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
-"""fosca: standalone CuTe DSL GQA paged-decode kernels for SM90/SM100.
+"""foscar: standalone CuTe DSL GQA paged-decode kernels for SM90/SM100.
 
 Public API is arch-agnostic; internal SM90/SM100 dispatch + feature gating are hidden.
 `QuantKVLayout` resolves a layer's cache layout against the device's reader,

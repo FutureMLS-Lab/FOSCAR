@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from fosca import QuantKVLayout, get_capabilities
-from fosca.wrapper import PagedDecodeWrapper
-from fosca._utils import is_supported
+from foscar import QuantKVLayout, get_capabilities
+from foscar.wrapper import PagedDecodeWrapper
+from foscar._utils import is_supported
 
 pytestmark = pytest.mark.skipif(not is_supported(), reason="needs SM90 or SM100 GPU")
 DEV = torch.device("cuda")

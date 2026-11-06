@@ -1,7 +1,7 @@
 # tests/test_utils.py
 import pytest
 import torch
-from fosca import _utils
+from foscar import _utils
 
 
 def test_torch_to_cutlass_known_dtypes():

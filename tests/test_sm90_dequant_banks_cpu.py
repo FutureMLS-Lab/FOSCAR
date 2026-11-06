@@ -50,13 +50,13 @@ def _load(monkeypatch, name, path):
 @pytest.fixture
 def sc(monkeypatch):
     # Importing the package imports the DSL, so serving_cache is loaded on its own.
-    for pkg in ("fosca", "fosca._sm90"):
+    for pkg in ("foscar", "foscar._sm90"):
         stub = types.ModuleType(pkg)
         stub.__path__ = []
         monkeypatch.setitem(sys.modules, pkg, stub)
-    _load(monkeypatch, "fosca.quant_layout", ROOT / "src/fosca/quant_layout.py")
-    return _load(monkeypatch, "fosca._sm90.serving_cache",
-                 ROOT / "src/fosca/_sm90/serving_cache.py")
+    _load(monkeypatch, "foscar.quant_layout", ROOT / "src/foscar/quant_layout.py")
+    return _load(monkeypatch, "foscar._sm90.serving_cache",
+                 ROOT / "src/foscar/_sm90/serving_cache.py")
 
 
 def _row_words(sc, tensor, bits, head_dim):

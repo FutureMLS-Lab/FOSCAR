@@ -78,8 +78,8 @@ import pathlib
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-KERNEL = ROOT / "src/fosca/_sm100/int_fold_decode.py"
-ASM = ROOT / "src/fosca/_sm100/int_fold_asm.py"
+KERNEL = ROOT / "src/foscar/_sm100/int_fold_decode.py"
+ASM = ROOT / "src/foscar/_sm100/int_fold_asm.py"
 
 
 def _expr(text):
@@ -178,13 +178,13 @@ PERSISTENCE_BUILTINS = {"bool", "int"}
 #: inputs, and a module-level helper or comprehension that uses the name `bool` locally.
 ACCEPTED_REWRITES = {
     "a module-level comprehension uses bool as its own variable": [(
-        "from fosca._sm100.int_fold_asm import (",
+        "from foscar._sm100.int_fold_asm import (",
         "_PROBE = [bool for bool in (False, True)]\n\n"
-        "from fosca._sm100.int_fold_asm import (")],
+        "from foscar._sm100.int_fold_asm import (")],
     "a module-level helper under a dead branch has a parameter named bool": [(
-        "from fosca._sm100.int_fold_asm import (",
+        "from foscar._sm100.int_fold_asm import (",
         "if False:\n    def _helper(bool):\n        return bool\n\n\n"
-        "from fosca._sm100.int_fold_asm import (")],
+        "from foscar._sm100.int_fold_asm import (")],
     "persistence spelled through do_none_red": [(
         "        self.persistent = bool(int(persistent)) and (\n"
         "            (reduction_mode == \"none\" or reduction_mode is None)\n"
@@ -622,7 +622,7 @@ def check_imports(src):
     for name in HELPERS:
         binds = _bindings(tree, name)
         ok = (len(binds) == 1 and binds[0][1] == "import"
-              and binds[0][2].module == "fosca._sm100.int_fold_asm"
+              and binds[0][2].module == "foscar._sm100.int_fold_asm"
               and [a.asname for a in binds[0][2].names if a.name == name] == [None])
         assert ok, (f"`{name}` must be bound only by its import from int_fold_asm, found "
                     f"{[(line, kind) for line, kind, _ in binds]}")
@@ -849,9 +849,9 @@ MUTATIONS = {
         "                pass\n"
         "        self.persistent = bool(int(persistent)) and (")]),
     "a match capture at module scope rebinds a builtin": (_K, [(
-        "from fosca._sm100.int_fold_asm import (",
+        "from foscar._sm100.int_fold_asm import (",
         "match (lambda value: value):\n    case bool:\n        pass\n\n"
-        "from fosca._sm100.int_fold_asm import (")]),
+        "from foscar._sm100.int_fold_asm import (")]),
     "a __bool__ hook reached through bool(self)": (_K, [
         ("    def __init__(\n",
          "    def __bool__(self):\n        return self.bits == 2\n\n    def __init__(\n"),

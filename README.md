@@ -1,4 +1,4 @@
-# FOSCA
+# FOSCAR
 
 Quantized-KV paged GQA decode kernels for Hopper (SM90) and Blackwell (SM100),
 written in CuTe DSL and exposed through one architecture-agnostic wrapper.
@@ -15,13 +15,13 @@ nvfp4.
 From a source checkout:
 
 ```sh
-git clone https://github.com/donglinz/fosca.git
-cd fosca
+git clone https://github.com/FutureMLS-Lab/FOSCAR.git
+cd foscar
 pip install -e ".[cu13]"    # CUDA 13: Blackwell, and Hopper
 pip install -e ".[cu12]"    # CUDA 12: Hopper only
 ```
 
-The same extras work with `pip install "fosca[cu13]"` once the package
+The same extras work with `pip install "foscar[cu13]"` once the package
 is published to PyPI.
 
 The package contains no compiled extensions. Everything is JIT-compiled by
@@ -29,14 +29,13 @@ The package contains no compiled extensions. Everything is JIT-compiled by
 cached on disk across processes. Bring your own `torch>=2.4`.
 
 Blackwell requires the `cu13` extra. The DSL's CUDA 12 backend miscompiles the
-SM100 kernel, and the package refuses to compile it under that backend rather
-than producing a wrong result.
+SM100 kernel, and the package refuses to compile it under that backend.
 
 ## Quickstart
 
 ```python
 import torch
-from fosca import PagedDecodeWrapper, QuantKVLayout, get_capabilities
+from foscar import PagedDecodeWrapper, QuantKVLayout, get_capabilities
 
 device = "cuda"
 arch = get_capabilities()["arch"]                 # "sm90" or "sm100"
@@ -139,11 +138,25 @@ layer may run concurrently with an append on another stream.
 Decode latency in microseconds. Each figure plots the speedup over FlashInfer
 bf16 at the same shape, so the dashed line at 1.00 is bf16.
 
-### B200 (SM100)
+### Shapes
+
+A shape is the attention geometry one GPU decodes: a model's query-head and
+KV-head counts divided by the tensor-parallel width it is served at.
+
+| Model | Query heads | KV heads | Head dim | Tensor parallel |
+|---|---:|---:|---:|---:|
+| Qwen3-8B | 32 | 8 | 128 | 1 |
+| Inkling | 8 | 1 | 128 | 8 |
+
+Inkling's full-attention layers have 64 query heads and 8 KV heads at head
+dimension 128, so each of the eight GPUs serving it decodes eight query heads
+against one KV head.
+
+### B200 (SM100), Qwen3-8B
 
 ![Decode speedup over FlashInfer bf16 on B200, at batch 1 and 8](docs/decode-latency-b200.png)
 
-| Batch | Context | FOSCA int2 | FOSCA int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 32K | **15.0** | 17.5 | 35.6 | 23.4 | 18.3 |
 | 1 | 128K | **35.5** | 43.7 | 98.4 | 58.9 | 41.7 |
@@ -154,14 +167,31 @@ bf16 at the same shape, so the dashed line at 1.00 is bf16.
 | 8 | 256K | **398.6** | 455.3 | 1168.8 | 594.2 | 480.6 |
 | 8 | 512K | **756.9** | 865.2 | 2319.4 | 1166.0 | 947.2 |
 
-### H100 (SM90)
+### B200 (SM100), Inkling
+
+| Batch | Context | FOSCAR int2 | FOSCAR int4 |
+|---:|---:|---:|---:|
+| 1 | 32K | 12.8 | **12.5** |
+| 1 | 128K | **18.6** | 18.8 |
+| 1 | 256K | **25.8** | 26.9 |
+| 1 | 512K | **40.4** | 42.3 |
+| 8 | 32K | **17.5** | 19.4 |
+| 8 | 128K | **40.5** | 46.2 |
+| 8 | 256K | **70.6** | 77.9 |
+| 8 | 512K | **131.6** | 142.1 |
+
+One KV head serves eight query heads here, so the cache one GPU streams is an
+eighth of the Qwen3-8B table's at the same context length, and the decode is
+correspondingly shorter.
+
+### H100 (SM90), Qwen3-8B
 
 TensorRT-LLM's `trtllm-gen` decode is Blackwell only, so this table has no
 TensorRT-LLM column.
 
 ![Decode speedup over FlashInfer bf16 on H100, at batch 1 and 8](docs/decode-latency-h100.png)
 
-| Batch | Context | FOSCA int2 | FOSCA int4 | FlashInfer bf16 |
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 |
 |---:|---:|---:|---:|---:|
 | 1 | 32K | **25.8** | 33.0 | 63.4 |
 | 1 | 128K | **73.7** | 79.7 | 200.6 |
@@ -174,20 +204,28 @@ TensorRT-LLM column.
 
 ### Conditions
 
-One query token per request, 32 query heads over 8 KV heads, `head_dim` 128,
-page size 64, paged cache. Q is fp8 on the B200 tables and bf16 on the H100 one;
-FlashInfer is bf16 everywhere. Every column of a row was timed by the same
+One query token per request. K and V are quantized token-wise, one scale and one
+offset per group of 128 values, which is the whole head dimension, both in FP32.
+Page size 64, paged cache. Q is fp8 e4m3 on the B200 tables and bf16 on the H100
+one; FlashInfer is bf16 everywhere. Every column of a row was timed by the same
 harness on the same GPU model. The number is the CUDA kernel span from CUPTI
-over a cold L2, the median of the fully observed iterations. It excludes host
-dispatch and the paged-attention wrapper, so it is not an end-to-end serving
-latency.
+over a cold L2, the median of the fully observed iterations, so it excludes host
+dispatch and the paged-attention wrapper.
 
-The FOSCA columns were measured by driving `PagedDecodeWrapper` from this
-release; `benchmarks/decode_latency.csv` holds the values and
-`benchmarks/plot_decode.py` renders both figures. The competitor columns were
-measured by the project's benchmark harness. Re-measuring the FOSCA columns
-reproduced the tables to within 1.5% on both GPUs, except for one B200 cell,
-batch 8 at 128K, which is reported at the value it reproduces.
+`benchmarks/decode_latency.csv` holds the values in these tables and
+`benchmarks/plot_decode.py` renders the figures. The FOSCAR columns come from
+`PagedDecodeWrapper`; the competitor columns from FlashInfer.
+
+### Reproducing
+
+```sh
+pip install -e ".[bench]"    # adds FlashInfer for the competitor columns
+python benchmarks/run_bench.py                              # every shape and kernel
+python benchmarks/run_bench.py --shape inkling --kernel ours_int2
+```
+
+`benchmarks/bench.yaml` sets the shapes and the batch and context grid.
+`run_bench.py` writes one CSV row per cell.
 
 ## Testing
 
@@ -199,7 +237,13 @@ Modules that need a device skip when there is none.
 
 ## License
 
-MIT. Three files derive from FlashInfer's CuTe DSL attention modules and carry
-the BSD-3-Clause notice those files carry; the package also redistributes
-subsets of QuACK and flash-attention (both BSD-3-Clause). [NOTICE](NOTICE) names
-the files and reproduces each license.
+MIT.
+
+## Acknowledgements
+
+This work was inspired by and builds on
+[FlashInfer](https://github.com/flashinfer-ai/flashinfer),
+[QuACK](https://github.com/Dao-AILab/quack) and
+[flash-attention](https://github.com/Dao-AILab/flash-attention).
+[NOTICE](NOTICE) records the material this package carries from them and the
+licenses it is under.

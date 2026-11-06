@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Donglin Zhuang
 # SPDX-License-Identifier: MIT
-# src/fosca/kernel_contract.py
+# src/foscar/kernel_contract.py
 """The constructor contract both decode kernels share: names, meanings, validation.
 
 NO KERNEL BODY LIVES HERE, and that restriction is the point rather than an oversight.

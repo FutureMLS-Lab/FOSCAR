@@ -282,17 +282,17 @@ from cutlass.cute.typing import (
     Union,
 )
 
-from fosca.kernel_contract import GQAPagedDecode, normalize_sdtype
-from fosca.quant_layout import (
+from foscar.kernel_contract import GQAPagedDecode, normalize_sdtype
+from foscar.quant_layout import (
     quant_block_offsets,
     validate_quant_flex,
 )
-from fosca._sm100.fold_runtime import (
+from foscar._sm100.fold_runtime import (
     PSCALE_FLOOR_BUCKET,
     VMAX_BINS,
     pscale_lp_of_bucket,
 )
-from fosca._sm100.int_fold_asm import (
+from foscar._sm100.int_fold_asm import (
     _cvt2_bf16x2,
     _e4m3x4_of_bf16x2,
     _fma2_bf16,
@@ -305,8 +305,8 @@ from fosca._sm100.int_fold_asm import (
     _tid_x_fresh,
     _opaque_i32,
 )
-from fosca._vendor.flash_attn.cute import mma_sm100_desc as sm100_desc
-from fosca._sm100.gqa_decode import (
+from foscar._vendor.flash_attn.cute import mma_sm100_desc as sm100_desc
+from foscar._sm100.gqa_decode import (
     # Kernel invariants
     mma_modes,
     mma_dice,

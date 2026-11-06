@@ -23,12 +23,16 @@ HERE = pathlib.Path(__file__).resolve().parent
 DOCS = HERE.parent / "docs"
 BASE = "flashinfer_bf16"
 
+# A speedup needs a FlashInfer measurement of the same shape. The Qwen3-8B rows
+# carry one; the Inkling rows measure the shape itself and have no baseline.
+PLOTTED_SHAPE = "qwen3-8b"
+
 # Fixed categorical order; identity is carried by position in the legend and by
 # the marker, not by colour alone. bf16 is the reference line rather than a
 # series, so it takes no hue.
 SERIES = [
-    ("ours_int2", "FOSCA int2", "#2a78d6", "o"),
-    ("ours_int4", "FOSCA int4", "#eb6834", "s"),
+    ("ours_int2", "FOSCAR int2", "#2a78d6", "o"),
+    ("ours_int4", "FOSCAR int4", "#eb6834", "s"),
     ("trtllm_nvfp4", "TRT-LLM NVFP4", "#1baf7a", "D"),
     ("trtllm_fp8", "TRT-LLM FP8", "#eda100", "^"),
 ]
@@ -37,7 +41,8 @@ INK_2 = "#52514e"
 GRID = "#e4e3df"
 REF = "#8a8984"
 
-rows = list(csv.DictReader((HERE / "decode_latency.csv").open()))
+rows = [r for r in csv.DictReader((HERE / "decode_latency.csv").open())
+        if r["shape"] == PLOTTED_SHAPE]
 
 
 def us(gpu, kernel, batch, kv):

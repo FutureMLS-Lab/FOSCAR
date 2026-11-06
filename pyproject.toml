@@ -3,7 +3,7 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fosca"
+name = "foscar"
 version = "0.2.0"
 description = "Quantized-KV paged decode kernels for Hopper (SM90) and Blackwell (SM100), written in CuTe DSL."
 readme = "README.md"
@@ -36,18 +36,20 @@ dependencies = [
 cu12 = ["nvidia-cutlass-dsl==4.8.0", "cuda-python>=12.4,<13"]
 cu13 = ["nvidia-cutlass-dsl[cu13]==4.8.0", "cuda-python>=13,<14"]
 test = ["pytest>=7", "nvidia-cutlass-dsl==4.8.0", "cuda-python>=12.4,<13"]
+# The benchmark harness compares against FlashInfer's kernels. Nothing in the
+# package imports it.
+bench = ["flashinfer-python>=0.6", "pyyaml>=6"]
 
 [project.urls]
-Homepage = "https://github.com/donglinz/fosca"
-Repository = "https://github.com/donglinz/fosca"
-Issues = "https://github.com/donglinz/fosca/issues"
-Changelog = "https://github.com/donglinz/fosca/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/FutureMLS-Lab/FOSCAR"
+Repository = "https://github.com/FutureMLS-Lab/FOSCAR"
+Issues = "https://github.com/FutureMLS-Lab/FOSCAR/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-fosca = ["py.typed", "_vendor/README.md"]
+foscar = ["py.typed", "_vendor/README.md"]
 
 [tool.uv]
 conflicts = [[{ extra = "cu12" }, { extra = "cu13" }]]
@@ -61,7 +63,7 @@ addopts = "--strict-markers"
 line-length = 100
 target-version = "py310"
 # The vendored subset keeps its upstream style.
-extend-exclude = ["src/fosca/_vendor"]
+extend-exclude = ["src/foscar/_vendor"]
 
 [tool.ruff.lint]
 # Ruff's classic default set. The ignores are idioms the kernels use on purpose:

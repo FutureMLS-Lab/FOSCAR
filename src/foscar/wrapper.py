@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Copyright (c) 2026 Donglin Zhuang (standalone fosca adaptation).
+# Copyright (c) 2026 Donglin Zhuang (standalone foscar adaptation).
 # SPDX-License-Identifier: BSD-3-Clause
 # Adapted from FlashInfer's CuTe DSL paged-decode wrapper (see NOTICE).
 
@@ -13,7 +13,7 @@ ONE PLAN PER STEP, ONE RUN PER LAYER
 ------------------------------------
 ``plan(indptr, indices, seq_lens, num_qo_heads, layout)`` fixes one step's batch: the page
 table, the lengths, the split count and the compiled kernel. ``layout`` is the
-:class:`~fosca.kv_cache.QuantKVLayout` the caches were built with, which carries the
+:class:`~foscar.kv_cache.QuantKVLayout` the caches were built with, which carries the
 stored width, the head dimension, the KV-head count, the quantization granularity, the scale
 dtype and the pool orders. ``run(q, kv_cache)`` then decodes one layer's cache. It refuses a
 cache of any other layout, a query or output of another shape, and any tensor on another
@@ -21,7 +21,7 @@ device, so a pool cannot meet a reader that reads it in another order.
 
 Kernels compile with symbolic dimensions (``cute.sym_int``) so the same compiled module is
 reused across batch sizes and lengths, and compilation is memoized on the static
-configuration, in process and on disk (:mod:`fosca.kernel_cache`).
+configuration, in process and on disk (:mod:`foscar.kernel_cache`).
 
 The split-K planners are deliberately NOT shared between the two architectures; see
 :meth:`PagedDecodeWrapper.plan` for why.
@@ -34,7 +34,7 @@ returns the graph-mode implementation (:class:`_GraphDecodeWrapper`), so an eage
 no graph-mode code at all. One graph-mode wrapper serves one captured batch size (a bucket) for
 its whole life: ``plan(page_table=, seq_lens=, ...)`` once, records the engine's fixed buffers
 and compiles the bucket's builds; ``update(lengths)`` once per step, outside the graph, plans the
-step on the host (:mod:`fosca.graph_plan`) and copies its work list to the device;
+step on the host (:mod:`foscar.graph_plan`) and copies its work list to the device;
 ``run()`` is captured once per layer and replayed. ``graph_workspace_bytes`` sizes the workspace
 that buckets share.
 
@@ -200,7 +200,7 @@ def _get_compiled_fold_kernel(
     physical page count and kv_splits as ``cute.sym_int()``, so one compiled
     module serves every batch size and KV length. A trace costs 10 to 13 s on
     B200, so this in-process memo is the difference between a usable plan() and
-    an unusable one, and :mod:`fosca.kernel_cache` underneath it serves a repeat
+    an unusable one, and :mod:`foscar.kernel_cache` underneath it serves a repeat
     of the same trace from disk across processes.
 
     ``kernel_kwargs`` arrives as a sorted tuple of pairs because

@@ -1,4 +1,4 @@
-# Integrating FOSCA into a decode loop
+# Integrating FOSCAR into a decode loop
 
 This page covers the plan/run lifecycle, the page-table inputs, writing the
 cache, what to keep out of the per-step path, and CUDA graph capture.
@@ -21,7 +21,7 @@ wrapper whose `plan()` raised must be planned again before `run()`.
 
 ```python
 import torch
-from fosca import PagedDecodeWrapper, QuantKVLayout
+from foscar import PagedDecodeWrapper, QuantKVLayout
 
 device = "cuda"
 batch, kv_heads, q_heads, head_dim, bits = 8, 8, 32, 128, 2
@@ -216,7 +216,7 @@ it because no two of their graphs run at the same time; an engine that overlaps
 two batches gives each stream its own workspace.
 
 ```python
-from fosca import graph_workspace_bytes
+from foscar import graph_workspace_bytes
 
 max_kv_len = 1024
 page_table = torch.zeros(batch, pages_per_request, dtype=torch.int32, device=device)

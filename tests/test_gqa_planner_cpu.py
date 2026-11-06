@@ -5,7 +5,7 @@ import pytest
 ROOT = Path(__file__).parents[1]
 
 def load(arch):
-    spec=importlib.util.spec_from_file_location("gqa_scheduler_"+arch,ROOT/"src/fosca"/arch/"scheduler.py")
+    spec=importlib.util.spec_from_file_location("gqa_scheduler_"+arch,ROOT/"src/foscar"/arch/"scheduler.py")
     m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
 
 @pytest.mark.parametrize("tiles", [1,2,4,16])
