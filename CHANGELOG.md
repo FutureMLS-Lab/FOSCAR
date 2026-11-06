@@ -48,8 +48,9 @@ First public release.
 
 ### Notes
 
-- The package is licensed under MIT. Three files carry NVIDIA's BSD-3-Clause
-  material taken from FlashInfer's CuTe DSL attention modules; see `NOTICE`.
+- The package is licensed under MIT. Three files derive from FlashInfer's CuTe
+  DSL attention modules and carry the BSD-3-Clause notice those files carry; see
+  `NOTICE`.
 - Only the quantized decode path exists. There is no dense bf16/fp16/fp8 KV
   mode.
 - Published latency comparisons are not reproduced by this repository; the

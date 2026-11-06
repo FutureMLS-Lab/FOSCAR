@@ -199,7 +199,7 @@ Modules that need a device skip when there is none.
 
 ## License
 
-MIT. Three files carry NVIDIA's BSD-3-Clause material, taken from FlashInfer's
-CuTe DSL attention modules, and the package redistributes subsets of QuACK and
-flash-attention (both BSD-3-Clause). [NOTICE](NOTICE) names the files and
-reproduces each license.
+MIT. Three files derive from FlashInfer's CuTe DSL attention modules and carry
+the BSD-3-Clause notice those files carry; the package also redistributes
+subsets of QuACK and flash-attention (both BSD-3-Clause). [NOTICE](NOTICE) names
+the files and reproduces each license.

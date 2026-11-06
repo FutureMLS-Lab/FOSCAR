@@ -6,15 +6,18 @@ the places listed below and nowhere else: each section names the files that hold
 the material, and reproduces the license that material is under.
 
 --------------------------------------------------------------------------------
-NVIDIA, via FlashInfer (BSD 3-Clause)
+Derived work: FlashInfer (BSD 3-Clause)
 --------------------------------------------------------------------------------
 
 `src/fosca/wrapper.py`, `src/fosca/_sm100/gqa_decode.py` and
-`src/fosca/_sm100/int_fold_decode.py` contain material from FlashInfer's CuTe DSL
-attention modules (https://github.com/flashinfer-ai/flashinfer), whose files
-carry NVIDIA's copyright notice and the BSD 3-Clause License reproduced below.
+`src/fosca/_sm100/int_fold_decode.py` are adapted from FlashInfer's CuTe DSL
+attention modules (https://github.com/flashinfer-ai/flashinfer). FlashInfer is
+published under the Apache License 2.0, and the files these three derive from
+carry NVIDIA's copyright and the BSD 3-Clause License reproduced below, which is
+the license this material is under. No Apache-licensed file is used here.
 
 Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Copyright 2025-2026 NVIDIA, Copyright 2023-2026 FlashInfer community.
 
 Changes from the upstream work: every decode path was replaced with a quantized
 one; the dense attention pipeline, the paged K/V gather, the flash-decoding
