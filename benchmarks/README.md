@@ -56,6 +56,3 @@ Add it under `shapes:` in `bench.yaml` with the per-GPU head counts, the head
 dimension and the tensor-parallel width, then run that shape by name. The kernel
 refuses a head dimension or a query-to-KV head ratio it does not build for, and
 the harness reports that shape as skipped rather than failing the run.
-
-Muse-Spark at TP8 is such a shape and is not in the tables: 16 query heads over
-2 KV heads at head dimension 64, where the kernel builds 128 and 256.
