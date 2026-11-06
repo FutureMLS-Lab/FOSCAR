@@ -138,15 +138,6 @@ layer may run concurrently with an append on another stream.
 Decode latency in microseconds. Each figure plots the speedup over FlashInfer
 bf16 at the same shape, so the dashed line at 1.00 is bf16.
 
-### Shapes
-
-Head counts are per GPU, after tensor parallelism.
-
-| Model | Tensor parallel | Query heads | KV heads | Head dim |
-|---|---:|---:|---:|---:|
-| Qwen3-8B | 1 | 32 | 8 | 128 |
-| Inkling | 8 | 8 | 1 | 128 |
-
 ### B200 (SM100), Qwen3-8B TP1 (HQ=32 HKV=8 D=128)
 
 ![Decode speedup over FlashInfer bf16 on B200, at batch 1 and 8](docs/decode-latency-b200.png)
