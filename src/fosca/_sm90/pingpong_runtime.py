@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """Library-side compile/launch glue for ``IntPingPongDecodeSm90`` (SM90 quantized KV).
 
 The Hopper sibling of ``_sm100/fold_runtime.py``: it is what

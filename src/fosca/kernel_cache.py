@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """A persistent on-disk cache of compiled CuTe DSL kernels.
 
 WHY THIS EXISTS. ``cute.compile`` in nvidia-cutlass-dsl 4.5.2 and 4.8.0 forces

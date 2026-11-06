@@ -1,5 +1,5 @@
 # Copyright 2026 Donglin Zhuang
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 """The cache API end to end, on the device.
 
 Build a layout, allocate a cache, write a KV cache into it with `append`, decode

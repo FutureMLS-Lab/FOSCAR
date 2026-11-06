@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Quantized-KV paged decode kernels for Hopper (SM90) and Blackwell (SM100), written in CuTe DSL."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "Apache-2.0"
+license = "MIT"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Donglin Zhuang", email = "donglinzhuang@outlook.com" }]
 keywords = ["attention", "decode", "kv-cache", "quantization", "cuda", "cute-dsl"]

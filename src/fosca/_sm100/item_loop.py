@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """Which SM100 unsplit builds the wrapper compiles without the item loop.
 
 The rule and its measurements are `wrapper.py`'s ONE WORK ITEM PER CTA. It lives here, on

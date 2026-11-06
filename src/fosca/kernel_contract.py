@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 # src/fosca/kernel_contract.py
 """The constructor contract both decode kernels share: names, meanings, validation.
 

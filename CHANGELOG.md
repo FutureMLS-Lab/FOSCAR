@@ -27,6 +27,9 @@ All notable changes to this project are documented here. The format follows
   two environment variables moved with it (`FOSCA_KERNEL_CACHE`,
   `FOSCA_KERNEL_CACHE_DIR`); an existing cache directory is not migrated.
 - `numpy` is a declared dependency.
+- The license is MIT. The files that carry third-party material keep that
+  material's license and are named in `NOTICE`; `_sm100/int_fold_asm.py`, which
+  held an NVIDIA header but none of NVIDIA's code, is ours and is MIT.
 
 ## [0.1.0] - unreleased
 
@@ -45,8 +48,8 @@ First public release.
 
 ### Notes
 
-- The package is licensed under Apache-2.0. It derives from FlashInfer
-  (Apache-2.0) and NVIDIA CUTLASS (BSD-3-Clause); see `NOTICE`.
+- The package is licensed under MIT. Three files carry NVIDIA's BSD-3-Clause
+  material taken from FlashInfer's CuTe DSL attention modules; see `NOTICE`.
 - Only the quantized decode path exists. There is no dense bf16/fp16/fp8 KV
   mode.
 - Published latency comparisons are not reproduced by this repository; the

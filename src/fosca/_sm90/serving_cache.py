@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """ServingCache — the batch-free GLOBAL paged quantized-KV pool that the SM90 decode kernel reads.
 
 This is the host fixture that builds the pool from per-request inputs: a single pooled set of

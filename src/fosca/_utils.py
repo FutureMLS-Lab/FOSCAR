@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """Local utilities: dtype mapping, arch detection, capability query, and a no-op
 API decorator."""
 import contextlib

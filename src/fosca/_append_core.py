@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The cache write both serving writers share: page runs, quantization and scale records.
 
 `_sm90/quant_append.QuantAppendSm90` and `_sm100/quant_append.QuantAppendSm100` quantize new K

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """Split-KV planning for the SM90 quantized-KV decode kernel (``IntPingPongDecodeSm90``):
 pick the CTA partition along the sequence dimension at plan time, FlashInfer-style.
 

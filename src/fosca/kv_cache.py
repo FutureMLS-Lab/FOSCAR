@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The quantized KV cache's layout and the cache object a decode reads.
 
 `QuantKVLayout` is one layer's cache layout, resolved once per model against the reader that will

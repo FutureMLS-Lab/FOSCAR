@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The graph-on planner: what a CUDA-graph bucket launches, and its work list per step.
 
 Graph mode (`PagedDecodeWrapper(..., use_cuda_graph=True)`) runs beside eager mode, which keeps

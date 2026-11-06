@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The paged dequantize both GPUs share: finding a page's request, the scale records, and the f32
 arithmetic that turns a stored value into bf16.
 

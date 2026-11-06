@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """Where a quantized value sits in the Blackwell code pools that `IntDecodeSm100` reads.
 
 V is stored exactly like K, so both pools have one layout in global memory, one row per token

@@ -7,6 +7,6 @@ authors:
     given-names: Donglin
     email: donglinzhuang@outlook.com
 repository-code: "https://github.com/donglinz/fosca"
-license: Apache-2.0
+license: MIT
 version: 0.1.0
 date-released: 2026-10-29

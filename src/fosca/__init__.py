@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """fosca: standalone CuTe DSL GQA paged-decode kernels for SM90/SM100.
 
 Public API is arch-agnostic; internal SM90/SM100 dispatch + feature gating are hidden.

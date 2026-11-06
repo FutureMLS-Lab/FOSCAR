@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """Library-side compile/launch glue for ``IntDecodeSm100`` (quantized-KV decode).
 
 This module is the SINGLE place that knows how to build and launch the SM100

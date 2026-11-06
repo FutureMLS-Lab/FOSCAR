@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """QuantDequantSm100: the paged dequantize of the cache `IntDecodeSm100` reads, on Blackwell.
 
 One launch per layer reads K and V of the pages a call names back into bf16 rows

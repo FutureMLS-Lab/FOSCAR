@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """Fused split-K (flash-decode) LSE combine kernel — the trtllm multi-block-reduction strategy as a CuTe DSL kernel.
 Merges the OUTER split-K partials produced by IntPingPongDecodeSm90 (_sm90/int_decode_pingpong.py) into the final
 output, replacing the slow torch reduction.

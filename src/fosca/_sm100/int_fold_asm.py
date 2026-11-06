@@ -1,5 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """Single-instruction inline-asm primitives for the SM100 fold decode kernel.
 
 Each function here wraps ONE PTX instruction (or one short straight-line

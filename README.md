@@ -199,6 +199,7 @@ Modules that need a device skip when there is none.
 
 ## License
 
-Apache-2.0. This package derives from FlashInfer (Apache-2.0) and the NVIDIA
-CUTLASS Hopper FMHA example (BSD-3-Clause), and redistributes subsets of QuACK
-and flash-attention (both BSD-3-Clause). See [NOTICE](NOTICE).
+MIT. Three files carry NVIDIA's BSD-3-Clause material, taken from FlashInfer's
+CuTe DSL attention modules, and the package redistributes subsets of QuACK and
+flash-attention (both BSD-3-Clause). [NOTICE](NOTICE) names the files and
+reproduces each license.

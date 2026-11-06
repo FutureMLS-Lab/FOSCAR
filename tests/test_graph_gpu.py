@@ -1,5 +1,5 @@
 # Copyright 2026 Donglin Zhuang
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 """`run()` inside a CUDA graph, on the device.
 
 A serving engine captures its decode step, so the call has to be capturable and

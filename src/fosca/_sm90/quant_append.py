@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """QuantAppendSm90: the serving cache write for `IntPingPongDecodeSm90`, on Hopper.
 
 One launch per layer quantizes new K and V tokens and writes them into the global-memory pools

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """Split-KV planner for the SM100 quantized-KV fold decode kernel.
 
 Picks ``(kv_splits, reduction_mode)`` for ``IntDecodeSm100`` at plan time from a
