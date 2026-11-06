@@ -37,8 +37,9 @@ cu12 = ["nvidia-cutlass-dsl==4.8.0", "cuda-python>=12.4,<13"]
 cu13 = ["nvidia-cutlass-dsl[cu13]==4.8.0", "cuda-python>=13,<14"]
 test = ["pytest>=7", "nvidia-cutlass-dsl==4.8.0", "cuda-python>=12.4,<13"]
 # The benchmark harness compares against FlashInfer's kernels. Nothing in the
-# package imports it.
-bench = ["flashinfer-python>=0.6", "pyyaml>=6"]
+# package imports it. The version is pinned because the baseline columns in the
+# README were measured with it; a later release moves its decode kernels.
+bench = ["flashinfer-python==0.6.13", "pyyaml>=6"]
 
 [project.urls]
 Homepage = "https://github.com/FutureMLS-Lab/FOSCAR"

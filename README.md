@@ -171,22 +171,23 @@ against one KV head.
 
 ![Decode speedup over FlashInfer bf16 on B200 at the Inkling shape, at batch 1 and 8](docs/decode-latency-b200-inkling.png)
 
-| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 | TRT-LLM NVFP4 |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 32K | 12.8 | **12.5** | 17.7 | 23.0 |
-| 1 | 128K | **18.9** | 18.9 | 37.3 | 28.6 |
-| 1 | 256K | **25.9** | 27.0 | 49.3 | 32.9 |
-| 1 | 512K | **40.7** | 42.1 | 72.8 | 41.1 |
-| 8 | 32K | **17.8** | 19.0 | 35.0 | 17.8 |
-| 8 | 128K | **40.5** | 45.7 | 98.6 | 41.6 |
-| 8 | 256K | 70.8 | 77.8 | 171.2 | **69.9** |
-| 8 | 512K | 131.2 | 142.1 | 318.9 | **124.4** |
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 32K | 12.7 | **12.1** | 17.6 | 15.9 | 22.8 |
+| 1 | 128K | **18.5** | 18.8 | 37.4 | 30.7 | 28.7 |
+| 1 | 256K | **25.9** | 26.8 | 49.3 | 37.3 | 32.2 |
+| 1 | 512K | **40.5** | 42.3 | 73.4 | 49.3 | 40.5 |
+| 8 | 32K | 18.1 | 19.5 | 35.0 | 22.8 | **17.9** |
+| 8 | 128K | **40.4** | 45.3 | 99.2 | 59.0 | 41.3 |
+| 8 | 256K | 71.3 | 77.9 | 171.9 | 100.4 | **70.4** |
+| 8 | 512K | 130.8 | 142.1 | 317.3 | 178.0 | **123.5** |
 
 One KV head serves eight query heads here, so the cache one GPU streams is an
 eighth of the Qwen3-8B table's at the same context length and the decode is
-correspondingly shorter. At batch 8 the TensorRT-LLM NVFP4 column is the fastest
-one: with a single KV head the split-K decode has less work per split than at
-four KV heads, and the narrower cache stops paying for it.
+correspondingly shorter. FOSCAR's lead narrows with it: at batch 8 the
+TensorRT-LLM NVFP4 column is the fastest at 32K, 256K and 512K, and within 2% of
+FOSCAR int2 at 128K. With one KV head the split-K decode has less work per
+split, so the narrower cache stops paying for it.
 
 ### H100 (SM90), Qwen3-8B
 
@@ -214,9 +215,7 @@ Page size 64, paged cache. Q is fp8 e4m3 on the B200 tables and bf16 on the H100
 one; FlashInfer is bf16 everywhere. Every column of a row was timed by the same
 harness on the same GPU model. The number is the CUDA kernel span from CUPTI
 over a cold L2, the median of the fully observed iterations, so it excludes host
-dispatch and the paged-attention wrapper. TensorRT-LLM's FP8 decode faults on
-the Inkling shape in FlashInfer 0.6.13, so its table carries the NVFP4 column
-and not that one.
+dispatch and the paged-attention wrapper.
 
 `benchmarks/decode_latency.csv` holds the values in these tables and
 `benchmarks/plot_decode.py` renders the figures. The FOSCAR columns come from

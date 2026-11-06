@@ -206,7 +206,10 @@ def build_trtllm(problem, kv_dtype: str):
 
     block_tables = physical.contiguous()
     seq_lens = problem["seq_lens"].to(torch.uint32).contiguous()
-    workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.int8, device=device)
+    # FlashInfer's decode writes split-K partials into this buffer and reads the
+    # counters it leaves there, so it must start zeroed: a fresh allocation is
+    # whatever the allocator last held.
+    workspace = torch.zeros(WORKSPACE_BYTES, dtype=torch.int8, device=device)
     out = torch.empty(batch, problem["q_heads"], head_dim, dtype=out_dtype, device=device)
     bmm1 = q_scale * k_scale * _sm_scale(problem)
     bmm2 = v_scale / o_scale
