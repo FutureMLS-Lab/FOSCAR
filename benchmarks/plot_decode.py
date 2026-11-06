@@ -41,8 +41,9 @@ REF = "#8a8984"
 rows = list(csv.DictReader((HERE / "decode_latency.csv").open()))
 
 
-def us(gpu, kernel, batch, kv):
-    hit = [r for r in rows if r["gpu"] == gpu and r["kernel"] == kernel
+def us(here, kernel, batch, kv):
+    """One cell of one figure. `here` is already narrowed to a GPU and a shape."""
+    hit = [r for r in here if r["kernel"] == kernel
            and int(r["batch"]) == batch and int(r["kv"]) == kv]
     return float(hit[0]["us"]) if hit else None
 
@@ -63,8 +64,8 @@ def render(gpu, shape, out):
         for key, label, color, marker in present:
             xs, ys = [], []
             for i, kv in enumerate(kv_lens):
-                base = us(gpu, BASE, batch, kv)
-                val = us(gpu, key, batch, kv)
+                base = us(here, BASE, batch, kv)
+                val = us(here, key, batch, kv)
                 if base and val:
                     xs.append(i)
                     ys.append(base / val)

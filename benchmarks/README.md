@@ -4,7 +4,7 @@ Decode latency for this package and for the two kernels it is compared against,
 measured by one harness on one GPU in one process.
 
 ```sh
-pip install -e ".[bench]"                       # adds FlashInfer 0.6.13
+pip install -e ".[bench]"                       # adds FlashInfer 0.7.3
 python benchmarks/run_bench.py                  # every shape, every kernel
 python benchmarks/run_bench.py --shape inkling
 python benchmarks/run_bench.py --kernel ours_int2 --batch 1 --context 32768
@@ -39,7 +39,7 @@ Every column of a cell decodes the same K, V and page table. Each converts them
 to the cache format its own kernel reads, before timing starts.
 
 The three FlashInfer columns are Blackwell-only for the TensorRT-LLM kernels; on
-Hopper the harness reports them as skipped. The extra pins FlashInfer 0.6.13,
+Hopper the harness reports them as skipped. The extra pins FlashInfer 0.7.3,
 the release the published columns were measured with: a later one moves its
 decode kernels, and its numbers would not be the same comparison.
 
