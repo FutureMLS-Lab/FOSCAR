@@ -197,6 +197,19 @@ pytest -q
 
 Modules that need a device skip when there is none.
 
+## Reference
+
+If you find FOSCAR useful in your research or systems, please cite our preprint:
+
+```bibtex
+@article{zhuang2026foscar,
+  title   = {{FOSCAR}: Accelerating Decode Attention over 2- and 4-Bit {KV} Caches through Affine Folding},
+  author  = {Donglin Zhuang and Pragaash Ponnusamy and Xiaoxia Wu and Shuaiwen Leon Song and Zhongzhu Zhou},
+  journal = {arXiv preprint},
+  year    = {2026}
+}
+```
+
 ## License
 
 MIT. Three files derive from FlashInfer's CuTe DSL attention modules and carry
