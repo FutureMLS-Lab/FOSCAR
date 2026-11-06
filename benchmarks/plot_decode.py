@@ -23,9 +23,6 @@ HERE = pathlib.Path(__file__).resolve().parent
 DOCS = HERE.parent / "docs"
 BASE = "flashinfer_bf16"
 
-# A speedup needs a FlashInfer measurement of the same shape. The Qwen3-8B rows
-# carry one; the Inkling rows measure the shape itself and have no baseline.
-PLOTTED_SHAPE = "qwen3-8b"
 
 # Fixed categorical order; identity is carried by position in the legend and by
 # the marker, not by colour alone. bf16 is the reference line rather than a
@@ -41,8 +38,7 @@ INK_2 = "#52514e"
 GRID = "#e4e3df"
 REF = "#8a8984"
 
-rows = [r for r in csv.DictReader((HERE / "decode_latency.csv").open())
-        if r["shape"] == PLOTTED_SHAPE]
+rows = list(csv.DictReader((HERE / "decode_latency.csv").open()))
 
 
 def us(gpu, kernel, batch, kv):
@@ -51,8 +47,8 @@ def us(gpu, kernel, batch, kv):
     return float(hit[0]["us"]) if hit else None
 
 
-def render(gpu, out):
-    here = [r for r in rows if r["gpu"] == gpu]
+def render(gpu, shape, out):
+    here = [r for r in rows if r["gpu"] == gpu and r["shape"] == shape]
     batches = sorted({int(r["batch"]) for r in here})
     kv_lens = sorted({int(r["kv"]) for r in here})
     present = [s for s in SERIES
@@ -112,5 +108,6 @@ def render(gpu, out):
     print(f"wrote {out}")
 
 
-render("b200", DOCS / "decode-latency-b200.png")
-render("h100", DOCS / "decode-latency-h100.png")
+render("b200", "qwen3-8b", DOCS / "decode-latency-b200.png")
+render("h100", "qwen3-8b", DOCS / "decode-latency-h100.png")
+render("b200", "inkling", DOCS / "decode-latency-b200-inkling.png")

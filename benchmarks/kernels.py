@@ -11,6 +11,7 @@ The competitor builders import FlashInfer, which is a benchmark-only dependency:
 
 from __future__ import annotations
 
+import inspect
 import math
 
 import torch
@@ -144,9 +145,11 @@ def build_trtllm(problem, kv_dtype: str):
     """TensorRT-LLM's Blackwell decode through FlashInfer, at fp8 or nvfp4 KV."""
     from flashinfer.decode import (get_trtllm_gen_fmha_module,
                                    trtllm_batch_decode_with_kv_cache)
-    from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
 
     get_trtllm_gen_fmha_module()
+    # FlashInfer gained the multi-CTA counter buffer in a later 0.6.x release;
+    # the call is made against whatever this build accepts.
+    params = inspect.signature(trtllm_batch_decode_with_kv_cache).parameters
     device = problem["device"]
     batch, pages, page = (problem["batch"], problem["context"] // problem["page_size"],
                           problem["page_size"])
@@ -183,14 +186,19 @@ def build_trtllm(problem, kv_dtype: str):
         v_sf = torch.empty_like(k_sf)
         for lo in range(0, batch, 8):
             hi = min(lo + 8, batch)
-            (kp, vp), (ks, vs), _, _ = nvfp4_quantize_paged_kv_cache(
-                k[lo:hi].contiguous(), v[lo:hi].contiguous(), kv_layout="HND",
-                k_global_sf=k_gsf, v_global_sf=v_gsf)
+            chunk = hi - lo
+            # The helper takes pages, not requests, and returns the packed
+            # pools first, followed by their block scales.
+            kc = k[lo:hi].reshape(chunk * pages, heads, page, head_dim).contiguous()
+            vc = v[lo:hi].reshape(chunk * pages, heads, page, head_dim).contiguous()
+            packed = nvfp4_quantize_paged_kv_cache(
+                kc, vc, kv_layout="HND", k_global_sf=k_gsf, v_global_sf=v_gsf)
+            (kp, vp), (ks, vs) = packed[0], packed[1]
             here = physical[lo:hi]
-            k_fp4[here] = kp
-            v_fp4[here] = vp
-            k_sf[here] = ks
-            v_sf[here] = vs
+            k_fp4[here] = kp.view(chunk, pages, heads, page, head_dim // 2)
+            v_fp4[here] = vp.view(chunk, pages, heads, page, head_dim // 2)
+            k_sf[here] = ks.view(chunk, pages, heads, page, head_dim // 16)
+            v_sf[here] = vs.view(chunk, pages, heads, page, head_dim // 16)
         kv_cache, kv_cache_sf = (k_fp4, v_fp4), (k_sf, v_sf)
         out_dtype, o_scale = torch.float8_e4m3fn, v_scale
     else:
@@ -199,23 +207,28 @@ def build_trtllm(problem, kv_dtype: str):
     block_tables = physical.contiguous()
     seq_lens = problem["seq_lens"].to(torch.uint32).contiguous()
     workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.int8, device=device)
-    counter = torch.zeros(
-        get_trtllm_gen_multi_ctas_kv_counter_bytes(
-            batch, problem["q_heads"],
-            torch.cuda.get_device_properties(device).multi_processor_count),
-        dtype=torch.uint8, device=device)
     out = torch.empty(batch, problem["q_heads"], head_dim, dtype=out_dtype, device=device)
     bmm1 = q_scale * k_scale * _sm_scale(problem)
     bmm2 = v_scale / o_scale
     max_seq_len = problem["context"]
 
+    kwargs = {"out": out, "kv_layout": "HND", "enable_pdl": True,
+              "backend": "trtllm-gen", "q_len_per_req": 1, "o_scale": o_scale,
+              "kv_cache_sf": kv_cache_sf, "uses_shared_paged_kv_idx": True}
+    if "multi_ctas_kv_counter_buffer" in params:
+        from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
+
+        kwargs["multi_ctas_kv_counter_buffer"] = torch.zeros(
+            get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                batch, problem["q_heads"],
+                torch.cuda.get_device_properties(device).multi_processor_count),
+            dtype=torch.uint8, device=device)
+    kwargs = {k: v for k, v in kwargs.items() if k in params}
+
     def fn() -> None:
         trtllm_batch_decode_with_kv_cache(
             q, kv_cache, workspace, block_tables, seq_lens, max_seq_len,
-            bmm1, bmm2, -1, out=out, kv_layout="HND", enable_pdl=True,
-            backend="trtllm-gen", q_len_per_req=1, o_scale=o_scale,
-            kv_cache_sf=kv_cache_sf, uses_shared_paged_kv_idx=True,
-            multi_ctas_kv_counter_buffer=counter)
+            bmm1, bmm2, -1, **kwargs)
 
     fn()
     torch.cuda.synchronize()

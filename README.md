@@ -169,20 +169,24 @@ against one KV head.
 
 ### B200 (SM100), Inkling
 
-| Batch | Context | FOSCAR int2 | FOSCAR int4 |
-|---:|---:|---:|---:|
-| 1 | 32K | 12.8 | **12.5** |
-| 1 | 128K | **18.6** | 18.8 |
-| 1 | 256K | **25.8** | 26.9 |
-| 1 | 512K | **40.4** | 42.3 |
-| 8 | 32K | **17.5** | 19.4 |
-| 8 | 128K | **40.5** | 46.2 |
-| 8 | 256K | **70.6** | 77.9 |
-| 8 | 512K | **131.6** | 142.1 |
+![Decode speedup over FlashInfer bf16 on B200 at the Inkling shape, at batch 1 and 8](docs/decode-latency-b200-inkling.png)
+
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 | TRT-LLM NVFP4 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 32K | 12.8 | **12.5** | 17.7 | 23.0 |
+| 1 | 128K | **18.9** | 18.9 | 37.3 | 28.6 |
+| 1 | 256K | **25.9** | 27.0 | 49.3 | 32.9 |
+| 1 | 512K | **40.7** | 42.1 | 72.8 | 41.1 |
+| 8 | 32K | **17.8** | 19.0 | 35.0 | 17.8 |
+| 8 | 128K | **40.5** | 45.7 | 98.6 | 41.6 |
+| 8 | 256K | 70.8 | 77.8 | 171.2 | **69.9** |
+| 8 | 512K | 131.2 | 142.1 | 318.9 | **124.4** |
 
 One KV head serves eight query heads here, so the cache one GPU streams is an
-eighth of the Qwen3-8B table's at the same context length, and the decode is
-correspondingly shorter.
+eighth of the Qwen3-8B table's at the same context length and the decode is
+correspondingly shorter. At batch 8 the TensorRT-LLM NVFP4 column is the fastest
+one: with a single KV head the split-K decode has less work per split than at
+four KV heads, and the narrower cache stops paying for it.
 
 ### H100 (SM90), Qwen3-8B
 
@@ -210,7 +214,9 @@ Page size 64, paged cache. Q is fp8 e4m3 on the B200 tables and bf16 on the H100
 one; FlashInfer is bf16 everywhere. Every column of a row was timed by the same
 harness on the same GPU model. The number is the CUDA kernel span from CUPTI
 over a cold L2, the median of the fully observed iterations, so it excludes host
-dispatch and the paged-attention wrapper.
+dispatch and the paged-attention wrapper. TensorRT-LLM's FP8 decode faults on
+the Inkling shape in FlashInfer 0.6.13, so its table carries the NVFP4 column
+and not that one.
 
 `benchmarks/decode_latency.csv` holds the values in these tables and
 `benchmarks/plot_decode.py` renders the figures. The FOSCAR columns come from

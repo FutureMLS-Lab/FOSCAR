@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 import pathlib
+import subprocess
 import sys
 
 import torch
@@ -79,6 +80,55 @@ def make_problem(shape, batch, context, page_size, device, arch):
     }
 
 
+def run_isolated(args, names, wanted, batches, contexts):
+    """Measure one cell per child process, then merge the rows.
+
+    A CUDA context is shared by everything in a process, and a fault in one
+    library's kernel has been seen to take down a later cell's build in the same
+    process. A child per cell keeps every measurement in the state the published
+    ones were taken in, and a cell that faults costs only itself.
+    """
+    parts, failed = [], []
+    for kernel in wanted:
+        for name in names:
+            for batch in batches:
+                for context in contexts:
+                    part = args.out.with_name(
+                        f"{args.out.stem}.{kernel}.{name}.{batch}.{context}.csv")
+                    command = [sys.executable, str(pathlib.Path(__file__).resolve()),
+                               "--config", str(args.config), "--kernel", kernel,
+                               "--shape", name, "--batch", str(batch),
+                               "--context", str(context), "--out", str(part),
+                               "--in-process"]
+                    if args.iterations:
+                        command += ["--iterations", str(args.iterations)]
+                    result = subprocess.run(command, check=False)
+                    if result.returncode:
+                        print(f"  {name} b={batch} kv={context} {kernel}: FAILED",
+                              flush=True)
+                        failed.append(f"{name} b={batch} kv={context} {kernel}")
+                        part.unlink(missing_ok=True)
+                        continue
+                    parts.append(part)
+
+    rows = []
+    for part in parts:
+        with open(part, newline="") as handle:
+            rows.extend(csv.DictReader(handle))
+        part.unlink()
+    if not rows:
+        raise SystemExit("no cell was measured")
+    with open(args.out, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]), lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"wrote {args.out} ({len(rows)} rows)")
+    if failed:
+        print(f"{len(failed)} cell(s) failed and are absent from the table: "
+              + ", ".join(failed))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=pathlib.Path, default=DEFAULT_CONFIG)
@@ -89,6 +139,9 @@ def main(argv=None):
     parser.add_argument("--out", type=pathlib.Path, default=HERE / "results.csv")
     parser.add_argument("--iterations", type=int, default=None,
                         help=f"measured iterations (default {timer.ITERS})")
+    parser.add_argument("--in-process", action="store_true",
+                        help="measure every kernel in this process instead of one "
+                             "process per kernel")
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
@@ -104,6 +157,9 @@ def main(argv=None):
     unknown = [n for n in wanted if n not in kernels.REGISTRY]
     if unknown:
         raise SystemExit(f"unknown kernel(s) {unknown}; known {sorted(kernels.REGISTRY)}")
+
+    if len(wanted) > 1 and not args.in_process:
+        return run_isolated(args, names, wanted, batches, contexts)
 
     rows = []
     print(f"{torch.cuda.get_device_name(device)} | {arch} | page {page_size} | "
