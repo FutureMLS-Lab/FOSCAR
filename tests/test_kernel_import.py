@@ -9,7 +9,7 @@ def test_sm100_shared_reduction_library_imports():
     # `GroupedQueryAttentionDecode` is the namespace for the reduction members. The
     # class name matters too -- `launch_reduction` reaches the kernel via a
     # class-qualified `GroupedQueryAttentionDecode.reduction_kernel(...)` call.
-    from fosca._sm100.gqa_decode import GroupedQueryAttentionDecode
+    from foscar._sm100.gqa_decode import GroupedQueryAttentionDecode
     assert GroupedQueryAttentionDecode is not None
     for member in ("can_implement", "gqa_pack", "gemm_view", "gemm_view_bsh",
                    "reduction_none", "reduction_epilogue", "reduction_cluster",
@@ -18,7 +18,7 @@ def test_sm100_shared_reduction_library_imports():
 
 
 def test_quantized_kernels_import():
-    from fosca._sm100.int_fold_decode import IntDecodeSm100
-    from fosca._sm90.int_decode_pingpong import IntPingPongDecodeSm90
+    from foscar._sm100.int_fold_decode import IntDecodeSm100
+    from foscar._sm90.int_decode_pingpong import IntPingPongDecodeSm90
     assert IntDecodeSm100 is not None
     assert IntPingPongDecodeSm90 is not None

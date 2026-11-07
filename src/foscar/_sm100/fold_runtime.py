@@ -2,7 +2,7 @@
 """Library-side compile/launch glue for ``IntDecodeSm100`` (quantized-KV decode).
 
 This module is the SINGLE place that knows how to build and launch the SM100
-fold kernel, so that :class:`fosca.PagedDecodeWrapper` — the public API —
+fold kernel, so that :class:`foscar.PagedDecodeWrapper` — the public API —
 drives the quantized kernels through exactly the same code a benchmark drives.
 There is one compile path and one launch path, not two that can drift.
 
@@ -21,7 +21,7 @@ What lives here
 ``vmax_bucket``, ``pscale_lp_of_bucket``  the exponent bin and its P-scale exponent
 
 What does NOT live here: pool CONSTRUCTION. A serving integration packs its own
-KV cache through :class:`fosca.QuantKVCache` and :class:`fosca.QuantKVLayout`;
+KV cache through :class:`foscar.QuantKVCache` and :class:`foscar.QuantKVLayout`;
 pool builders are test and benchmark fixtures, not library code.
 """
 import os
@@ -279,7 +279,7 @@ def v_max_hist_for_pool(mScale, kernel_kwargs=None, *, page_size=POOL_PAGE_SIZE,
 
 
 def _refuse_cuda12_dsl_backend(where="compile_fold"):
-    """Blackwell builds need the DSL's CUDA 13 backend (`fosca[cu13]`).
+    """Blackwell builds need the DSL's CUDA 13 backend (`foscar[cu13]`).
 
     nvidia-cutlass-dsl 4.8.0's CUDA 12 backend vendors ptxas 12.9, which on B200
     leaves output elements of this kernel unwritten at the B = 1 cell and at a
@@ -295,7 +295,7 @@ def _refuse_cuda12_dsl_backend(where="compile_fold"):
     if major is not None and major < 13:
         raise RuntimeError(
             f"{where}: the SM100 kernel needs nvidia-cutlass-dsl's CUDA 13 backend "
-            f"(install fosca[cu13]); this DSL loaded CUDA "
+            f"(install foscar[cu13]); this DSL loaded CUDA "
             f"{version_info.CUDA_VERSION}, whose ptxas miscompiles this kernel on B200")
 
 
@@ -329,7 +329,7 @@ def compile_fold(
     ONE compile serves every batch size and every KV length — the batch, page
     count and kv_splits dims are `cute.sym_int()`. Memoise on the remaining
     (static) arguments; a trace costs 10 to 13 s on B200, and
-    `fosca.kernel_cache` serves a repeat of the same trace from disk in
+    `foscar.kernel_cache` serves a repeat of the same trace from disk in
     milliseconds.
 
     `bits_tuning`: the per-bits ctor knobs to apply (default `BITS_TUNING`).
@@ -784,7 +784,7 @@ def launch_fold_graph(compiled, *, seqlens, page_table, q_bshd, o_bshd, o_partia
 
 def graph_work_views(buf, slots, batch):
     """`(work, split_counts)`: the graph split build's two inputs, as views of the work list
-    `fosca.graph_plan` writes (`Bucket.write`), one int32 device buffer of
+    `foscar.graph_plan` writes (`Bucket.write`), one int32 device buffer of
     `graph_plan.words(slots, batch)` words that the host plan reaches with one copy.
 
     `work` is [slots, 4], one 16-byte entry per CTA of the launch's grid; `split_counts` is
@@ -870,7 +870,7 @@ def plan_fold(p, bits, *, sequence_tile=256):
     """(kv_splits, reduction) the SM100 planner would choose for this problem.
 
     Thin adapter from a problem dict (keys "b", "h_kv", "seq_lens") to
-    `fosca._sm100.scheduler.plan_splits_sm100`, so the planner is
+    `foscar._sm100.scheduler.plan_splits_sm100`, so the planner is
     reachable from the one place every fold launch goes through instead of
     being library code nobody calls.
 

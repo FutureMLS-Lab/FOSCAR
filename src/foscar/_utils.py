@@ -23,7 +23,7 @@ def torch_to_cutlass(dtype: torch.dtype):
         torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     }
     if dtype not in table:
-        raise TypeError(f"fosca does not support {dtype}; supported: {list(table)}")
+        raise TypeError(f"foscar does not support {dtype}; supported: {list(table)}")
     return table[dtype]
 
 
@@ -69,7 +69,7 @@ def require_arch(device=None) -> str:
     if arch is None:
         major, minor = device_cc(device)
         raise RuntimeError(
-            f"fosca has no kernel for compute capability {major}.{minor}; it runs on "
+            f"foscar has no kernel for compute capability {major}.{minor}; it runs on "
             f"sm90 (compute capability 9.0) and sm100 (10.0)")
     return arch
 

@@ -63,7 +63,7 @@ THREE RULES A CHANGE HERE MUST RESPECT
 
 The self-test below is the cheap always-on version of the held-out validation, pinned
 to the measured optima so it fails loudly if these constants drift again.
-Run: uv run python src/fosca/_sm100/scheduler.py
+Run: uv run python src/foscar/_sm100/scheduler.py
 """
 import math
 

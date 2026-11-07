@@ -1,4 +1,4 @@
-# FOSCA
+# FOSCAR
 
 Quantized-KV paged GQA decode kernels for Hopper (SM90) and Blackwell (SM100),
 written in CuTe DSL and exposed through one architecture-agnostic wrapper.
@@ -15,13 +15,13 @@ nvfp4.
 From a source checkout:
 
 ```sh
-git clone https://github.com/donglinz/fosca.git
-cd fosca
+git clone https://github.com/FutureMLS-Lab/FOSCAR.git
+cd foscar
 pip install -e ".[cu13]"    # CUDA 13: Blackwell, and Hopper
 pip install -e ".[cu12]"    # CUDA 12: Hopper only
 ```
 
-The same extras work with `pip install "fosca[cu13]"` once the package
+The same extras work with `pip install "foscar[cu13]"` once the package
 is published to PyPI.
 
 The package contains no compiled extensions. Everything is JIT-compiled by
@@ -29,14 +29,13 @@ The package contains no compiled extensions. Everything is JIT-compiled by
 cached on disk across processes. Bring your own `torch>=2.4`.
 
 Blackwell requires the `cu13` extra. The DSL's CUDA 12 backend miscompiles the
-SM100 kernel, and the package refuses to compile it under that backend rather
-than producing a wrong result.
+SM100 kernel, and the package refuses to compile it under that backend.
 
 ## Quickstart
 
 ```python
 import torch
-from fosca import PagedDecodeWrapper, QuantKVLayout, get_capabilities
+from foscar import PagedDecodeWrapper, QuantKVLayout, get_capabilities
 
 device = "cuda"
 arch = get_capabilities()["arch"]                 # "sm90" or "sm100"
@@ -139,29 +138,50 @@ layer may run concurrently with an append on another stream.
 Decode latency in microseconds. Each figure plots the speedup over FlashInfer
 bf16 at the same shape, so the dashed line at 1.00 is bf16.
 
-### B200 (SM100)
+### B200 (SM100), Qwen3-8B TP1 (HQ=32 HKV=8 D=128)
 
 ![Decode speedup over FlashInfer bf16 on B200, at batch 1 and 8](docs/decode-latency-b200.png)
 
-| Batch | Context | FOSCA int2 | FOSCA int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 32K | **15.0** | 17.5 | 35.6 | 23.4 | 18.3 |
-| 1 | 128K | **35.5** | 43.7 | 98.4 | 58.9 | 41.7 |
-| 1 | 256K | **62.1** | 73.7 | 170.7 | 102.0 | 70.3 |
-| 1 | 512K | **113.9** | 135.3 | 313.5 | 175.0 | 123.7 |
-| 8 | 32K | **61.4** | 73.9 | 167.3 | 85.2 | 69.3 |
-| 8 | 128K | **217.4** | 250.8 | 596.5 | 309.1 | 246.4 |
-| 8 | 256K | **398.6** | 455.3 | 1168.8 | 594.2 | 480.6 |
-| 8 | 512K | **756.9** | 865.2 | 2319.4 | 1166.0 | 947.2 |
+| 1 | 32K | **15.3** | 17.6 | 35.3 | 23.0 | 18.1 |
+| 1 | 128K | **36.7** | 44.2 | 99.0 | 60.1 | 41.2 |
+| 1 | 256K | **62.4** | 74.8 | 170.7 | 100.1 | 69.8 |
+| 1 | 512K | **114.3** | 135.6 | 314.1 | 175.3 | 123.7 |
+| 8 | 32K | **62.5** | 75.1 | 167.6 | 95.8 | 69.2 |
+| 8 | 128K | **218.3** | 251.9 | 596.0 | 310.5 | 242.9 |
+| 8 | 256K | **399.1** | 456.2 | 1172.5 | 594.3 | 474.7 |
+| 8 | 512K | **758.1** | 865.7 | 2319.8 | 1166.6 | 932.7 |
 
-### H100 (SM90)
+### B200 (SM100), Inkling TP8 (HQ=8 HKV=1 D=128)
+
+![Decode speedup over FlashInfer bf16 on B200 at the Inkling shape, at batch 1 and 8](docs/decode-latency-b200-inkling.png)
+
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 32K | 12.7 | 12.5 | 16.8 | **11.6** | 13.6 |
+| 1 | 128K | **18.5** | 18.8 | 37.4 | 30.4 | 29.2 |
+| 1 | 256K | **25.6** | 26.6 | 49.0 | 36.7 | 32.9 |
+| 1 | 512K | **40.7** | 42.4 | 72.7 | 49.1 | 41.1 |
+| 8 | 32K | **17.7** | 18.9 | 34.8 | 22.1 | 17.9 |
+| 8 | 128K | **40.2** | 46.1 | 98.1 | 58.9 | 41.1 |
+| 8 | 256K | 71.1 | 78.4 | 171.2 | 101.3 | **70.3** |
+| 8 | 512K | 130.5 | 141.8 | 318.6 | 181.4 | **124.1** |
+
+One KV head serves eight query heads, so a GPU streams an eighth of the
+Qwen3-8B cache at the same context length. FOSCAR's lead narrows with it: at
+batch 8 the TensorRT-LLM NVFP4 column is fastest at 32K, 256K and 512K, and
+within 2% of FOSCAR int2 at 128K. With one KV head there is less work per split,
+and the narrower cache stops paying for it.
+
+### H100 (SM90), Qwen3-8B TP1 (HQ=32 HKV=8 D=128)
 
 TensorRT-LLM's `trtllm-gen` decode is Blackwell only, so this table has no
 TensorRT-LLM column.
 
 ![Decode speedup over FlashInfer bf16 on H100, at batch 1 and 8](docs/decode-latency-h100.png)
 
-| Batch | Context | FOSCA int2 | FOSCA int4 | FlashInfer bf16 |
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 |
 |---:|---:|---:|---:|---:|
 | 1 | 32K | **25.8** | 33.0 | 63.4 |
 | 1 | 128K | **73.7** | 79.7 | 200.6 |
@@ -174,20 +194,28 @@ TensorRT-LLM column.
 
 ### Conditions
 
-One query token per request, 32 query heads over 8 KV heads, `head_dim` 128,
-page size 64, paged cache. Q is fp8 on the B200 tables and bf16 on the H100 one;
-FlashInfer is bf16 everywhere. Every column of a row was timed by the same
+One query token per request. K and V are quantized token-wise, one scale and one
+offset per group of 128 values, which is the whole head dimension, both in FP32.
+Page size 64, paged cache. Q is fp8 e4m3 on the B200 tables and bf16 on the H100
+one; FlashInfer is bf16 everywhere. Every column of a row was timed by the same
 harness on the same GPU model. The number is the CUDA kernel span from CUPTI
-over a cold L2, the median of the fully observed iterations. It excludes host
-dispatch and the paged-attention wrapper, so it is not an end-to-end serving
-latency.
+over a cold L2, the median of the fully observed iterations, so it excludes host
+dispatch and the paged-attention wrapper.
 
-The FOSCA columns were measured by driving `PagedDecodeWrapper` from this
-release; `benchmarks/decode_latency.csv` holds the values and
-`benchmarks/plot_decode.py` renders both figures. The competitor columns were
-measured by the project's benchmark harness. Re-measuring the FOSCA columns
-reproduced the tables to within 1.5% on both GPUs, except for one B200 cell,
-batch 8 at 128K, which is reported at the value it reproduces.
+`benchmarks/decode_latency.csv` holds the values in these tables and
+`benchmarks/plot_decode.py` renders the figures. The FOSCAR columns come from
+`PagedDecodeWrapper`; the competitor columns from FlashInfer.
+
+### Reproducing
+
+```sh
+pip install -e ".[bench]"    # adds FlashInfer for the competitor columns
+python benchmarks/run_bench.py                              # every shape and kernel
+python benchmarks/run_bench.py --shape inkling --kernel ours_int2
+```
+
+`benchmarks/bench.yaml` sets the shapes and the batch and context grid.
+`run_bench.py` writes one CSV row per cell.
 
 ## Testing
 
@@ -212,7 +240,13 @@ If you find FOSCAR useful in your research or systems, please cite our preprint:
 
 ## License
 
-MIT. Three files derive from FlashInfer's CuTe DSL attention modules and carry
-the BSD-3-Clause notice those files carry; the package also redistributes
-subsets of QuACK and flash-attention (both BSD-3-Clause). [NOTICE](NOTICE) names
-the files and reproduces each license.
+MIT.
+
+## Acknowledgements
+
+This work was inspired by and builds on
+[FlashInfer](https://github.com/flashinfer-ai/flashinfer),
+[QuACK](https://github.com/Dao-AILab/quack) and
+[flash-attention](https://github.com/Dao-AILab/flash-attention).
+[NOTICE](NOTICE) records the material this package carries from them and the
+licenses it is under.

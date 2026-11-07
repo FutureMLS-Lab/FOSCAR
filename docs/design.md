@@ -1,6 +1,6 @@
 # Design and Internals
 
-This page describes how FOSCA is built: the package layout, how the wrapper
+This page describes how FOSCAR is built: the package layout, how the wrapper
 picks a kernel for the device it runs on, the lifecycle of that wrapper, the workspace
 the split-K reduction needs, and how a launch is bound to a CUDA stream. It is written
 for contributors and for integrators wiring the package into a serving engine, who want
@@ -13,13 +13,12 @@ documented in the module docstrings of `_sm100/int_fold_decode.py` and
 [support matrix](../README.md#support-matrix).
 
 [NOTICE](../NOTICE) records what this package derives from and redistributes, and the
-license each part carries. The derived files are modified and do not track upstream, so an
-upstream change has to be merged by hand.
+license each part carries. The derived files are modified from the upstream versions.
 
 ## Package layout
 
 ```
-src/fosca/
+src/foscar/
 ├── __init__.py                 public API: PagedDecodeWrapper, QuantKVCache, QuantKVLayout
 ├── wrapper.py                  plan/run, arch dispatch, feature gating, graph mode
 ├── kv_cache.py                 the cache layout and the cache object a decode reads
@@ -53,16 +52,14 @@ src/fosca/
 
 `_sm90` and `_sm100` are private, and nothing architecture-specific is exported at the
 top level. `_utils`, `quant_layout` and `kernel_contract` import nothing from the CuTe
-DSL, so `import fosca` works on a machine with no CUDA toolkit installed; the
+DSL, so `import foscar` works on a machine with no CUDA toolkit installed; the
 DSL is imported at the point a kernel is compiled.
 
-`_sm100/gqa_decode.py` is a split-K reduction library rather than a kernel, despite the
-name. `int_fold_decode.py` imports the `GroupedQueryAttentionDecode` class from it and
+`_sm100/gqa_decode.py` is a split-K reduction library rather than a kernel. `int_fold_decode.py` imports the `GroupedQueryAttentionDecode` class from it and
 uses it as the namespace for the reduction entry points. Two of those dependencies are
 invisible to a search of the import list: `launch_reduction` reaches the kernel through a
-class-qualified call, and `reduction_epilogue` reads `gmem_fmax` as a module global. Keep
-the module name, the class name and `gmem_fmax` as they are, because breaking either
-dependency fails at trace time rather than at import time, as a broken reduction launch.
+class-qualified call, and `reduction_epilogue` reads `gmem_fmax` as a module global.
+Breaking either dependency fails at trace time, as a broken reduction launch.
 
 ## Architecture dispatch
 
@@ -73,7 +70,7 @@ decision as a dictionary whose keys are always present, with empty or false valu
 unsupported device, so a router can read any key without a `KeyError`.
 
 ```python
-from fosca import get_capabilities, is_supported
+from foscar import get_capabilities, is_supported
 
 print(is_supported())                 # True on an SM90 or SM100 device
 print(get_capabilities()["arch"])     # "sm90", "sm100" or "unsupported"
@@ -89,7 +86,7 @@ planner, the compile entry point and the launch site:
 | SM90 (major 9) | `IntPingPongDecodeSm90` | `_sm90/pingpong_runtime.compile_pingpong` | `launch_pingpong` |
 | SM100 (10, 0) | `IntDecodeSm100` | `_sm100/fold_runtime.compile_fold` | `launch_fold` |
 
-Feature gating happens in the wrapper rather than in the kernel, so a refused request
+Feature gating happens in the wrapper, so a refused request
 raises an actionable message before any trace is attempted:
 
 | Call | Argument | Result |

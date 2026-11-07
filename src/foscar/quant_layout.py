@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Donglin Zhuang
 # SPDX-License-Identifier: MIT
-# src/fosca/quant_layout.py
+# src/foscar/quant_layout.py
 """The scale-block layout and quantization envelope, shared by BOTH decode kernels.
 
 Torch-free, so the kernel modules can import it.  Per (page, kv-head) the scale

@@ -11,7 +11,7 @@
    "kernel": {
     "ALPHA_INV": 1.0,
     "BETA_FOLD": 4.0,
-    "__class__": "fosca._sm90.int_decode_pingpong.IntPingPongDecodeSm90",
+    "__class__": "foscar._sm90.int_decode_pingpong.IntPingPongDecodeSm90",
     "_min_blocks": 2,
     "bits": 2,
     "fold": true,
@@ -90,6 +90,6 @@
  },
  "kind": "sm90_IntPingPongDecodeSm90",
  "object_sha256": "f0f81108bb2d5812950fc1f03ca40fc263acd40fae587e96526a5ad055107638",
- "symbol": "fosca_sm90_IntPingPongDecodeSm90_6f1d84b5d07f1cc7",
+ "symbol": "foscar_sm90_IntPingPongDecodeSm90_6f1d84b5d07f1cc7",
  "trace_seconds": 5.136
 }

@@ -15,9 +15,9 @@ import numpy as np
 import pytest
 import torch
 
-from fosca import _utils, graph_plan, kv_cache
-from fosca import wrapper as W
-from fosca.kv_cache import QuantKVCache, QuantKVLayout
+from foscar import _utils, graph_plan, kv_cache
+from foscar import wrapper as W
+from foscar.kv_cache import QuantKVCache, QuantKVLayout
 
 D, HQ, HKV, MAX_PAGES = 128, 32, 8, 64
 
@@ -39,8 +39,8 @@ def graph_env(monkeypatch):
     table, seq_lens), planned in graph mode on the CPU at 132 SMs; `launches` records each
     launch, `log` the CUDA events and syncs, `stream` the current stream, `capturing` whether
     the stream is capturing."""
-    from fosca._sm100 import fold_runtime
-    from fosca._sm90 import pingpong_runtime
+    from foscar._sm100 import fold_runtime
+    from foscar._sm90 import pingpong_runtime
 
     launches, log, stream, capturing, arch_box = [], [], ["s0"], [False], ["sm90"]
     monkeypatch.setattr(_utils, "require_arch", lambda device=None: arch_box[0])
@@ -385,7 +385,7 @@ def test_graph_plan_refuses_what_int32_cannot_hold(graph_env, monkeypatch, rows,
 
 
 def test_blackwells_graph_tile_is_the_kernels_resolved_tile(graph_env, monkeypatch):
-    from fosca._sm100 import fold_runtime
+    from foscar._sm100 import fold_runtime
 
     graph_env("sm100", 2)
     layout = QuantKVLayout._create("sm100", bits=2, head_dim=D, num_kv_heads=HKV)

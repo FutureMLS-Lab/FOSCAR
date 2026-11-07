@@ -12,9 +12,9 @@ import dataclasses
 import pytest
 import torch
 
-import fosca as cd
-from fosca import _utils, kv_cache
-from fosca.kv_cache import QuantKVCache, QuantKVLayout
+import foscar as cd
+from foscar import _utils, kv_cache
+from foscar.kv_cache import QuantKVCache, QuantKVLayout
 
 D = 128
 
@@ -54,8 +54,8 @@ def fake_cuda(monkeypatch):
 
 @pytest.mark.parametrize("bits", [2, 4])
 def test_production_orders_are_the_readers_answers(bits):
-    from fosca._sm100.int_fold_decode import IntDecodeSm100
-    from fosca._sm90.int_decode_pingpong import IntPingPongDecodeSm90
+    from foscar._sm100.int_fold_decode import IntDecodeSm100
+    from foscar._sm90.int_decode_pingpong import IntPingPongDecodeSm90
 
     h = _layout("sm90", bits)
     assert (h.reader, h.code_pool_order) == ("IntPingPongDecodeSm90",
@@ -135,7 +135,7 @@ def test_both_arches_take_either_scale_dtype_at_128():
 
 @pytest.mark.parametrize("bits", [2, 4])
 def test_blackwell_d256_has_only_the_whole_head_eager_layout(bits):
-    from fosca._append_core import envelope_refusal
+    from foscar._append_core import envelope_refusal
     layout = _layout("sm100", bits, head_dim=256)
     assert layout.k_quant == layout.v_quant == ("token", 256)
     assert layout.scale_dtype is torch.float32
@@ -204,7 +204,7 @@ def test_bytes_per_page(arch, bits, want):
 
 
 def test_pool_shapes():
-    from fosca._sm90.serving_cache import code_row_bytes
+    from foscar._sm90.serving_cache import code_row_bytes
 
     h = _layout("sm90", 4, num_kv_heads=3).pool_shapes(5)
     per_k, per_v = code_row_bytes(D, 64, 4)
@@ -378,7 +378,7 @@ def _host_pools(layout, pages, seed=0):
 
 @pytest.mark.parametrize("kw", [{}, {"k_quant": ("token", 64)}, {"k_quant": ("channel", 64)}])
 def test_adopt_derives_the_page_maxima_from_the_scales(any_device, kw):
-    from fosca.quant_layout import quant_block_offsets
+    from foscar.quant_layout import quant_block_offsets
 
     layout = _layout("sm100", 2, num_kv_heads=2, **kw)
     k, v, s = _host_pools(layout, 3)
@@ -391,7 +391,7 @@ def test_adopt_derives_the_page_maxima_from_the_scales(any_device, kw):
     assert cache.v_page_max.shape == (3, 2)
     got = cache.v_page_max.view(torch.int32).view(torch.float32)
     assert torch.equal(got, s_v.float().amax(-1))
-    from fosca._sm100.fold_runtime import v_max_hist_of
+    from foscar._sm100.fold_runtime import v_max_hist_of
     assert torch.equal(cache.v_max_hist, v_max_hist_of(cache.v_page_max))
     channel = QuantKVCache._adopt(_layout("sm100", 2, v_quant=("channel", 64)),
                                   *_host_pools(_layout("sm100", 2, v_quant=("channel", 64)), 3))
@@ -399,7 +399,7 @@ def test_adopt_derives_the_page_maxima_from_the_scales(any_device, kw):
 
 
 def test_adopt_takes_the_page_maxima_and_their_table_together(any_device):
-    from fosca._sm100.fold_runtime import v_max_hist_of, v_page_max_for_pool
+    from foscar._sm100.fold_runtime import v_max_hist_of, v_page_max_for_pool
 
     layout = _layout("sm100", 4, num_kv_heads=2)
     k, v, s = _host_pools(layout, 3)
@@ -421,7 +421,7 @@ def test_adopt_takes_the_page_maxima_and_their_table_together(any_device):
 def test_recount_v_max_rebuilds_the_table_in_place(any_device):
     """An engine-style copy of one page's maximum from another cache bypasses the table;
     `recount_v_max` makes the table the histogram of the maxima again, in the same tensor."""
-    from fosca._sm100.fold_runtime import v_max_hist_of
+    from foscar._sm100.fold_runtime import v_max_hist_of
 
     layout = _layout("sm100", 2, num_kv_heads=2)
     a = QuantKVCache._adopt(layout, *_host_pools(layout, 4, seed=1))
@@ -639,7 +639,7 @@ def test_the_prequantized_saturation_range_is_the_quantizing_writers(bits):
     """`scale_range(qmax)` is the f32 scale `append` stores for a constant row, div.rn(1e-8,
     qmax), and for a row spanning the whole input envelope, div.rn(2^65, qmax), each as torch's
     correctly rounded f32 division gives it: the bounds the prequantized write saturates to."""
-    from fosca._append_core import INPUT_ENVELOPE, scale_range
+    from foscar._append_core import INPUT_ENVELOPE, scale_range
     qmax = (1 << bits) - 1
     lo, hi = scale_range(qmax)
     f32 = lambda x: torch.tensor(x, dtype=torch.float32)  # noqa: E731
@@ -652,7 +652,7 @@ def test_the_prequantized_saturation_range_is_the_quantizing_writers(bits):
 # and the launch are stood in for, so these check what plan() and run() decide and refuse,
 # and what they hand the launch, without a GPU.
 
-from fosca import wrapper as W  # noqa: E402
+from foscar import wrapper as W  # noqa: E402
 
 
 class _Launched(Exception):
@@ -663,8 +663,8 @@ class _Launched(Exception):
 def host_wrapper(monkeypatch):
     """`make(arch, layout=None, **plan_kwargs)` -> (wrapper, layout, cache), planned on the CPU
     for a 2-request batch of 512 tokens; `launches` records each launch's keyword arguments."""
-    from fosca._sm100 import fold_runtime
-    from fosca._sm90 import pingpong_runtime
+    from foscar._sm100 import fold_runtime
+    from foscar._sm90 import pingpong_runtime
 
     launches = []
     targets = []
@@ -1017,7 +1017,7 @@ def test_the_wrapper_resolves_its_own_device_and_compile_target(fake_cuda, monke
     stub_dsl.retarget("sm_90a")
     with pytest.raises(_Planned):
         hopper.plan(iptr, lens, lens, 8, _layout("sm90", 2), max_kv_len=64)
-    from fosca import kernel_cache
+    from foscar import kernel_cache
     with pytest.raises(RuntimeError, match="cannot build the sm100 kernel"):
         blackwell.plan(iptr, lens, lens, 8, _layout("sm100", 2), max_kv_len=64)
     # The kernel cache keys every object by that same target, so a refusal here is what keeps

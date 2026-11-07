@@ -51,7 +51,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 #: a reader to ignore this gate. `_vendor/flash_attn/cute/utils.py` legitimately
 #: trips it: `ex2_emulation_2` reads `quack` under an import upstream makes
 #: conditional.
-VENDORED = ("src/fosca/_vendor/", "baselines/vendor/")
+VENDORED = ("src/foscar/_vendor/", "baselines/vendor/")
 
 #: Anything that opens a new namespace. Bindings do not cross these.
 SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)

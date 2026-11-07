@@ -17,7 +17,7 @@ from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
 
-import fosca._vendor.quack.activation
+import foscar._vendor.quack.activation
 
 _MIXER_ATTRS = ("__vec_size__",)
 

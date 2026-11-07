@@ -82,8 +82,8 @@ from typing import Any, Callable, Optional
 
 #: ``0`` (or ``false`` / ``off`` / ``no``) turns the on-disk layer off for the process.
 ENABLE_ENV = "CUTEDSL_DECODE_KERNEL_CACHE"
-#: Overrides the cache root. The default is ``$XDG_CACHE_HOME/fosca/kernel-cache``
-#: or ``~/.cache/fosca/kernel-cache``. Put it on local disk on a box whose home
+#: Overrides the cache root. The default is ``$XDG_CACHE_HOME/foscar/kernel-cache``
+#: or ``~/.cache/foscar/kernel-cache``. Put it on local disk on a box whose home
 #: is NFS.
 DIR_ENV = "CUTEDSL_DECODE_KERNEL_CACHE_DIR"
 #: Environment variables whose PRESENCE means the caller needs a real trace: the DSL
@@ -147,7 +147,7 @@ PROFILING_MODULE = "cutedsl_profiling"
 #: artifact reads as a miss rather than as a hit with a different meaning.
 FORMAT_VERSION = 2
 #: The package this module belongs to; the source closure never leaves it.
-PACKAGE = "fosca"
+PACKAGE = "foscar"
 PACKAGE_DIR = Path(__file__).resolve().parent
 
 
@@ -188,7 +188,7 @@ def default_root() -> Path:
     if override:
         return Path(override).expanduser()
     base = os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache")
-    return Path(base).expanduser() / "fosca" / "kernel-cache"
+    return Path(base).expanduser() / "foscar" / "kernel-cache"
 
 
 def status() -> dict:
@@ -540,7 +540,7 @@ def compile_or_load(*, kind: str, compile_fn: Callable[[], Any], sources: dict[s
     root = Path(state["root"]) / kind
     object_path = root / f"{key}.o"
     sidecar_path = root / f"{key}.json"
-    symbol = f"fosca_{kind}_{key[:16]}"
+    symbol = f"foscar_{kind}_{key[:16]}"
     loader = _loader or _load
 
     try:

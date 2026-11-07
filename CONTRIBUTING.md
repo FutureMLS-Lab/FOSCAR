@@ -2,12 +2,12 @@
 
 ## Setup
 
-FOSCA is pure Python and JIT-compiles its kernels, so a source checkout is all
+FOSCAR is pure Python and JIT-compiles its kernels, so a source checkout is all
 you need:
 
 ```sh
-git clone https://github.com/donglinz/fosca.git
-cd fosca
+git clone https://github.com/FutureMLS-Lab/FOSCAR.git
+cd foscar
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[cu13,test]"     # cu12 on a CUDA 12 driver
 ```
@@ -34,11 +34,10 @@ pool builder is gated.
   `pytest -q` on a machine with a supported GPU.
 - **Kernel changes are measured.** A change to either decode kernel needs a
   timing comparison on the affected architecture, and a change to a split
-  planner needs its self-test re-pinned rather than loosened.
+  planner needs its self-test re-pinned.
 - **Comments state what the code does and why an invariant holds.** Present
   tense, no dates, no commit hashes, no pointers to private measurement records.
-- **No dead code.** A module, function or flag that nothing reaches is removed
-  rather than kept for later.
+- **No dead code.** A module, function or flag that nothing reaches is removed.
 
 ## Style
 

@@ -60,7 +60,7 @@ from tests import test_sm90_lc_refill_banks_cpu as banks
 from tests._smem_banks import wavefronts
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-KERNEL = ROOT / "src/fosca/_sm90/int_decode_pingpong.py"
+KERNEL = ROOT / "src/foscar/_sm90/int_decode_pingpong.py"
 HELPERS = ("_swizzle_period", "_swizzle_of", "_plane_store_split", "_build_q_layout", "_lc_ones_layout")
 
 PG = 8                        # q_head_tile, the plane's row count

@@ -1,12 +1,12 @@
 cff-version: 1.2.0
-title: "FOSCA: quantized-KV paged decode kernels for Hopper and Blackwell"
+title: "FOSCAR: quantized-KV paged decode kernels for Hopper and Blackwell"
 message: "If you use this software, please cite it as below."
 type: software
 authors:
   - family-names: Zhuang
     given-names: Donglin
     email: donglinzhuang@outlook.com
-repository-code: "https://github.com/donglinz/fosca"
+repository-code: "https://github.com/FutureMLS-Lab/FOSCAR"
 license: MIT
 version: 0.1.0
 date-released: 2026-10-29

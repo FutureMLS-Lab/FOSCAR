@@ -10,7 +10,7 @@ own error rather than the quantization's.
 import pytest
 import torch
 
-from fosca import PagedDecodeWrapper, QuantKVLayout, get_capabilities, is_supported
+from foscar import PagedDecodeWrapper, QuantKVLayout, get_capabilities, is_supported
 
 pytestmark = [
     pytest.mark.gpu,

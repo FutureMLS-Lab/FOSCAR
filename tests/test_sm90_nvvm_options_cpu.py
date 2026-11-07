@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 runtime = pytest.importorskip(
-    "fosca._sm90.pingpong_runtime", reason="imports torch")
+    "foscar._sm90.pingpong_runtime", reason="imports torch")
 
 
 def _kern(head_dim, fused_combine, bits=2, k=("token", 128), v=("token", 128)):

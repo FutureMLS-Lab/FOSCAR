@@ -25,7 +25,7 @@ import types
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-PKG = ROOT / "src/fosca"
+PKG = ROOT / "src/foscar"
 KERNELS = (PKG / "_sm90/quant_dequant.py", PKG / "_sm100/quant_dequant.py")
 INT32_MAX = 2 ** 31 - 1
 
@@ -41,13 +41,13 @@ def _load(monkeypatch, name, path):
 @pytest.fixture
 def kv(monkeypatch):
     # kv_cache imports `_utils`, which imports the DSL; it is not reached by what is tested here.
-    pkg = types.ModuleType("fosca")
+    pkg = types.ModuleType("foscar")
     pkg.__path__ = []
-    monkeypatch.setitem(sys.modules, "fosca", pkg)
-    monkeypatch.setitem(sys.modules, "fosca._utils",
-                        types.ModuleType("fosca._utils"))
-    _load(monkeypatch, "fosca.quant_layout", PKG / "quant_layout.py")
-    return _load(monkeypatch, "fosca.kv_cache", PKG / "kv_cache.py")
+    monkeypatch.setitem(sys.modules, "foscar", pkg)
+    monkeypatch.setitem(sys.modules, "foscar._utils",
+                        types.ModuleType("foscar._utils"))
+    _load(monkeypatch, "foscar.quant_layout", PKG / "quant_layout.py")
+    return _load(monkeypatch, "foscar.kv_cache", PKG / "kv_cache.py")
 
 
 def _threads(path):
