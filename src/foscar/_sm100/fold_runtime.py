@@ -113,7 +113,7 @@ def scale_pool_dtype_of(page_size, head_dim, kernel_kwargs=None):
     return torch.bfloat16 if sdt == "bf16" else torch.float32
 
 
-def resolve_fold_tiling(k_quant, v_quant, *, sequence_tile=None, o_stages=None):
+def resolve_fold_tiling(k_quant, v_quant, *, sequence_tile=None, o_stages=None, bits=None):
     """`IntDecodeSm100.resolve_tiling`, importable without naming the kernel
     module. Drivers and the split planner MUST go through this rather than
     duplicating the table -- a driver that hardcodes 256 while the kernel
@@ -122,7 +122,7 @@ def resolve_fold_tiling(k_quant, v_quant, *, sequence_tile=None, o_stages=None):
     from .int_fold_decode import IntDecodeSm100
 
     return IntDecodeSm100.resolve_tiling(
-        k_quant, v_quant, sequence_tile=sequence_tile, o_stages=o_stages)
+        k_quant, v_quant, sequence_tile=sequence_tile, o_stages=o_stages, bits=bits)
 
 
 #: The f32 bit pattern of 1e-30. The P-scale exponent takes the largest s_v at
@@ -456,7 +456,7 @@ def compile_fold(
     _kq_t, _vq_t, _sdt_t, _ = quant_cfg_of(page_size, head_dim, kernel_kwargs)
     sequence_tile, _o_res = IntDecodeSm100.resolve_tiling(
         _kq_t, _vq_t, sequence_tile=sequence_tile,
-        o_stages=kernel_kwargs.get("o_stages"))
+        o_stages=kernel_kwargs.get("o_stages"), bits=bits)
     kernel_kwargs["o_stages"] = _o_res
 
     # g <= 8 is the P hi/lo row budget (`2 * blk_tile_n <= mma_tile_n`).

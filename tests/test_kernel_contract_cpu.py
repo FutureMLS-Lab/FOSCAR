@@ -78,18 +78,15 @@ def test_sdtype_is_not_folded_into_the_shape_check():
 
 
 def test_the_shared_shape_rules_hold():
+    _contract().validate_problem(page_size=64, head_dim=64, q_head_tile=8, bits=2)
     _contract().validate_problem(page_size=64, head_dim=128, q_head_tile=8, bits=2)
-    # 256 rather than 64: the shared floor is a multiple of 128, because SM90 builds
-    # 128 and 256 only and SM100 tiles D at 128 with no partial-tile masking. A
-    # head_dim of 64 reaches the SM90 epilogue and writes past its own row, so the
-    # floor refuses it.
     _contract().validate_problem(page_size=64, head_dim=256, q_head_tile=1, bits=4)
 
 
 @pytest.mark.parametrize("kw,needle", [
     (dict(page_size=32, head_dim=128, q_head_tile=8, bits=2), "tile KV at 64"),
-    (dict(page_size=64, head_dim=100, q_head_tile=8, bits=2), "multiple of 128"),
-    (dict(page_size=64, head_dim=64, q_head_tile=8, bits=2), "multiple of 128"),
+    (dict(page_size=64, head_dim=100, q_head_tile=8, bits=2), "multiple of 64"),
+    (dict(page_size=64, head_dim=32, q_head_tile=8, bits=2), "multiple of 64"),
     (dict(page_size=64, head_dim=128, q_head_tile=3, bits=2), "q_head_tile must be"),
     (dict(page_size=64, head_dim=128, q_head_tile=8, bits=8), "must be 2 or 4"),
 ])

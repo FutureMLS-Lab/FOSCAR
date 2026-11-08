@@ -432,7 +432,7 @@ class IntDecodeSm100(GQAPagedDecode):
     LO_SHIFT = 4
 
     @staticmethod
-    def deposit_lane_offsets(t, ring_row, row_bytes, run_bytes, uniform_offsets):
+    def deposit_lane_offsets(t, ring_row, row_bytes, run_bytes, uniform_offsets, cpr=None):
         """The two per-lane byte offsets of an INT4 dequant-stream thread's deposit into
         a swizzled e4m3 operand stage in shared memory.
 
@@ -472,7 +472,8 @@ class IntDecodeSm100(GQAPagedDecode):
             raise ValueError(
                 f"deposit_lane_offsets: a {run_bytes}-byte run does not tile a "
                 f"{row_bytes}-byte row in 16-byte halves")
-        cpr = row_bytes // run_bytes
+        if cpr is None:
+            cpr = row_bytes // run_bytes
         if cpr & (cpr - 1):
             raise ValueError(
                 f"deposit_lane_offsets: {cpr} runs per row is not a power of two")
@@ -607,6 +608,8 @@ class IntDecodeSm100(GQAPagedDecode):
     #: which moves kv_stages. int2 and int4 are measured; if a future width regresses
     #: this table grows a bits dimension.
     QUANT_TILING = {
+        (("token", 64), ("token", 64)): (256, 2),
+        (("token", 128), ("token", 128)): (256, 2),
         (("token", 128), ("channel", 64)): (128, 3),
         (("token", 128), ("channel", 128)): (256, 2),
         (("channel", 128), ("channel", 128)): (256, 2),
@@ -614,7 +617,7 @@ class IntDecodeSm100(GQAPagedDecode):
 
     @classmethod
     def resolve_tiling(cls, k_quant, v_quant, *,
-                       sequence_tile=None, o_stages=None):
+                       sequence_tile=None, o_stages=None, bits=None):
         """Per-quant-config ``(sequence_tile, o_stages)``.
 
         ``None`` (kwarg absent) resolves through ``QUANT_TILING``, defaulting to
@@ -627,6 +630,8 @@ class IntDecodeSm100(GQAPagedDecode):
         """
         key = ((k_quant[0], int(k_quant[1])), (v_quant[0], int(v_quant[1])))
         st, ost = cls.QUANT_TILING.get(key, (256, 3))
+        if key == (("token", 64), ("token", 64)) and bits == 2:
+            st, ost = 512, 2
         return (st if sequence_tile is None else int(sequence_tile),
                 ost if o_stages is None else int(o_stages))
 
@@ -659,6 +664,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # store's row bound is a constant below the tile and the family goes to local
         # memory. The default tiling, no TMA mask and no query descale are required because
         # only those were measured.
+        if self.head_dim == 64 and not self.do_atomic_red:
+            return True
         if not self.persistent:
             return bool(self.do_kernel_red and self.v_axis == "token"
                         and not (self.bits == 4 and self.k_axis == "token"
@@ -894,10 +901,11 @@ class IntDecodeSm100(GQAPagedDecode):
         # (validate_quant_flex has not run yet), so the resolver normalizes them.
         sequence_tile, o_stages = self.resolve_tiling(
             k_quant, v_quant,
-            sequence_tile=sequence_tile, o_stages=o_stages)
+            sequence_tile=sequence_tile, o_stages=o_stages, bits=bits)
         # Whether this build runs its quantization pair's default tiling, the only tiling the
         # per-warpgroup register budgets were measured at (`rebalance_regs` in `kernel`).
-        self._default_tiling = (sequence_tile, o_stages) == self.resolve_tiling(k_quant, v_quant)
+        self._default_tiling = (sequence_tile, o_stages) == self.resolve_tiling(
+            k_quant, v_quant, bits=bits)
         self.head_dim = head_dim
         self.q_head_tile = q_head_tile
         self.page_size = page_size
@@ -1020,7 +1028,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # of smem the KV ring would otherwise get, and `kv_stages` in the
         # `FOLD_TRACE_TILING` line is where that cost shows up.
         self._pt_stages = 4 if pt_stages is None else int(pt_stages)
-        self._p_stages = 4 if p_stages is None else int(p_stages)
+        self._p_stages = ((3 if head_dim == 64 else 2)
+                          if p_stages is None else int(p_stages))
         # THREE IS THE ONLY FLOOR CONSTRUCTION CAN PROVE, and the effective floor is
         # usually 4. The kernel asserts `pt_stages > prefetch_iters + 1` with
         # `prefetch_iters = min(2, s_stages - 1)`, and `s_stages = min(max_s_stages,
@@ -1050,12 +1059,12 @@ class IntDecodeSm100(GQAPagedDecode):
         # stored whole, so a D that is not a multiple of 128 runs past the last full tile.
         # The legacy token-D path is tiled for D=256, but whether D=256 works is
         # untested; the wrapper refuses it, on the ground that nothing measures it.
-        if head_dim <= 0 or head_dim % 128 != 0:
+        if head_dim <= 0 or head_dim % 64 != 0:
             # NOT an assert: python -O would drop this guard.
             raise ValueError(
-                f"this kernel tiles the head dimension at 128 (mma_tile_m == mma_tile_k "
-                f"== 128) and masks no partial tile, so head_dim must be a positive "
-                f"multiple of 128; got {head_dim}")
+                f"this kernel tiles the head dimension at 64 or 128 "
+                f"and masks no partial tile, so head_dim must be a positive "
+                f"multiple of 64; got {head_dim}")
         self._validate_shape(page_size, head_dim, q_head_tile, bits)
         # THIS KERNEL NEEDS AT LEAST FOUR Q HEAD ROWS, and this refuses the smaller
         # tiles here rather than letting the DSL fail at trace time. The P hi/lo
@@ -1625,7 +1634,7 @@ class IntDecodeSm100(GQAPagedDecode):
         mbarrier_bits = Int64.width
         pipe_stage_bits = mbarrier_bits * 2  # producer + consumer
         mk_stage_bits = mma_tile_m * mma_tile_k * mma_dtype.width
-        nk_stage_bits = mma_tile_n * mma_tile_k * mma_dtype.width
+        nk_stage_bits = mma_tile_n * min(blk_tile_d, mma_tile_k) * mma_dtype.width
         mn_stage_bits = mma_tile_m * mma_tile_n * mma_dtype.width
         # tmem ptr
         smem_alloc_bits += Int32.width
@@ -1659,9 +1668,10 @@ class IntDecodeSm100(GQAPagedDecode):
         smem_alloc_bits += p_stages * (tiles_sm * mn_stage_bits + pipe_stage_bits)
         smem_alloc_bits += o_ring_c * pipe_stage_bits  # o in tmem (virtual ring)
         # Code ring: one PAGE of packed codes per stage
-        # (64 x mma_tile_k codes = 4KB int4 / 2KB int2).
+        # (64 x tile_d codes = 4KB int4 / 2KB int2 at D>=128, half at D=64).
+        tile_d = min(blk_tile_d, mma_tile_k)
         code_stages = self.code_stages
-        code_stage_bits = self.page_size * mma_tile_k * self.bits
+        code_stage_bits = self.page_size * tile_d * self.bits
         smem_alloc_bits += code_stages * (code_stage_bits + pipe_stage_bits)
         # Scale ring: the RING sections of the per-page scale block (legacy:
         # the interleaved [page_size, 4] f32 quad = 1KB; flex: ring_tot
@@ -1756,8 +1766,9 @@ class IntDecodeSm100(GQAPagedDecode):
             return cute.make_tensor(t.iterator, layout)
 
         # ((MMA_N, MMA_K), #MMA_N, #MMA_K, q_stages)
+        mma_tile_mnk_q = (mma_tile_m, mma_tile_n, tile_d)
         smem_layout_q = sm100_utils.make_smem_layout_b(
-            tiled_mma_kq, mma_tile_mnk, mma_dtype, tiles_dk
+            tiled_mma_kq, mma_tile_mnk_q, mma_dtype, tiles_dk
         )
 
         # ((MMA_M, MMA_K), #MMA_M, #MMA_K, kv_stages)
@@ -1829,9 +1840,9 @@ class IntDecodeSm100(GQAPagedDecode):
         # flat token-major page stream (the channel-row order) with a
         # (128, 64*bits/8) box instead. Both stage kinds have the same byte
         # total (code_stage_bytes_).
-        code_k_box_bytes = mma_tile_k * self.bits // 8
+        code_k_box_bytes = tile_d * self.bits // 8
         code_v_row_bytes = self.page_size * self.bits // 8
-        code_stage_bytes_ = self.page_size * mma_tile_k * self.bits // 8
+        code_stage_bytes_ = self.page_size * tile_d * self.bits // 8
         # TMA box layouts (compact row-major within a box). A token-row V pool
         # is stored exactly like K, so its code stage is K's box too.
         smem_layout_code_k_box = cute.make_layout(
@@ -1890,7 +1901,7 @@ class IntDecodeSm100(GQAPagedDecode):
 
         # Construct multimode gmem tiler
         tma_tile_n = (blk_tile_h, mma_tile_n // blk_tile_h)
-        tma_tile_mnk = (mma_tile_m, tma_tile_n, mma_tile_k)
+        tma_tile_mnk = (mma_tile_m, tma_tile_n, tile_d)
         tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_B(
             tma_load_op,
             mQ_nkl,
@@ -2350,7 +2361,7 @@ class IntDecodeSm100(GQAPagedDecode):
                         k_handle.release()
                         continue
 
-                    mmas_k = cute.size(tAsK.shape[2])
+                    mmas_k = cute.size(tBsQ.shape[2])
                     for mma_k in cutlass.range_constexpr(mmas_k):
                         if cutlass.const_expr(k_channel):
                             qp_plane_idx = (
@@ -2884,18 +2895,19 @@ class IntDecodeSm100(GQAPagedDecode):
         # PAST the K ring's in the same flat sCode block, so the view is
         # rebased by code_stages_k stages (the layout already carries the
         # code_stages_v extent).
+        tile_d = min(self.head_dim, mma_tile_k)
         code_v_row_bytes = page_size * bits // 8
-        code_stage_bytes_v = page_size * mma_tile_k * bits // 8
+        code_stage_bytes_v = page_size * tile_d * bits // 8
         sVC = cute.make_tensor(
             sCode.iterator + self.code_stages_k * code_stage_bytes_v,
             smem_layout_code_v_tma,
         )  # ((BOX_ROWS, BOX_BYTES), 1, code_stages_v)
         if cutlass.const_expr(self.v_token_rows):
-            # Token-row V: the K box, one 128-channel slab of a page per
+            # Token-row V: the K box, one tile_d-channel slab of a page per
             # stage; head-dim tile dm selects the slab's byte columns.
             gVC = cute.local_tile(
                 mVC,
-                (page_size, mma_tile_k * bits // 8),
+                (page_size, tile_d * bits // 8),
                 coord=(0, None, (coord_hk, None)),
             )  # (PAGE, BOX_BYTES, #TILE_DM, #PAGE_S)
         else:
@@ -3097,7 +3109,8 @@ class IntDecodeSm100(GQAPagedDecode):
             coord=(coord_hp, 0, coord_hb),
         )
         # (MMA_TILE_N, MMA_TILE_K, #TILE_DK)
-        gQ_mma = cute.local_tile(gQ, (mma_tile_n, mma_tile_k), coord=(0, None))
+        tile_d = min(blk_tile_d, mma_tile_k)
+        gQ_mma = cute.local_tile(gQ, (mma_tile_n, tile_d), coord=(0, None))
         # (MMA, #MMA_N, #MMA_K, #TILE_DK)
         tBgQ = thrblk_mma_kq.partition_B(gQ_mma)
         # (TMA, #TILE_DK)
@@ -3111,9 +3124,9 @@ class IntDecodeSm100(GQAPagedDecode):
 
         # Slice and partition K (TMA targets the CODE ring; the dequant WG
         # maps code stages into the operand ring)
-        # Packed K codes: one full-width (64, mma_tile_k*bits//8) box per
+        # Packed K codes: one full-width (64, tile_d*bits//8) box per
         # page = one code stage per TMA op, the same shape family as V.
-        code_k_box_bytes = mma_tile_k * bits // 8
+        code_k_box_bytes = tile_d * bits // 8
         sKC = cute.make_tensor(
             sCode.iterator, smem_layout_code_k_tma
         )  # ((PAGE, BOX_BYTES), #BOXES, code_stages)
@@ -3422,12 +3435,12 @@ class IntDecodeSm100(GQAPagedDecode):
         # that makes this true IS the mode-keyed pool order (the
         # channel-row order on the E4M3 feed, K's order on the main
         # feeds).
-        words = mma_tile_k * bits // 64  # src u32/(tok, dim-half)
+        words = code_stage_bytes // (page_size * 8)  # src u32/(tok, dim-half)
         # src u32 per thread slot per stage; equal to `words` by construction
         # because one dequant warpgroup is hardcoded, kept as the per-slot name
         # the staging shapes and `load_src` read.
         words_pt = words
-        out_bytes = mma_tile_k // 2  # e4m3 out bytes per thread slot
+        out_bytes = words * 32 // bits  # e4m3 out bytes per thread slot
         stage_words = code_stage_bytes // 4
         kf_chunk_words = min(4, words_pt)
         kf_runs = words_pt // kf_chunk_words
@@ -3927,7 +3940,7 @@ class IntDecodeSm100(GQAPagedDecode):
         # TMA-VO trails through tma_order_k_nbar, by a whole tile. INT4 keeps
         # per-block fence-and-commit.
         merge_k_drain = (bits == 2) and k_deposit_blocks <= k_stages and not f4_feed
-        merge_v_drain = (bits == 2) and v_deposit_blocks <= v_stages
+        merge_v_drain = (bits == 2) and v_deposit_blocks <= v_stages and nvc < self.code_stages_v
         if cutlass.const_expr(bits == 2 and not f4_feed):
             # The int2 e4m3 streams merge by design, not by fit: an
             # operand ring too shallow to hold a tile's blocks is a
@@ -4209,7 +4222,7 @@ class IntDecodeSm100(GQAPagedDecode):
                 # swizzled view at (kfs_rows, kfs_cir) instead.
                 if cutlass.const_expr(bits == 4):
                     kf_row_bytes = kv_stage_bytes // mma_tile_m
-                    assert kf_cpr * kf_out_bytes == kf_row_bytes
+                    assert kf_cpr * kf_out_bytes <= kf_row_bytes
                     swz_k = tAsK.iterator.type.swizzle_type
                     assert (swz_k.num_base, swz_k.num_shift) == (4, 3) and (
                         16 << swz_k.num_bits == kf_row_bytes), (
@@ -4223,7 +4236,7 @@ class IntDecodeSm100(GQAPagedDecode):
                     # (`Pointer.align(16)` would instead round the address up at run time.)
                     k_lane = [cute.assume(c, divby=16) for c in self.deposit_lane_offsets(
                         dq_tidx, k_ring.toint() >> 7, kf_row_bytes, kf_out_bytes,
-                        (kv_stage_bytes, k_page_off, k_run_off))]
+                        (kv_stage_bytes, k_page_off, k_run_off), cpr=kf_cpr)]
                     rOutS4H = cute.make_tensor(
                         rOutS4.iterator,
                         cute.make_layout((16, kf_out_bytes // 16, 2 * kf_runs)),
@@ -4425,7 +4438,7 @@ class IntDecodeSm100(GQAPagedDecode):
                     # page and run offsets, and this thread's two lane offsets. A
                     # V stage row is one token's mma_tile_m channel bytes.
                     vf_row_bytes = kv_stage_bytes // mma_tile_k
-                    assert kf_cpr * kf_out_bytes == vf_row_bytes
+                    assert kf_cpr * kf_out_bytes <= vf_row_bytes
                     swz_v = tAsV.iterator.type.swizzle_type
                     assert (swz_v.num_base, swz_v.num_shift) == (4, 3) and (
                         16 << swz_v.num_bits == vf_row_bytes), (
@@ -4438,7 +4451,7 @@ class IntDecodeSm100(GQAPagedDecode):
                     v_lane = [cute.assume(c, divby=16) for c in self.deposit_lane_offsets(
                         i4vt, v_ring.toint() >> 7, vf_row_bytes, kf_out_bytes,
                         (kv_stage_bytes, k_stages * kv_stage_bytes, v_page_off,
-                         v_run_off))]
+                         v_run_off), cpr=kf_cpr)]
                     rOutV4H = cute.make_tensor(
                         rOutS4.iterator,
                         cute.make_layout((16, kf_out_bytes // 16, 2 * kf_runs)),
@@ -5842,10 +5855,17 @@ class IntDecodeSm100(GQAPagedDecode):
             tOcO = thr_o_st.partition_D(tCcO_d)[None, 0, 0, 0, None]
             rOut = cute.make_rmem_tensor(tOgO.shape, o_dtype)
             rOut.store(output_final.to(o_dtype).reshape(tOgO.shape))
-            for e in cutlass.range_constexpr(cute.size(tOgO)):
-                _, o_hp = tOcO[e]
-                if cute.elem_less(o_hp, o_hp_lim):
-                    tOgO[e] = rOut[e]
+            if cutlass.const_expr(self.head_dim >= 128):
+                for e in cutlass.range_constexpr(cute.size(tOgO)):
+                    _, o_hp = tOcO[e]
+                    if cute.elem_less(o_hp, o_hp_lim):
+                        tOgO[e] = rOut[e]
+            else:
+                if warpgroup_tidx < self.head_dim:
+                    for e in cutlass.range_constexpr(cute.size(tOgO)):
+                        _, o_hp = tOcO[e]
+                        if cute.elem_less(o_hp, o_hp_lim):
+                            tOgO[e] = rOut[e]
         else:
             # Store O to smem and notify
             tOsO.store(output_final.to(o_dtype).reshape(tOsO.shape))
@@ -6387,6 +6407,7 @@ class IntDecodeSm100(GQAPagedDecode):
                         )
                     rSV = cute.make_rmem_tensor(tiles_sm, acc_dtype)
                     rZV = cute.make_rmem_tensor(tiles_sm, acc_dtype)
+                    rZR = cute.make_rmem_tensor(tiles_sm, acc_dtype)
                     if cutlass.const_expr(scale_prefetch):
                         # Coefficients from the quad buffer fetched one
                         # tile ago (prologue, or the previous
@@ -6468,6 +6489,9 @@ class IntDecodeSm100(GQAPagedDecode):
                                 else:
                                     rSV[smi] = s_v
                                     rZV[smi] = z_v - beta_fold * s_v
+                                rZR[smi] = rZV[smi] * cute.arch.rcp_approx(
+                                    rSV[smi] + Float32(1e-30)
+                                )
                             if cutlass.const_expr(
                                 k_is_token and not k_tok64
                             ):
@@ -6904,9 +6928,7 @@ class IntDecodeSm100(GQAPagedDecode):
                                     * inv_lo
                                 )
                             else:
-                                zr = rZV[smi] / (
-                                    rSV[smi] + Float32(1e-30)
-                                )
+                                zr = rZR[smi]
                                 contrib = (
                                     hi_f
                                     + rLo.load().to(acc_dtype)
@@ -7601,7 +7623,7 @@ class IntDecodeSm100(GQAPagedDecode):
         sCode = smem.allocate_tensor(
             Uint8,
             cute.make_layout(
-                (page_size * mma_tile_k * bits // 8, self.code_stages)
+                (page_size * min(blk_tile_d, mma_tile_k) * bits // 8, self.code_stages)
             ),
             stensor_align,
         )  # flat (stage_bytes, code_stages)
@@ -7943,7 +7965,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # stream; V by TMA-VO and the V stream. Same elect-one TMA
             # producer group; the release group is the owning stream's two
             # warps.
-            code_stage_bytes = page_size * mma_tile_k * bits // 8  # 1 page
+            code_stage_bytes = page_size * min(blk_tile_d, mma_tile_k) * bits // 8  # 1 page
             codek_producer, codek_consumer = pipeline.PipelineTmaAsync.create(
                 num_stages=self.code_stages_k,
                 producer_group=tma_group,
@@ -8157,7 +8179,7 @@ class IntDecodeSm100(GQAPagedDecode):
             if cutlass.const_expr(mOraw is not None):
                 gO_d = cute.local_tile(
                     mOraw,
-                    tiler=(blk_tile_d, blk_tile_hp),
+                    tiler=(max(blk_tile_d, mma_tile_m), blk_tile_hp),
                     coord=(0, coord_hp, (coord_hk, kv_split_idx * batches + coord_b
                                          if do_kernel_red else coord_b)),
                 )

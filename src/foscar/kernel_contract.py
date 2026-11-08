@@ -115,14 +115,8 @@ def validate_problem(page_size, head_dim, q_head_tile, bits):
         f"box does; got page_size={page_size}")
     # The 2-D-half PV loop is a head_dim assumption, not a page_size one: the PV mma emits 64
     # channels, so the number of output accumulators is head_dim//64.
-    # THIS IS THE SHARED FLOOR, AND IT IS 128, not 64. Both consumers refuse a smaller D --
-    # SM90 any D outside {128, 256}, the head dimensions its output tiling and its
-    # thread-indexed fused tail are built for, SM100 any D that is not a multiple of 128,
-    # because it tiles D at 128 and masks no partial tile. A contract that admitted 64
-    # would describe a configuration neither kernel implements, and each constructor
-    # narrows this floor further from its own hardware.
-    assert head_dim > 0 and head_dim % 128 == 0, (
-        f"head_dim must be a positive multiple of 128; got {head_dim}")
+    assert head_dim > 0 and head_dim % 64 == 0, (
+        f"head_dim must be a positive multiple of 64; got {head_dim}")
     assert q_head_tile in Q_HEAD_TILES, (
         f"q_head_tile must be one of {Q_HEAD_TILES}; got {q_head_tile}")
     assert bits in (2, 4), f"token-wise quantized KV: bits must be 2 or 4; got {bits}"

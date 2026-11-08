@@ -38,7 +38,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 
-from .._append_core import PAGE, bf16x2, f32_from_bits, layout_key, pool_fake, st_b32
+from .._append_core import PAGE, bf16x2, f32_from_bits, layout_key, ld_nc_b32x2, pool_fake, st_b32
 from .._dequant_core import (
     MAGIC, MAGIC_BITS, UNIT_CHANNELS, QuantDequantBase, code_value, compile_dequant, fma_rn,
     launch_dequant, ld_nc_b32x4)
@@ -76,10 +76,13 @@ class QuantDequantSm90(QuantDequantBase):
         16-byte load and one 16-byte store per chunk; V's words go into their chunk in the
         order `dequant_stage_word` permutes them to, which is a choice of registers."""
         per = self.k_row_bytes if tensor == "K" else self.v_row_bytes
-        for chunk in cutlass.range_constexpr(per // 16):
+        for chunk in cutlass.range_constexpr(max(per // 16, 1)):
             offset = code_word_offset(self.code_pool_order, per, self.num_kv_heads, page, head,
                                       row, 4 * chunk, wide=Int64)
-            words = ld_nc_b32x4(mPool.iterator.toint() + offset * Int64(4))
+            if cutlass.const_expr(per == 8):
+                words = ld_nc_b32x2(mPool.iterator.toint() + offset * Int64(4)) + [Int32(0), Int32(0)]
+            else:
+                words = ld_nc_b32x4(mPool.iterator.toint() + offset * Int64(4))
             # Word 4 * chunk + i lands at slot word i ^ swap of the chunk's 16 bytes.
             swap = dequant_stage_word(tensor, 0, 4 * chunk) % 4
             staged = cute.make_rmem_tensor(4, Int32)
@@ -133,9 +136,9 @@ class QuantDequantSm90(QuantDequantBase):
         head = cta - p * Int32(self.num_kv_heads)
         num_pages = Int32(mKq.shape[0])
         smem = cutlass.utils.SmemAllocator()
-        sK = smem.allocate_tensor(Int32, cute.make_layout(self.k_row_bytes * 32),
+        sK = smem.allocate_tensor(Int32, cute.make_layout(max(self.k_row_bytes, 16) * 32),
                                   byte_alignment=16)
-        sV = smem.allocate_tensor(Int32, cute.make_layout(self.v_row_bytes * 32),
+        sV = smem.allocate_tensor(Int32, cute.make_layout(max(self.v_row_bytes, 16) * 32),
                                   byte_alignment=16)
         if p < Int32(mPageIndices.shape[0]):
             page, safe = self._page_of(mPageIndices, num_pages, p)

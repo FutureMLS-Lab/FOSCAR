@@ -656,7 +656,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         #     (0.9-4.7%) and three at int2 (0.4-3.5%), and faster at one at each width (1.1%, 1.3%),
         #     so the rule, 4 only where it is faster somewhere and slower nowhere, keeps 2.
         if num_stages is None:
-            num_stages = (4 if bits == 2 else 2) if head_dim == 128 else 2
+            num_stages = 4 if (head_dim == 64 or (head_dim == 128 and bits == 2)) else 2
         # THE HEAD-DIMENSION ENVELOPE, refused FIRST, before `validate_quant_flex` and every
         # assert below. A head dimension outside `SM90_HEAD_DIMS` raises ValueError, and so, at
         # an admitted head dimension other than 128, does every quantization pair, scale dtype,
@@ -685,7 +685,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # the register A operands and the packed words a thread holds at one time stay at one
         # group's worth and only the D/16 f32 output accumulators grow with D. 128 at both
         # widths: the SASS census of the launched D=256 binaries passes at 128.
-        self.group_channels = None if head_dim == 128 else 128
+        self.group_channels = None if head_dim == 128 else min(head_dim, 128)
         self.k_axis, self.k_group = k_quant
         self.v_axis, self.v_group = v_quant
         if (self.k_axis, self.k_group) == ("token", head_dim // 2):
@@ -845,7 +845,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         stride, and one `autovec_copy` of the slice issues one 16-byte load per chunk into
         the thread's row registers in row order."""
         chunks = code_row_chunks(code_bytes_per_thread)
-        words = CODE_CHUNK_BYTES // 4
+        words = min(code_bytes_per_thread, CODE_CHUNK_BYTES) // 4
         thread, chunk = code_block_word_strides(self.code_pool_order, code_bytes_per_thread)
         return cute.make_tensor(
             cute.recast_ptr(sCodes.iterator, dtype=Int32),
@@ -871,7 +871,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         chunk and chunk groups, and one of the two has extent 1 at any group size, so one
         `autovec_copy` of a slice issues one 16-byte load per whole chunk, or one 8-byte load."""
         chunks = code_row_chunks(code_bytes_per_thread)
-        words = CODE_CHUNK_BYTES // 4
+        words = min(code_bytes_per_thread, CODE_CHUNK_BYTES) // 4
         thread, chunk = code_block_word_strides(self.code_pool_order, code_bytes_per_thread)
         n = self._group_word_count(code_bytes_per_thread)
         in_chunk, chunks_per_group = min(n, words), max(n // words, 1)
@@ -2203,7 +2203,7 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                             o += 16
                         # pass 2 and the store, once per 128 channels; pass 2 re-reads the LSE
                         # values, which pass 1 has just brought into L1
-                        for p in cutlass.range_constexpr(self.head_dim // 128):
+                        for p in cutlass.range_constexpr(max(1, self.head_dim // 128)):
                             channel = wg_thread_idx if cutlass.const_expr(p == 0) else 128 * p + wg_thread_idx
                             for kk in cutlass.range_constexpr(4):
                                 rAccP[kk] = Float32(0.0); rWsP[kk] = Float32(0.0)
@@ -2211,8 +2211,9 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                             while o < split_count:      # pass 2: flat weighted sums, 4 parallel partials
                                 for kk in cutlass.range_constexpr(16):
                                     inb = o + kk < split_count
+                                    inb_o = inb if cutlass.const_expr(self.head_dim >= 128) else (inb and channel < self.head_dim)
                                     rLBlk[kk] = mLSE[(Int64(o + kk), Int64(batch_idx), head)] if inb else Float32(-1e30)
-                                    rOBlk[kk] = mOp[(Int64(o + kk), Int64(batch_idx), head, channel)] if inb else Float32(0.0)
+                                    rOBlk[kk] = mOp[(Int64(o + kk), Int64(batch_idx), head, channel)] if inb_o else Float32(0.0)
                                 for kk in cutlass.range_constexpr(16):
                                     w = cute.arch.exp2((rLBlk[kk] - global_max) * log2e)
                                     rAccP[kk % 4] += w * rOBlk[kk]
@@ -2235,7 +2236,11 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                             # one spill; H100 SASS).
                             if cutlass.const_expr(mLseOut is not None and p == 0):
                                 request_lse = global_max + cute.math.log2(weight_sum, approx=True, ftz=True) * Float32(_LN2)
-                            mOut[(Int64(batch_idx), head, channel)] = (acc / cutlass.max(weight_sum, Float32(1e-30))).to(mOut.element_type)
+                            if cutlass.const_expr(self.head_dim >= 128):
+                                mOut[(Int64(batch_idx), head, channel)] = (acc / cutlass.max(weight_sum, Float32(1e-30))).to(mOut.element_type)
+                            else:
+                                if channel < self.head_dim:
+                                    mOut[(Int64(batch_idx), head, channel)] = (acc / cutlass.max(weight_sum, Float32(1e-30))).to(mOut.element_type)
                             if cutlass.const_expr(mLseOut is not None and p == 0):
                                 mLseOut[(Int64(batch_idx), head)] = request_lse
                         q_idx += 2

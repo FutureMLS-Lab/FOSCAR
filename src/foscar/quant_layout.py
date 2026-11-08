@@ -88,7 +88,7 @@ def quant_block_offsets(k_quant, v_quant, N, D):
 #: The head dimensions `IntPingPongDecodeSm90` builds. At 128 it builds every configuration
 #: `validate_quant_flex` admits. At any other it runs its grouped body, which builds one layout at
 #: the ring depths in `SM90_WIDE_STAGES` (`sm90_wide_layouts`), and refuses everything else.
-SM90_HEAD_DIMS = (128, 256)
+SM90_HEAD_DIMS = (64, 128, 256)
 #: The ring stage depths admitted at a head dimension other than 128. Both fit two CTAs per SM at
 #: D=256 (84.7 KiB of shared memory per CTA at int4 with four stages); int4 at six would not.
 SM90_WIDE_STAGES = (2, 4)

@@ -92,7 +92,10 @@ def _require_order(order):
 
 
 def code_row_chunks(per):
-    """C, the number of 16-byte chunks in a `per`-byte thread row (a positive whole number)."""
+    """C, the number of chunks in a `per`-byte thread row (one 8-byte chunk at per=8, otherwise
+    a positive whole number of 16-byte chunks)."""
+    if per == 8:
+        return 1
     if per <= 0 or per % CODE_CHUNK_BYTES:
         raise ValueError(f"a thread row must be a positive whole number of 16-byte chunks; "
                          f"got {per} bytes")
@@ -136,7 +139,7 @@ def code_block_shape(order, per):
     chunks = code_row_chunks(per)
     if order == "row":
         return (128, per)
-    return (chunks, 128, CODE_CHUNK_BYTES)
+    return (chunks, 128, min(per, CODE_CHUNK_BYTES))
 
 
 def code_pool_shape(order, num_pages, num_kv_heads, per):
@@ -148,9 +151,12 @@ def code_pool_shape(order, num_pages, num_kv_heads, per):
 def code_block_order(block_shape):
     """Which order a (page, kv-head) code block is in, read from its shape alone."""
     block = tuple(int(x) for x in block_shape)
-    if len(block) == 2 and block[0] == 128 and block[1] > 0 and block[1] % CODE_CHUNK_BYTES == 0:
+    if len(block) == 2 and block[0] == 128 and block[1] > 0 and (
+            block[1] == 8 or block[1] % CODE_CHUNK_BYTES == 0):
         return "row"
-    if len(block) == 3 and block[0] > 0 and block[1:] == (128, CODE_CHUNK_BYTES):
+    if len(block) == 3 and (
+            (block[0] > 0 and block[1:] == (128, CODE_CHUNK_BYTES))
+            or block == (1, 128, 8)):
         return "chunk16"
     raise ValueError(f"{block} is neither a 'row' [128, per] nor a 'chunk16' "
                      f"[per/16, 128, 16] code block")
@@ -165,7 +171,7 @@ def code_block_word_strides(order, per):
     serving writer's stores are both built from this, so each follows whatever order
     `IntPingPongDecodeSm90.code_pool_order` names rather than restating chunk16."""
     code_block_shape(order, per)
-    words = CODE_CHUNK_BYTES // 4
+    words = min(per, CODE_CHUNK_BYTES) // 4
     if order == "row":
         return per // 4, words
     return words, 128 * words
@@ -272,8 +278,8 @@ def dequant_stage_word(tensor, thread, word):
     gather of a unit's values meets one word per bank (`tests/test_sm90_dequant_banks_cpu.py`)."""
     chunk = word // 4
     if tensor == "K":
-        return 4 * (thread ^ (2 * chunk)) + 512 * chunk + word % 4
-    return (4 * (thread ^ (thread >> 5) ^ (4 * (chunk % 2))) + 512 * chunk
+        return 4 * (thread ^ (2 * ((thread >> 3) & 1)) ^ (2 * chunk)) + 512 * chunk + word % 4
+    return (4 * (thread ^ (thread >> 5) ^ (4 * (thread & 1)) ^ (4 * (chunk % 2))) + 512 * chunk
             + ((word % 4) ^ (chunk // 2)))
 
 
@@ -311,7 +317,7 @@ def code_rows_to_order(rows, order):
         return rows.contiguous()
     lead = rows.shape[:-2]
     out = rows.new_empty((*lead, *block))
-    out.copy_(rows.reshape(*lead, 128, block[0], CODE_CHUNK_BYTES).transpose(-3, -2))
+    out.copy_(rows.reshape(*lead, 128, block[0], block[-1]).transpose(-3, -2))
     return out
 
 

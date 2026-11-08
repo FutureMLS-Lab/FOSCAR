@@ -71,7 +71,7 @@ NVVM_LSR_OFF = "-Xllc -disable-lsr={}"
 #: twice the output accumulators, so there the pass stays on, restricted to cheap
 #: recomputations. The setmaxnregs split cannot pay for the extra registers instead: at two CTAs
 #: per SM the consumers' 104 is already the most the pool allows.
-REMAT_OFF_HEAD_DIMS = (128,)
+REMAT_OFF_HEAD_DIMS = (64, 128)
 #: The head dimensions whose direct A/Bs named `lsr_off`'s classes; at any other head dimension
 #: strength reduction stays on.
 LSR_OFF_HEAD_DIMS = (128,)
@@ -197,7 +197,8 @@ def plan_pingpong(batch, num_kv_heads, kv_len, *, bits, head_dim, sm_count=None,
     outer, min_blocks = plan_splits(batch, num_kv_heads, kv_len, bits=bits,
                                     head_dim=head_dim, page_size=POOL_PAGE_SIZE,
                                     sm_count=sm_count, head_tiles=head_tiles)
-    fused = plan_fused_combine(batch, num_kv_heads, outer, head_tiles=head_tiles)
+    fused = plan_fused_combine(batch, num_kv_heads, outer, head_tiles=head_tiles,
+                               head_dim=head_dim)
     return outer, min_blocks, fused
 
 

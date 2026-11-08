@@ -103,7 +103,9 @@ def test_identical_pool_shapes_still_compare_unequal():
 
 @pytest.mark.parametrize("arch,bits,kw,match", [
     ("sm100", 4, {"head_dim": 384}, "head_dim 384 is not accepted on sm100"),
-    ("sm90", 4, {"head_dim": 64}, "head_dim 64 is not accepted on sm90"),
+    ("sm90", 4, {"head_dim": 32}, "head_dim 32 is not accepted on sm90"),
+    ("sm90", 4, {"head_dim": 64, "scale_dtype": torch.bfloat16}, "f32 scale pool"),
+    ("sm90", 4, {"head_dim": 64, "k_quant": ("channel", 64)}, "token-wise K and V"),
     ("sm90", 4, {"head_dim": 256, "scale_dtype": torch.bfloat16}, "f32 scale pool"),
     ("sm90", 4, {"head_dim": 256, "k_quant": ("channel", 64)}, "token-wise K and V"),
     ("sm90", 2, {"k_quant": ("token", 64), "scale_dtype": torch.float32}, "bfloat16 scale"),
@@ -711,14 +713,14 @@ def _q(w, *, three_d=True, dtype=None):
 
 
 @pytest.mark.parametrize("bits", [2, 4])
-@pytest.mark.parametrize("dim", [128, 256])
+@pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("splits", [1, 2])
 def test_blackwell_plan_forwards_d256_groups_and_preserves_d128_compile_keys(host_wrapper, bits, dim, splits):
     layout = _layout("sm100", bits, head_dim=dim, num_kv_heads=2)
     w, _, _ = host_wrapper("sm100", layout=layout, kv_splits=splits)
     kwargs = dict(w._fold_key[-1])
-    if dim == 256:
-        assert kwargs["k_quant"] == kwargs["v_quant"] == ("token", 256)
+    if dim != 128:
+        assert kwargs["k_quant"] == kwargs["v_quant"] == ("token", dim)
     else:
         assert "k_quant" not in kwargs and "v_quant" not in kwargs
     assert (kwargs.get("persistent") is False) == (splits == 1)

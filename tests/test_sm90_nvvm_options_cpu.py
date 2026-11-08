@@ -22,6 +22,7 @@ def _kern(head_dim, fused_combine, bits=2, k=("token", 128), v=("token", 128)):
 
 
 @pytest.mark.parametrize("head_dim,fused,remat,mcse", [
+    (64, False, "false", "false"), (64, True, "false", "false"),
     (128, False, "false", "false"), (128, True, "false", "false"),
     (256, False, "true", "false"), (256, True, "true", "true")])
 def test_options_follow_the_kernel(head_dim, fused, remat, mcse):
@@ -190,7 +191,7 @@ def _option_names(text):
 def _every_configuration_class():
     """One kernel per class `nvvm_options` can tell apart: both widths, both head dimensions,
     every K and V grouping the SM90 decode builds at each, with and without the fused combine."""
-    for head_dim in (128, 256):
+    for head_dim in (64, 128, 256):
         ks = [("token", head_dim), ("token", head_dim // 2), ("channel", 64), ("channel", 128),
               ("channel", 256)]
         vs = [("token", head_dim), ("channel", 64), ("channel", 128), ("channel", 256)]

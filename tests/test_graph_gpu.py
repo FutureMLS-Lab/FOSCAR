@@ -16,11 +16,11 @@ pytestmark = [
     pytest.mark.skipif(not is_supported(), reason="needs an SM90 or SM100 device"),
 ]
 
-D, PS, HQ, HKV = 128, 64, 32, 8
+PS, HQ, HKV = 64, 16, 2
 BATCH, KV = 2, 8192
 
 
-def _planned(bits):
+def _planned(bits, head_dim=128):
     device = "cuda"
     arch = get_capabilities()["arch"]
     q_dtype = torch.float8_e4m3fn if arch == "sm100" else torch.bfloat16
@@ -28,9 +28,9 @@ def _planned(bits):
     npages = BATCH * nt
     tokens = BATCH * KV
 
-    k = torch.randn(tokens, HKV, D, device=device, dtype=torch.bfloat16)
+    k = torch.randn(tokens, HKV, head_dim, device=device, dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    layout = QuantKVLayout.create(bits=bits, head_dim=D, num_kv_heads=HKV, device=device)
+    layout = QuantKVLayout.create(bits=bits, head_dim=head_dim, num_kv_heads=HKV, device=device)
     cache = layout.allocate(npages)
     cache.append(k, v, torch.arange(tokens, device=device, dtype=torch.int64))
 
@@ -38,17 +38,18 @@ def _planned(bits):
     indices = torch.arange(npages, device=device, dtype=torch.int32)
     seq = torch.full((BATCH,), KV, device=device, dtype=torch.int32)
 
-    q = torch.randn(BATCH, HQ, D, device=device, dtype=torch.bfloat16).to(q_dtype)
+    q = torch.randn(BATCH, HQ, head_dim, device=device, dtype=torch.bfloat16).to(q_dtype)
     w = PagedDecodeWrapper(torch.empty(256 * 1024 * 1024, dtype=torch.uint8,
                                        device=device))
     w.plan(indptr, indices, seq, num_qo_heads=HQ, layout=layout)
-    out = torch.empty(BATCH, HQ, D, device=device, dtype=torch.bfloat16)
+    out = torch.empty(BATCH, HQ, head_dim, device=device, dtype=torch.bfloat16)
     return (lambda: w.run(q, cache, out=out)), out
 
 
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("bits", [2, 4])
-def test_run_replays_identically_from_a_cuda_graph(bits):
-    call, out = _planned(bits)
+def test_run_replays_identically_from_a_cuda_graph(bits, head_dim):
+    call, out = _planned(bits, head_dim=head_dim)
 
     call()
     torch.cuda.synchronize()
