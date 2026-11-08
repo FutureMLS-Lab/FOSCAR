@@ -391,7 +391,7 @@ def test_blackwells_graph_tile_is_the_kernels_resolved_tile(graph_env, monkeypat
     layout = QuantKVLayout._create("sm100", bits=2, head_dim=D, num_kv_heads=HKV)
     for tile in (128, 256):
         monkeypatch.setattr(fold_runtime, "resolve_fold_tiling",
-                            lambda k_quant, v_quant, tile=tile: (tile, 2))
+                            lambda k_quant, v_quant, tile=tile, **kw: (tile, 2))
         assert W._graph_tile("sm100", layout) == tile
         assert W._graph_bucket("sm100", layout, 2, 4096, 132).tile == tile
 

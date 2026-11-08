@@ -608,6 +608,7 @@ class IntDecodeSm100(GQAPagedDecode):
     #: which moves kv_stages. int2 and int4 are measured; if a future width regresses
     #: this table grows a bits dimension.
     QUANT_TILING = {
+        (("token", 64), ("token", 64)): (256, 2),
         (("token", 128), ("channel", 64)): (128, 3),
         (("token", 128), ("channel", 128)): (256, 2),
         (("channel", 128), ("channel", 128)): (256, 2),
@@ -615,7 +616,7 @@ class IntDecodeSm100(GQAPagedDecode):
 
     @classmethod
     def resolve_tiling(cls, k_quant, v_quant, *,
-                       sequence_tile=None, o_stages=None):
+                       sequence_tile=None, o_stages=None, bits=None):
         """Per-quant-config ``(sequence_tile, o_stages)``.
 
         ``None`` (kwarg absent) resolves through ``QUANT_TILING``, defaulting to
@@ -628,6 +629,8 @@ class IntDecodeSm100(GQAPagedDecode):
         """
         key = ((k_quant[0], int(k_quant[1])), (v_quant[0], int(v_quant[1])))
         st, ost = cls.QUANT_TILING.get(key, (256, 3))
+        if key == (("token", 64), ("token", 64)) and bits == 2:
+            st, ost = 512, 2
         return (st if sequence_tile is None else int(sequence_tile),
                 ost if o_stages is None else int(o_stages))
 
@@ -897,10 +900,11 @@ class IntDecodeSm100(GQAPagedDecode):
         # (validate_quant_flex has not run yet), so the resolver normalizes them.
         sequence_tile, o_stages = self.resolve_tiling(
             k_quant, v_quant,
-            sequence_tile=sequence_tile, o_stages=o_stages)
+            sequence_tile=sequence_tile, o_stages=o_stages, bits=bits)
         # Whether this build runs its quantization pair's default tiling, the only tiling the
         # per-warpgroup register budgets were measured at (`rebalance_regs` in `kernel`).
-        self._default_tiling = (sequence_tile, o_stages) == self.resolve_tiling(k_quant, v_quant)
+        self._default_tiling = (sequence_tile, o_stages) == self.resolve_tiling(
+            k_quant, v_quant, bits=bits)
         self.head_dim = head_dim
         self.q_head_tile = q_head_tile
         self.page_size = page_size
@@ -1023,7 +1027,8 @@ class IntDecodeSm100(GQAPagedDecode):
         # of smem the KV ring would otherwise get, and `kv_stages` in the
         # `FOLD_TRACE_TILING` line is where that cost shows up.
         self._pt_stages = 4 if pt_stages is None else int(pt_stages)
-        self._p_stages = 4 if p_stages is None else int(p_stages)
+        self._p_stages = ((3 if head_dim == 64 else 4)
+                          if p_stages is None else int(p_stages))
         # THREE IS THE ONLY FLOOR CONSTRUCTION CAN PROVE, and the effective floor is
         # usually 4. The kernel asserts `pt_stages > prefetch_iters + 1` with
         # `prefetch_iters = min(2, s_stages - 1)`, and `s_stages = min(max_s_stages,
@@ -1628,7 +1633,7 @@ class IntDecodeSm100(GQAPagedDecode):
         mbarrier_bits = Int64.width
         pipe_stage_bits = mbarrier_bits * 2  # producer + consumer
         mk_stage_bits = mma_tile_m * mma_tile_k * mma_dtype.width
-        nk_stage_bits = mma_tile_n * mma_tile_k * mma_dtype.width
+        nk_stage_bits = mma_tile_n * min(blk_tile_d, mma_tile_k) * mma_dtype.width
         mn_stage_bits = mma_tile_m * mma_tile_n * mma_dtype.width
         # tmem ptr
         smem_alloc_bits += Int32.width
@@ -3934,7 +3939,7 @@ class IntDecodeSm100(GQAPagedDecode):
         # TMA-VO trails through tma_order_k_nbar, by a whole tile. INT4 keeps
         # per-block fence-and-commit.
         merge_k_drain = (bits == 2) and k_deposit_blocks <= k_stages and not f4_feed
-        merge_v_drain = (bits == 2) and v_deposit_blocks <= v_stages
+        merge_v_drain = (bits == 2) and v_deposit_blocks <= v_stages and nvc < self.code_stages_v
         if cutlass.const_expr(bits == 2 and not f4_feed):
             # The int2 e4m3 streams merge by design, not by fit: an
             # operand ring too shallow to hold a tile's blocks is a
@@ -5849,13 +5854,17 @@ class IntDecodeSm100(GQAPagedDecode):
             tOcO = thr_o_st.partition_D(tCcO_d)[None, 0, 0, 0, None]
             rOut = cute.make_rmem_tensor(tOgO.shape, o_dtype)
             rOut.store(output_final.to(o_dtype).reshape(tOgO.shape))
-            for e in cutlass.range_constexpr(cute.size(tOgO)):
-                o_d, o_hp = tOcO[e]
-                if cute.elem_less(o_hp, o_hp_lim) and (
-                    cutlass.const_expr(self.head_dim >= 128)
-                    or o_d < self.head_dim
-                ):
-                    tOgO[e] = rOut[e]
+            if cutlass.const_expr(self.head_dim >= 128):
+                for e in cutlass.range_constexpr(cute.size(tOgO)):
+                    _, o_hp = tOcO[e]
+                    if cute.elem_less(o_hp, o_hp_lim):
+                        tOgO[e] = rOut[e]
+            else:
+                if warpgroup_tidx < self.head_dim:
+                    for e in cutlass.range_constexpr(cute.size(tOgO)):
+                        _, o_hp = tOcO[e]
+                        if cute.elem_less(o_hp, o_hp_lim):
+                            tOgO[e] = rOut[e]
         else:
             # Store O to smem and notify
             tOsO.store(output_final.to(o_dtype).reshape(tOsO.shape))

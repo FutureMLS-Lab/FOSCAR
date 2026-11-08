@@ -369,7 +369,7 @@ def _graph_tile(arch, layout):
         return _QUANT_PAGE_SIZE
     from ._sm100.fold_runtime import resolve_fold_tiling
 
-    return resolve_fold_tiling(layout.k_quant, layout.v_quant)[0]
+    return resolve_fold_tiling(layout.k_quant, layout.v_quant, bits=layout.bits)[0]
 
 
 def _graph_bucket(arch, layout, batch, max_kv_len, sm_count):
@@ -850,7 +850,7 @@ class PagedDecodeWrapper:
         # count.
         from ._sm100.fold_runtime import resolve_fold_tiling
 
-        _seq_res, _ = resolve_fold_tiling(k_quant, v_quant)
+        _seq_res, _ = resolve_fold_tiling(k_quant, v_quant, bits=bits)
         self._planned_splits, self._planned_reduction = plan_splits_sm100(
             self._batch_size, self._num_kv_heads, self._max_kv_len, bits=bits,
             sm_count=get_num_sm(self.device), sequence_tile=_seq_res,
