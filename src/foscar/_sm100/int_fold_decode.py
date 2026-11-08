@@ -609,6 +609,7 @@ class IntDecodeSm100(GQAPagedDecode):
     #: this table grows a bits dimension.
     QUANT_TILING = {
         (("token", 64), ("token", 64)): (256, 2),
+        (("token", 128), ("token", 128)): (256, 2),
         (("token", 128), ("channel", 64)): (128, 3),
         (("token", 128), ("channel", 128)): (256, 2),
         (("channel", 128), ("channel", 128)): (256, 2),
@@ -1027,7 +1028,7 @@ class IntDecodeSm100(GQAPagedDecode):
         # of smem the KV ring would otherwise get, and `kv_stages` in the
         # `FOLD_TRACE_TILING` line is where that cost shows up.
         self._pt_stages = 4 if pt_stages is None else int(pt_stages)
-        self._p_stages = ((3 if head_dim == 64 else 4)
+        self._p_stages = ((3 if head_dim == 64 else 2)
                           if p_stages is None else int(p_stages))
         # THREE IS THE ONLY FLOOR CONSTRUCTION CAN PROVE, and the effective floor is
         # usually 4. The kernel asserts `pt_stages > prefetch_iters + 1` with
@@ -6406,6 +6407,7 @@ class IntDecodeSm100(GQAPagedDecode):
                         )
                     rSV = cute.make_rmem_tensor(tiles_sm, acc_dtype)
                     rZV = cute.make_rmem_tensor(tiles_sm, acc_dtype)
+                    rZR = cute.make_rmem_tensor(tiles_sm, acc_dtype)
                     if cutlass.const_expr(scale_prefetch):
                         # Coefficients from the quad buffer fetched one
                         # tile ago (prologue, or the previous
@@ -6487,6 +6489,9 @@ class IntDecodeSm100(GQAPagedDecode):
                                 else:
                                     rSV[smi] = s_v
                                     rZV[smi] = z_v - beta_fold * s_v
+                                rZR[smi] = rZV[smi] * cute.arch.rcp_approx(
+                                    rSV[smi] + Float32(1e-30)
+                                )
                             if cutlass.const_expr(
                                 k_is_token and not k_tok64
                             ):
@@ -6923,9 +6928,7 @@ class IntDecodeSm100(GQAPagedDecode):
                                     * inv_lo
                                 )
                             else:
-                                zr = rZV[smi] / (
-                                    rSV[smi] + Float32(1e-30)
-                                )
+                                zr = rZR[smi]
                                 contrib = (
                                     hi_f
                                     + rLo.load().to(acc_dtype)
