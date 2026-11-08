@@ -31,6 +31,14 @@ shapes:
     head_dim: 128
     tensor_parallel: 8
 
+  muse-spark:
+    # Muse-Spark-Open-816B-A42B's global attention layers at TP8: 128 query
+    # heads and 16 KV heads divided by eight, at head dimension 64.
+    num_qo_heads: 16
+    num_kv_heads: 2
+    head_dim: 64
+    tensor_parallel: 8
+
 kernels:
   - ours_int2
   - ours_int4

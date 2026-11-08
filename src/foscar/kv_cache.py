@@ -185,7 +185,7 @@ def _derive(arch, bits, head_dim, num_kv_heads, k_quant, v_quant, scale_dtype, k
         if head_dim != 128 and (k_quant != ("token", head_dim)
                                 or v_quant != ("token", head_dim)
                                 or scale_dtype is not torch.float32 or kkw):
-            raise ValueError("at head_dim=256 SM100 eager decode builds only whole-head "
+            raise ValueError(f"at head_dim={head_dim} SM100 eager decode builds only whole-head "
                              "token-wise K and V with float32 scales and default kernel settings")
         clash = sorted(set(kkw) & set(_SM100_FIELD_KWARGS))
         if clash:

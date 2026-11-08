@@ -76,10 +76,11 @@ class QuantAppendSm90(QuantAppendBase):
         bits = self.bits
         fields = 32 // bits
         pool = mPool.iterator.toint()
-        for chunk in cutlass.range_constexpr(per // 16):
+        chunk_words = min(per, 16) // 4
+        for chunk in cutlass.range_constexpr(max(per // 16, 1)):
             masks = []
             values = []
-            for u in cutlass.range_constexpr(4):
+            for u in cutlass.range_constexpr(chunk_words):
                 word = 4 * chunk + u
                 # The word's tokens are its field 0's plus constants, so one pair of compares
                 # tells whether the run touches it at all; most words of a short run it does not.

@@ -142,7 +142,11 @@ def plan_splits_sm100(batch, num_kv_heads, kv_len, *, bits,
     t_us = T_US[bits]
 
     best_s, best_c = 1, None
-    for s in SPLIT_CANDIDATES:
+    wave_s = sm_count // base if num_kv_heads < 8 and base > 0 else 0
+    candidates = SPLIT_CANDIDATES
+    if wave_s > 1 and (wave_s <= 64 or tiles >= 1024):
+        candidates = tuple(sorted(set(SPLIT_CANDIDATES) | {wave_s}))
+    for s in candidates:
         if s > 1 and kv_len // s < MIN_CHUNK_TOKENS:
             continue
         if s > tiles:

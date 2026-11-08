@@ -194,7 +194,7 @@ GROUP_CHANNELS = 16
 #: Passes whose K and V rows a warp loads before quantizing any of them, by lanes per token:
 #: two for a warp per token (D / 32 values a lane), one for a group (16 values a lane), which
 #: keeps the registers within eight CTAs per SM.
-PASSES_IN_FLIGHT = {8: 1, 16: 1, 32: 2}
+PASSES_IN_FLIGHT = {4: 1, 8: 1, 16: 1, 32: 2}
 #: The clamp of a token's range before it is divided, as `quant_ref.quantize_grouped` has it.
 S_CLAMP = 1.0e-8
 #: The writer's input envelope: every K and V element is saturated to
@@ -406,7 +406,7 @@ def envelope_refusal(layout, arch):
     if k_quant[0] == "channel" or v_quant[0] == "channel":
         return ("a channel-wise K or V is written in whole quantization groups by "
                 "append_groups (PR 3), not by the per-token append")
-    heads = (128, 256) if arch == "sm90" else (128,)
+    heads = (64, 128, 256) if arch == "sm90" else (64, 128)
     if D not in heads:
         return f"the {arch} writer serves head_dim in {heads}; got {D}"
     full, half = ("token", D), ("token", D // 2)
@@ -486,7 +486,9 @@ class QuantAppendBase:
                 + Int64(part * count))
         addr = mX.iterator.toint() + elem * Int64(2)
         words = []
-        if cutlass.const_expr(count == 4):
+        if cutlass.const_expr(count == 2):
+            words = [ld_nc_b32(addr)]
+        elif cutlass.const_expr(count == 4):
             words = ld_nc_b32x2(addr)
         else:
             for piece in cutlass.range_constexpr(count // 8):
@@ -1025,13 +1027,14 @@ class QuantAppendBase:
                     # one (decode tokens) with a whole warp per token, which issues fewer
                     # instructions per token when most lanes would hold no token.
                     lanes = D // GROUP_CHANNELS
+                    short_lanes = min(32, D // 4)
                     vmax = Int32(0)
                     if n >= WARPS * (32 // lanes):
                         vmax = self._quantize_tokens(mK, mV, mScale, sQk32, sQv32, p, n, t0,
                                                      page, head, warp, lane, lanes)
                     else:
                         vmax = self._quantize_tokens(mK, mV, mScale, sQk32, sQv32, p, n, t0,
-                                                     page, head, warp, lane, 32)
+                                                     page, head, warp, lane, short_lanes)
                 # A run that starts a new use of its page and ends before the page does. On
                 # Blackwell it scans the launch for the page's other tokens here, because their
                 # s_v enter this run's exchange of the page maximum (2a), and clears the tail in
@@ -1136,16 +1139,20 @@ class QuantAppendBase:
 
     @cute.jit
     def _store_word_group(self, addr, masks, values):
-        """Store four consecutive words of one destination row at a 16-byte aligned address:
-        one 16-byte store when the run covers all four, otherwise a plain store per covered
-        word and red.and then red.or per partly covered one. A mask holds the bits of the
-        fields this run owns; a word with no such field is left alone."""
+        """Store 2 or 4 consecutive words of one destination row at a correspondingly aligned
+        address: one vector store when the run covers all of them, otherwise a plain store per
+        covered word and red.and then red.or per partly covered one. A mask holds the bits of
+        the fields this run owns; a word with no such field is left alone."""
+        n = len(values)
         full = Int32(-1)
-        all_full = (masks[0] & masks[1] & masks[2] & masks[3]) == full
+        if cutlass.const_expr(n == 2):
+            all_full = (masks[0] & masks[1]) == full
+        else:
+            all_full = (masks[0] & masks[1] & masks[2] & masks[3]) == full
         if all_full:
             st_b32(addr, values)
         else:
-            for u in cutlass.range_constexpr(4):
+            for u in cutlass.range_constexpr(n):
                 if masks[u] == full:
                     st_b32(addr + Int64(4 * u), [values[u]])
                 else:

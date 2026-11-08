@@ -130,7 +130,7 @@ def _plan_pingpong_model(base, kv_len, nt, bits, sm_count, min_chunk_tokens,
     return best[1], legacy[1]
 
 
-def plan_fused_combine(batch, num_kv_heads, outer_splits, *, head_tiles=1):
+def plan_fused_combine(batch, num_kv_heads, outer_splits, *, head_tiles=1, head_dim=128):
     """Whether IntPingPongDecodeSm90 should run its in-kernel fused split-K combine
     (v2 tree form) instead of the external SplitKCombine launch.
 
@@ -142,7 +142,7 @@ def plan_fused_combine(batch, num_kv_heads, outer_splits, *, head_tiles=1):
     hides its latency across B x HQ parallel CTAs anyway."""
     if isinstance(head_tiles, bool) or not isinstance(head_tiles, int) or head_tiles < 1:
         raise ValueError("head_tiles must be a positive integer")
-    return outer_splits > 1 and batch * num_kv_heads * head_tiles <= 16
+    return outer_splits > 1 and head_dim != 64 and batch * num_kv_heads * head_tiles <= 16
 
 
 def plan_splits(batch, num_kv_heads, kv_len, *, bits, head_dim, page_size=64,

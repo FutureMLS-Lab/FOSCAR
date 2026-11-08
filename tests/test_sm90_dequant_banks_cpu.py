@@ -36,7 +36,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 PAGE = 64
 UNIT = 8
 CASES = [(tensor, bits, head_dim) for tensor in ("K", "V") for bits in (2, 4)
-         for head_dim in (128, 256)]
+         for head_dim in (64, 128, 256)]
 
 
 def _load(monkeypatch, name, path):
@@ -88,7 +88,7 @@ def test_unit_gathers(sc, tensor, bits, head_dim):
 
 @pytest.mark.parametrize("tensor,bits,head_dim", CASES)
 def test_stage_is_a_slot_permutation(sc, tensor, bits, head_dim):
-    words = _row_words(sc, tensor, bits, head_dim)
+    words = max(_row_words(sc, tensor, bits, head_dim), 4)
     placed = {}
     for row in range(128):
         for chunk in range(words // 4):
@@ -102,7 +102,7 @@ def test_stage_is_a_slot_permutation(sc, tensor, bits, head_dim):
 def _stage_stores(sc, tensor, bits, head_dim, stage_word):
     """Every staging store, as (lane, byte address) per warp-wide 16-byte store: thread r of the
     warpgroup stores chunk c of row r at the slot of its first word."""
-    for chunk in range(_row_words(sc, tensor, bits, head_dim) // 4):
+    for chunk in range(max(_row_words(sc, tensor, bits, head_dim) // 4, 1)):
         for warp in range(4):
             yield [(lane, 16 * (stage_word(tensor, 32 * warp + lane, 4 * chunk) // 4))
                    for lane in range(32)]

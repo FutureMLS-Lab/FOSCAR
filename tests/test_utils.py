@@ -31,6 +31,6 @@ def test_capabilities_shape():
     assert _utils.get_num_sm(torch.device("cuda")) > 0
     # The advertised head dimensions are the running architecture's accepted set.
     if caps["arch"] != "unsupported":
-        assert caps["head_dims"] == {"sm90": "128,256", "sm100": "128,256"}[caps["arch"]]
+        assert caps["head_dims"] == {"sm90": "64,128,256", "sm100": "64,128,256"}[caps["arch"]]
     else:
         assert caps["head_dims"] == ""

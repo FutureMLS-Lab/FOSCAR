@@ -114,7 +114,7 @@ one complete quantization group at a time, through `append_quantized`.
 | `bits` | 2, 4 | 2, 4 |
 | Q dtype | bf16 | fp8 e4m3 |
 | K/V | packed uint8 pools + scale pool | packed uint8 pools + scale pool |
-| head_dim | 128, 256 | 128, 256 |
+| head_dim | 64, 128, 256 | 64, 128, 256 |
 | page_size | 64 | 64 |
 | reductions | none, kernel (split-K with LSE merge) | none, kernel (split-K with LSE merge) |
 | KV heads | 1 to 128 at 128 query heads | 1 to 128 at 128 query heads |
@@ -174,6 +174,21 @@ batch 8 the TensorRT-LLM NVFP4 column is fastest at 32K, 256K and 512K, and
 within 2% of FOSCAR int2 at 128K. With one KV head there is less work per split,
 and the narrower cache stops paying for it.
 
+### B200 (SM100), Muse-Spark-Open-816B-A42B TP8 (HQ=16 HKV=2 D=64)
+
+![Decode speedup over FlashInfer bf16 on B200 at the Muse-Spark shape, at batch 1 and 8](docs/decode-latency-b200-muse-spark.png)
+
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 32K | 12.8 | 12.3 | 12.5 | **10.7** | 13.6 |
+| 1 | 128K | **17.6** | 17.8 | 28.7 | 23.1 | 22.7 |
+| 1 | 256K | **23.6** | 24.3 | 40.8 | 30.1 | 29.6 |
+| 1 | 512K | **35.6** | 37.2 | 66.0 | 45.2 | 42.5 |
+| 8 | 32K | **21.4** | 22.9 | 33.6 | 23.0 | 22.3 |
+| 8 | 128K | **57.2** | 60.7 | 101.0 | 61.6 | 62.1 |
+| 8 | 256K | **105.8** | 110.9 | 176.6 | 107.7 | 116.0 |
+| 8 | 512K | 203.2 | 213.0 | 328.1 | **188.5** | 223.6 |
+
 ### H100 (SM90), Qwen3-8B TP1 (HQ=32 HKV=8 D=128)
 
 TensorRT-LLM's `trtllm-gen` decode is Blackwell only, so this table has no
@@ -192,10 +207,25 @@ TensorRT-LLM column.
 | 8 | 256K | **681.2** | 782.0 | 2906.5 |
 | 8 | 512K | **1352.2** | 1546.0 | 5726.9 |
 
+### H100 (SM90), Muse-Spark-Open-816B-A42B TP8 (HQ=16 HKV=2 D=64)
+
+![Decode speedup over FlashInfer bf16 on H100 at the Muse-Spark shape, at batch 1 and 8](docs/decode-latency-h100-muse-spark.png)
+
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 |
+|---:|---:|---:|---:|---:|
+| 1 | 32K | **15.8** | 16.3 | 19.4 |
+| 1 | 128K | **26.7** | 27.7 | 41.6 |
+| 1 | 256K | **35.2** | 37.2 | 66.2 |
+| 1 | 512K | **52.1** | 55.4 | 110.9 |
+| 8 | 32K | **27.2** | 29.3 | 65.1 |
+| 8 | 128K | **78.8** | 84.3 | 196.9 |
+| 8 | 256K | **147.6** | 156.2 | 374.7 |
+| 8 | 512K | **285.6** | 298.9 | 724.8 |
+
 ### Conditions
 
 One query token per request. K and V are quantized token-wise, one scale and one
-offset per group of 128 values, which is the whole head dimension, both in FP32.
+offset per token over the whole head dimension, both in FP32.
 Page size 64, paged cache. Q is fp8 e4m3 on the B200 tables and bf16 on the H100
 one; FlashInfer is bf16 everywhere. Every column of a row was timed by the same
 harness on the same GPU model. The number is the CUDA kernel span from CUPTI

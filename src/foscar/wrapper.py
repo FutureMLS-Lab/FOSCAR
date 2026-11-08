@@ -88,7 +88,7 @@ _QUANT_PAGE_SIZE = 64
 # `kv_cache.QuantKVLayout.create` refuses anything else, so a plan never sees it.
 # It stays one literal, because tooling reads it from this file's syntax tree with
 # `ast.literal_eval` rather than importing the package.
-_ACCEPTED_HEAD_DIMS = {"sm90": (128, 256), "sm100": (128, 256)}
+_ACCEPTED_HEAD_DIMS = {"sm90": (64, 128, 256), "sm100": (64, 128, 256)}
 
 #: The output dtypes each architecture's kernel is compiled for. float32 is the engine's opt-in:
 #: a plan for it compiles its own build, and a bf16 plan compiles the default build. A dtype
@@ -405,7 +405,7 @@ def graph_workspace_bytes(max_batch: int, num_qo_heads: int, layout: QuantKVLayo
     arch = _utils.require_arch(device)
     if layout.arch != arch:
         raise ValueError(f"the layout was resolved for {layout.arch} and {device} is {arch}")
-    if arch == "sm100" and layout.head_dim != 128:
+    if arch == "sm100" and layout.head_dim == 256:
         raise NotImplementedError("SM100 head_dim=256 is eager-only; CUDA graphs retain D=128")
     sm_count = get_num_sm(device)
     wave = graph_plan.SPLIT_CTAS_PER_SM[arch] * sm_count
@@ -1034,7 +1034,8 @@ class PagedDecodeWrapper:
             min_blocks = planned_minb
             fused = plan_fused_combine(
                 self._batch_size, self._num_kv_heads, outer,
-                head_tiles=(self._num_qo_heads // self._num_kv_heads + 7) // 8)
+                head_tiles=(self._num_qo_heads // self._num_kv_heads + 7) // 8,
+                head_dim=self._head_dim)
         if fused_override is not None:
             fused = bool(fused_override) and outer > 1
         if reduction == "atomic":
@@ -1422,7 +1423,7 @@ class _GraphDecodeWrapper(PagedDecodeWrapper):
                 f"{self.device} is {arch}; create the layout for the device that decodes it")
         _utils.require_dsl_target(arch)
         _check_num_qo_heads(arch, num_qo_heads, layout.num_kv_heads)
-        if arch == "sm100" and layout.head_dim != 128:
+        if arch == "sm100" and layout.head_dim == 256:
             raise NotImplementedError("SM100 head_dim=256 is eager-only; CUDA graphs retain D=128")
         ratio = num_qo_heads // layout.num_kv_heads
         if ratio > 8 or (arch == "sm100" and ratio < 3):
@@ -1496,7 +1497,7 @@ class _GraphDecodeWrapper(PagedDecodeWrapper):
         bucket, b, hq, d = graph.bucket, self._batch_size, self._num_qo_heads, self._head_dim
         fused = False
         if bucket.split_capable:
-            fused = plan_fused_combine(b, self._num_kv_heads, bucket.s_tight)
+            fused = plan_fused_combine(b, self._num_kv_heads, bucket.s_tight, head_dim=d)
             override = self._quant_kernel_kwargs.get("fused_combine")
             if override is not None:
                 fused = bool(override)
@@ -1536,7 +1537,7 @@ class _GraphDecodeWrapper(PagedDecodeWrapper):
             return
         # the layout's kernel arguments, as eager's plan passes them (`_plan_quantized_sm100`)
         kkw = dict(self._quant_kernel_kwargs)
-        if (self._k_quant, self._v_quant) != (("token", self._head_dim),) * 2:
+        if self._head_dim != 128 or (self._k_quant, self._v_quant) != (("token", self._head_dim),) * 2:
             kkw["k_quant"], kkw["v_quant"] = self._k_quant, self._v_quant
         self._reads_v_max_hist = reads_v_max_hist(self._page_size, self._head_dim, kkw)
         graph.decode, applied = _get_compiled_fold_graph_kernel(

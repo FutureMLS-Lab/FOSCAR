@@ -112,3 +112,5 @@ def render(gpu, shape, out):
 render("b200", "qwen3-8b", DOCS / "decode-latency-b200.png")
 render("h100", "qwen3-8b", DOCS / "decode-latency-h100.png")
 render("b200", "inkling", DOCS / "decode-latency-b200-inkling.png")
+render("b200", "muse-spark", DOCS / "decode-latency-b200-muse-spark.png")
+render("h100", "muse-spark", DOCS / "decode-latency-h100-muse-spark.png")
