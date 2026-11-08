@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/foscar-logo.png" alt="FOSCAR" width="180"/>
+</p>
+
 # FOSCAR
 
 Quantized-KV paged GQA decode kernels for Hopper (SM90) and Blackwell (SM100),
