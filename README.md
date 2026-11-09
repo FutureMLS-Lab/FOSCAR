@@ -17,11 +17,16 @@
   <a href="#citation">Citation</a>
 </p>
 
-FOSCAR provides paged grouped-query attention (GQA) decode kernels for packed INT2 and INT4 KV caches. Affine folding moves scale and offset arithmetic from individual KV values into the attention computation. Both GPU backends use the same Python API.
+FOSCAR provides paged grouped-query attention (GQA) decode kernels for packed INT2 and INT4 KV caches.
+Affine folding moves scale and offset arithmetic from individual KV values into the attention computation.
+Both GPU backends use the same Python API.
 
 ## Install
 
-Requires Linux, Python 3.10+, and CUDA-enabled PyTorch 2.4 or later. Choose the extra that matches your environment. CUDA 13 supports Hopper (SM90) and Blackwell (SM100). CUDA 12 supports Hopper only.
+Requires Linux, Python 3.10+, and a CUDA-enabled PyTorch build for your GPU (`torch>=2.4`).
+Choose the extra that matches your environment.
+The `cu13` extra supports Hopper (SM90) and Blackwell (SM100).
+The `cu12` extra supports Hopper only.
 
 ```bash
 git clone https://github.com/FutureMLS-Lab/FOSCAR.git
@@ -29,11 +34,13 @@ cd FOSCAR
 pip install -e '.[cu13]'
 ```
 
-For Hopper with CUDA 12, use `pip install -e '.[cu12]'` instead. Kernels compile on first use and are cached for subsequent runs.
+For Hopper with CUDA 12, use `pip install -e '.[cu12]'` instead.
+Kernels compile on first use and are cached for subsequent runs.
 
 ## Quickstart
 
-Run one decode step for two requests with two fully populated cache pages per request. Set `bits=4` in the layout to try INT4.
+Run one decode step for two requests with two fully populated cache pages per request.
+Set `bits=4` in the layout to try INT4.
 
 ```python
 import torch
@@ -67,7 +74,8 @@ decode.run(q, cache, out=out)
 print(out.shape)  # torch.Size([2, 32, 128])
 ```
 
-For page tables, cache writes, and CUDA graph capture, see the [integration guide](docs/integration.md). See [design and internals](docs/design.md) for the backend architecture.
+For page tables, cache writes, and CUDA graph capture, see the [integration guide](docs/integration.md).
+See [design and internals](docs/design.md) for the backend architecture.
 
 ## Support matrix
 
@@ -79,7 +87,10 @@ For page tables, cache writes, and CUDA graph capture, see the [integration guid
 | Head dimensions | 64, 128, 256 | 64, 128, 256 |
 | Page size | 64 tokens | 64 tokens |
 
-The decode kernels support token-wise and channel-wise grouping. The public cache writers and `dequantize()` support token-wise layouts. To use channel-wise decode, supply a cache in the layout expected by the kernel. Use `get_capabilities()` to check support on the current device.
+The decode kernels support token-wise and channel-wise grouping.
+The public cache writers and `dequantize()` support token-wise layouts.
+To use channel-wise decode, supply a cache in the layout expected by the kernel.
+Use `get_capabilities()` to check support on the current device.
 
 <details>
 <summary>Quantization groups and decode limits</summary>
@@ -107,7 +118,9 @@ Both backends support split-K reduction and 1 to 128 KV heads at 128 query heads
 
 ## Benchmarks
 
-Geometric mean kernel speedup over FlashInfer BF16 for the Qwen3-8B attention shape on one GPU. The repository harness measures batches of 1 and 8 at 32K, 128K, 256K, and 512K context lengths. It measures GPU kernel time with a cold L2 cache and excludes host dispatch.
+Geometric mean kernel speedup over FlashInfer BF16 for the Qwen3-8B attention shape on one GPU.
+The repository harness measures batches of 1 and 8 at 32K, 128K, 256K, and 512K context lengths.
+It measures GPU kernel time with a cold L2 cache and excludes host dispatch.
 
 | GPU | FOSCAR INT2 | FOSCAR INT4 |
 |---|---:|---:|
@@ -118,7 +131,8 @@ Geometric mean kernel speedup over FlashInfer BF16 for the Qwen3-8B attention sh
 
 ## Testing
 
-After installing the CUDA extra, install the test dependencies with `pip install -e '.[test]'` and run `pytest -q`. Device tests skip without a supported GPU.
+After installing the CUDA extra, install the test dependencies with `pip install -e '.[test]'` and run `pytest -q`.
+Device tests skip without a supported GPU.
 
 ## Citation
 
@@ -134,4 +148,5 @@ After installing the CUDA extra, install the test dependencies with `pip install
 
 ## License
 
-[MIT](LICENSE). See [NOTICE](NOTICE) for attribution and licenses for code derived from FlashInfer, QuACK, and FlashAttention.
+[MIT](LICENSE).
+See [NOTICE](NOTICE) for attribution and licenses for code derived from FlashInfer, QuACK, and FlashAttention.
