@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The shared-memory bank model the CPU tests cost lane maps with.
 
 Shared memory has 32 banks of 4 bytes and serves 128 bytes per wavefront. `wavefronts` turns
@@ -6,11 +6,10 @@ the byte addresses of one warp-wide shared-memory instruction into the (actual, 
 wavefronts per execution that ncu reports for it as `L1 Wavefronts Shared` and
 `L1 Wavefronts Shared Ideal`.
 
-THE SERVICING RULE. It was measured on 2026-09-29 by a lane-pattern microbenchmark on B200
-(ssr-b200, sm_100a) and H100 (research-secure-26, sm_90a): 21 lane patterns, each issued by one
-warp as one `ld.shared` and one `st.shared` at its own PC, 100 times, under ncu SourceCounters.
-Both GPUs gave identical counts for all 42 instructions; the ncu reports are kept on those nodes
-under `remote_workspace/bankconf_20260929/`. The warp is served in groups of lanes, formed by
+THE SERVICING RULE. It was measured by a lane-pattern microbenchmark on B200 (sm_100a) and
+H100 (sm_90a): 21 lane patterns, each issued by one warp as one `ld.shared` and one
+`st.shared` at its own PC, 100 times, under ncu SourceCounters. Both GPUs gave identical
+counts for all 42 instructions. The warp is served in groups of lanes, formed by
 access width and by lane index:
 
 - A 16-byte access, load or store, is served one 8-lane quarter warp at a time. A load also

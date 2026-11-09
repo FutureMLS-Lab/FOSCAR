@@ -185,7 +185,7 @@ def _derive(arch, bits, head_dim, num_kv_heads, k_quant, v_quant, scale_dtype, k
         if head_dim != 128 and (k_quant != ("token", head_dim)
                                 or v_quant != ("token", head_dim)
                                 or scale_dtype is not torch.float32 or kkw):
-            raise ValueError(f"at head_dim={head_dim} SM100 eager decode builds only whole-head "
+            raise ValueError(f"at head_dim={head_dim} SM100 decode builds only whole-head "
                              "token-wise K and V with float32 scales and default kernel settings")
         clash = sorted(set(kkw) & set(_SM100_FIELD_KWARGS))
         if clash:
@@ -471,7 +471,7 @@ class QuantKVLayout:
 #: slab shapes hold the same bytes, so a pool of the other layout reaches `_adopt` only as a
 #: shape mismatch.
 _V_LAYOUT_HINT = {
-    True: ("; this layout stores V exactly like K, in token rows (docs/SM100_ALIGNED_KV.md), so "
+    True: ("; this layout stores V exactly like K, in token rows (docs/K_STORE_PERM.md), so "
            "a V pool written in the earlier channel-row layout must be rebuilt"),
     False: ("; this ablation layout reads channel-row V, so a V pool stored like K must be "
             "rebuilt"),
@@ -711,7 +711,7 @@ class QuantKVCache:
         `[T, num_kv_heads, 2]` when it is token-wise over `head_dim // 2`, where group 0 is
         channels `[0, head_dim / 2)` and group 1 the rest; `v_scale` and `v_zero` are float32
         `[T, num_kv_heads]`; all four C-contiguous. `slot_mapping` is as in `append`. A stored
-        token is x = s * q + z per channel, the library's convention (`quant_ref`).
+        token is x = s * q + z per channel, the library's affine convention.
 
         Everything but the quantization is `append`'s: the same layouts, page runs, tail clear
         of a page a run starts at position 0, Blackwell page maximum and count table, and the
@@ -780,13 +780,9 @@ class QuantKVCache:
     def _refuse_channel_wise(self, method):
         layout = self.layout
         if layout.k_quant[0] == "channel" or layout.v_quant[0] == "channel":
-            # append_groups must clear the token-wise section of a page it starts at
-            # position 0, as `append` does, because no decode masks a stale tail scale.
             raise NotImplementedError(
                 f"{method}() writes token-wise layouts only; k_quant={layout.k_quant} "
-                f"v_quant={layout.v_quant} has a channel-wise tensor, whose groups are written "
-                f"whole by append_groups (docs/SERVING_READINESS.md, section 5), which is not "
-                f"available yet")
+                f"v_quant={layout.v_quant} has a channel-wise tensor")
 
     def _check_slots(self, slot_mapping, num_tokens):
         if (not isinstance(slot_mapping, torch.Tensor) or slot_mapping.dtype != torch.int64

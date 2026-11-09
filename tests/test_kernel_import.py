@@ -1,4 +1,10 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 # tests/test_kernel_import.py
+import pytest
+
+pytest.importorskip("cutlass", reason="requires nvidia-cutlass-dsl")
+pytest.importorskip("cuda", reason="requires cuda-python")
 
 
 def test_sm100_shared_reduction_library_imports():

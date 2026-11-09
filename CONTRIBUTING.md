@@ -7,7 +7,7 @@ you need:
 
 ```sh
 git clone https://github.com/FutureMLS-Lab/FOSCAR.git
-cd foscar
+cd FOSCAR
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[cu13,test]"     # cu12 on a CUDA 12 driver
 ```

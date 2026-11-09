@@ -270,5 +270,6 @@ Graph mode requires `out=` on every `run()`, and the call must pass exactly the
 `lse` and `q_descale` variants the plan declared, because those are the builds it
 compiled. A second `plan()` on the same wrapper raises.
 
-Blackwell graphs take head_dim 128 and GQA ratios 3 to 8; Hopper takes ratios 1
-to 8. A ratio outside that range runs in eager mode only.
+Blackwell graphs take head_dim 64 or 128 and GQA ratios 3 to 8; Hopper graphs
+take head_dim 64, 128 or 256 and ratios 1 to 8. A configuration outside that
+range runs in eager mode only.

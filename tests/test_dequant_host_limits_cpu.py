@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The host limits of `QuantKVCache.dequantize` keep its kernels' 32-bit indices in range.
 
 The dequantize counts requests and grid CTAs in 32-bit integers. Its checking CTA c checks request
@@ -11,8 +11,8 @@ the smaller thread count (`DEQUANT_MIN_CHECK_REQUESTS`). This file checks the re
 boundaries and holds both kernels' thread counts to the request limit and to that bound, reading
 them from the kernel source because importing the kernels imports the DSL. It does not run the
 device check: it only matches the call sites that pass each kernel's THREADS to `_validate` and
-to its launch, so a check that skips a chunk of requests passes here, and the GPU round trip's
-`late` trap (`scripts/test_serving_roundtrip.py`) is what catches it.
+to its launch, so a check that skips a chunk of requests passes here and is caught by the GPU
+serving round-trip tests.
 
 Run: pytest tests/test_dequant_host_limits_cpu.py
 """

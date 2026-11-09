@@ -6,7 +6,15 @@ authors:
   - family-names: Zhuang
     given-names: Donglin
     email: donglinzhuang@outlook.com
+  - family-names: Ponnusamy
+    given-names: Pragaash
+  - family-names: Wu
+    given-names: Xiaoxia
+  - family-names: Song
+    given-names: Shuaiwen Leon
+  - family-names: Zhou
+    given-names: Zhongzhu
 repository-code: "https://github.com/FutureMLS-Lab/FOSCAR"
 license: MIT
-version: 0.1.0
-date-released: 2026-10-29
+version: 0.2.0
+date-released: 2026-11-08

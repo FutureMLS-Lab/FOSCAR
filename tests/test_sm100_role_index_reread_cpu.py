@@ -1,9 +1,8 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The Blackwell kernel's persistent item loop chooses every warp role from one fresh read.
 
 WHY. In a persistent build each CTA loops over work items, and at the top of each item every
-warp picks its role by comparing its warp index with the role's warp number
-(`docs/kernel/int_fold_decode.md`, "The warp role is re-read for every work item"). Two rules
+warp picks its role by comparing its warp index with the role's warp number. Two rules
 hold in a persistent build of either storage width:
 
 - One fresh read of the thread index per item. When the warp index came from the kernel-entry

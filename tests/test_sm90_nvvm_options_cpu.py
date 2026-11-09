@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """The NVVM options `IntPingPongDecodeSm90` compiles with, and how they reach `cute.compile`.
 
 `pingpong_runtime.nvvm_options` derives them from the constructed kernel,
@@ -179,6 +181,7 @@ def test_an_unlisted_release_does_not_compile(recording_compile, monkeypatch):
 
 
 def test_the_split_combine_compile_refuses_an_unlisted_release(monkeypatch):
+    pytest.importorskip("cutlass", reason="needs the DSL")
     monkeypatch.setattr(runtime, "installed_dsl_version", lambda: "4.7.0")
     with pytest.raises(RuntimeError, match="4.7.0"):
         runtime.compile_splitk_combine(head_dim=128)

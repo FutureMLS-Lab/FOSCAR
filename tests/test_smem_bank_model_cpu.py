@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The suite's shared-memory bank model, `tests/_smem_banks.py`, against measured lane patterns.
 
 Every CPU test that costs a shared-memory lane map uses that one model, so this file pins a

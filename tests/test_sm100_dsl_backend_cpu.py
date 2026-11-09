@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """The SM100 compile path refuses nvidia-cutlass-dsl's CUDA 12 backend.
 
 That backend vendors ptxas 12.9, which left output elements of the SM100 kernel unwritten

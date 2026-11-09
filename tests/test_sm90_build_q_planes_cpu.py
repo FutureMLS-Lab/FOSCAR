@@ -1,11 +1,10 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The shared-memory addressing that removed `IntPingPongDecodeSm90`'s register spills in the
 configurations the census and its compile matrix checked (1 to 5 and 8 query heads per kv head,
 not 6 or 7), on a CPU.
 
-Two roles of the kernel spilled registers to local memory at D = 128 (the dated section
-"Register spills in the channel-wise paths (2026-09-28)" of
-docs/kernel/int_decode_pingpong_sm90.md). The channel-K Q'-plane builder in IO warps 10-11
+Two roles of the kernel spilled registers to local memory at D = 128 before this
+addressing split. The channel-K Q'-plane builder in IO warps 10-11
 carried one swizzled address per (head, channel quarter) plane store and the query block across
 its group loop; the consumers under channel-wise V carried four copies of the lc wgmma's
 constant ones-row operand. The fix is three shared-memory layouts, each a plain-Python helper
@@ -28,14 +27,13 @@ THE PLANE LAYOUT. `__call__` builds the plane layout with
 K-major atom, 8 rows of 64 bf16 channels, tiled D / 64 times along the channels, so channel d of
 row h sits at element 64 h + d % 64 + 512 (d // 64), under the byte-address swizzle
 Swizzle<3, 4, 3>. `_plane_layout` below is that model. It is anchored to the compiled kernel at
-D = 128 in two ways: at 6d4a06e the builder's hoisted plane-store addresses were
+D = 128 in two ways: the builder's unsplit plane-store addresses were
 `base + 2 lane + 0x80 h + {0, 0x40, 0x400, 0x440}` followed by the XOR of bits 7-9 into bits
-4-6 (profile/h100_flex_spills_20260928/diagnosis_6d4a06e.md), which is this layout and swizzle;
+4-6, which is this layout and swizzle;
 and the kernel with the split emits `st.shared.b16 [lane_reg + imm]` with exactly the immediates
-`test_the_split_reproduces_the_compiled_store_immediates` derives
-(profile/h100_flex_spills_20260928/ptx_excerpt.txt). At D = 256 the model is the same atom
-tiled four times; the constructor refuses channel-wise K at D != 128, so no compiled D = 256
-plane exists to compare with.
+`test_the_split_reproduces_the_compiled_store_immediates` derives. At D = 256 the model is the
+same atom tiled four times; the constructor refuses channel-wise K at D != 128, so no compiled
+D = 256 plane exists to compare with.
 
 WHAT THE STRUCTURAL TESTS PIN. Where a test interprets the kernel's code, it binds the operands of
 the kernel's own packing helpers (`_cvt2_bf16x2`, `_bf16x2_lo_f32`, `_bf16x2_hi_f32`) and of
@@ -134,8 +132,7 @@ def test_the_split_reproduces_the_compiled_store_immediates(kernel):
     """At four heads and D = 128 the compiled builder stores through four registers, one per
     head (%r76-%r79 for heads 0-3), with byte immediates 128 h + {0, 64, 1024, 1088} per
     quarter: `st.shared.b16 [%r76]`, `[%r77+128]`, `[%r78+256]`, `[%r79+384]`, `[%r76+64]` and
-    so on in the PTX of flex_i4_K-ch128_V-ch128
-    (profile/h100_flex_spills_20260928/ptx_excerpt.txt). The split gives exactly those
+    so on in the PTX of flex_i4_K-ch128_V-ch128. The split gives exactly those
     immediates and one lane XOR per head, 8 h, so a head's four quarters share one lane term, as
     they share one register there."""
     split = kernel["_plane_store_split"](_plane_layout(), 4, 4, SWIZZLE_128B, BF16_BYTES, 1024)
@@ -1056,14 +1053,13 @@ def _helper_semantics(tree):
                                 "_bf16x2_hi_f32": lambda word: word & 0xFFFF0000}
 
 
-@pytest.mark.xfail(strict=True, reason="source-text pin not updated for the GQA block-index change")
 def test_the_staged_words_give_every_head_its_own_query(tree, kernel):
     """Interpreting the builder's own staging loop and its per-build read-back, with the packing
     helpers' semantics read from their inline PTX and operand wiring, at D = 128 and 256 and every
-    ratio: the staging reads each real head of its kv head exactly once and no other query row,
-    an odd ratio's last word carries a zero high half, every build's head loop visits exactly the
-    real heads, and head h reads back exactly its own bf16 query bits, whatever padding the word
-    count adds."""
+    ratio: the staging reads each real head of its kv head's head-tile exactly once and no other
+    query row, an odd ratio's last word carries a zero high half, every build's head loop visits
+    exactly the real heads, and head h reads back exactly its own bf16 query bits, whatever
+    padding the word count adds."""
     params, pack, extract = _helper_semantics(tree)
     builder = _method(tree, "_build_q_planes")
     group_loop = next(n for n in ast.walk(builder) if isinstance(n, ast.While) and ast.unparse(n.test) == "g <= g1")
@@ -1142,8 +1138,8 @@ def test_the_staged_words_give_every_head_its_own_query(tree, kernel):
         q = {(b, r, c): 0x3F80 + (7 * r + 131 * c + 977 * b) % 0x3F00
              for b in range(6) for r in range(8 * 4) for c in range(head_dim)}
         for heads, kv_head, batch in itertools.product(RATIOS, (0, 1, 3), (0, 5)):
-            # the builder's own head count, from the constructor's ratio
-            assert _eval(hpk.value, self=types.SimpleNamespace(heads_per_kv=heads)) == heads
+            # the builder's own head count, from the constructor's per-tile head count
+            assert _eval(hpk.value, self=types.SimpleNamespace(heads_per_tile=heads)) == heads
             request = _eval(gq.value.slice.elts[0], batch_idx=batch, Int64=int)
             real_rows = [kv_head * heads + h for h in range(heads)]   # this kv head's query rows
             qw = kernel["_build_q_layout"](heads, head_dim)[0][0]
@@ -1155,7 +1151,7 @@ def test_the_staged_words_give_every_head_its_own_query(tree, kernel):
                 qd_value = _eval(_binds_of(builder, "qd")[0].value, builder_lane=lane, **{staging_qtr.target.id: qtr})
                 words, rows_read = {}, []
                 for w in _range_of(word_loop.iter, QW=qw):
-                    env = {"w": w, "HPK": heads, "kv_head_idx": kv_head, "heads_per_kv": heads, "qd": qd_value}
+                    env = {"w": w, "HPK": heads, "kv_head_idx": kv_head, "q_group_idx": kv_head, "heads_per_kv": heads, "qd": qd_value}
                     if _eval(guard.test.args[0], **env):
                         hi_expr = q_hi.value
                         assert ast.unparse(hi_expr.orelse) == "Float32(0.0)"
@@ -1215,16 +1211,14 @@ def test_the_kernel_builds_the_modelled_plane_layout(tree):
         "sQ_layout = sm90_utils.make_smem_layout(BF16, LayoutEnum.ROW_MAJOR, (PG, D))"
 
 
-@pytest.mark.xfail(strict=True, reason="source-text pin not updated for the GQA block-index change")
 def test_the_plane_split_reads_the_plane_layout_and_its_swizzle(tree):
     method = _method(tree, "_plane_store_offsets")
     (ret,) = [n for n in ast.walk(method) if isinstance(n, ast.Return)]
     assert ast.unparse(ret.value) == (
         "_plane_store_split(lambda h, d: cute.crd2idx((h, d), sQ_layout.outer), "
-        "self.heads_per_kv, self.head_dim // 32, _swizzle_of(sQ_layout), BF16.width // 8, alignment)")
+        "self.heads_per_tile, self.head_dim // 32, _swizzle_of(sQ_layout), BF16.width // 8, alignment)")
 
 
-@pytest.mark.xfail(strict=True, reason="source-text pin not updated for the GQA block-index change")
 def test_the_kernel_allocates_the_builder_buffers_under_channel_wise_k_only(tree, kernel):
     """The two planes are aligned to the swizzle's period under channel-wise K and at 128
     bytes otherwise, so every token-wise-K configuration keeps its shared-memory map; sBuildQ
@@ -1255,7 +1249,7 @@ def test_the_kernel_allocates_the_builder_buffers_under_channel_wise_k_only(tree
         assert reached == {id(planes[1]): k_axis == "channel", id(alias): k_axis != "channel"}, (k_axis, v_axis)
     for name in ("build_q_shape", "build_q_stride"):
         assert _only_binding(kernel_fn, name) == \
-            "build_q_shape, build_q_stride = _build_q_layout(self.heads_per_kv, D)"
+            "build_q_shape, build_q_stride = _build_q_layout(self.heads_per_tile, D)"
     allocs = _binds_of(kernel_fn, "sBuildQ")
     assert [ast.unparse(a) for a in allocs] == [
         "sBuildQ = sQRowSum",

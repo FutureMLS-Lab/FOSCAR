@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """Head-tile occupancy must reach both split and merge planners."""
 import importlib.util
 from pathlib import Path

@@ -83,9 +83,8 @@ def quant_cfg_of(page_size, head_dim, kernel_kwargs=None):
     dict (the compile-keying entry for the quant-flex configs; absent kwargs
     mean the legacy token-128 pair, f32 pool — the shipped default).
 
-    K token-64 keeps its shipped bf16 default, but an explicit ``sdtype="f32"``
-    selects the full-precision metadata path. Bf16 metadata remains exclusive
-    to K token-64.
+    K token-64 keeps its shipped bf16 default, and an explicit ``sdtype="f32"`` or
+    ``sdtype="bf16"`` selects the requested scale-pool precision.
     """
     from ..quant_layout import quant_block_offsets
 

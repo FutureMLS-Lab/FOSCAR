@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """The benchmark timer's attribution and summary rules, on synthetic records.
 
 These are the two places a timing bug would go unnoticed: a device record that

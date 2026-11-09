@@ -1,3 +1,6 @@
+# Copyright (c) 2025, Tri Dao.
+# SPDX-License-Identifier: BSD-3-Clause
+
 from typing import Optional
 from dataclasses import dataclass
 

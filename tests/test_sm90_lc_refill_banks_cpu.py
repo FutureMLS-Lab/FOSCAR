@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """Bank arithmetic of the lc strip `sLcFactors` of `IntPingPongDecodeSm90`, on a CPU.
 
 Once per tile, after the tile's PV wgmmas (`pv_tile_restart`), the strip is copied from shared
@@ -11,19 +11,17 @@ one 128-byte row in the registers' order, so the copy is 4 16-byte loads per war
 
 This file proves by lane arithmetic that every load of the copy is at its ideal, that the other
 access to the buffer (the lc writer) stays at its ideal, and that the reader and the writer
-still agree on every value. It also re-derives, for the layout at 6d4a06e, the per-instruction
-counts ncu measured there, so the model is anchored before it is used:
-`profile/h100_chunk16_bankconf_20260925/chunk16/analysis.txt`, INT4 and INT2 at B=128,
-KV=8192, records the refill LDS at 2.00/1.00 on 8 threads and the lc writer STS.U16 at
-1.00/1.00 on 8 threads (that tree's kernel is 6d4a06e's at these sites).
+still agree on every value. It also re-derives, for the earlier token-fastest layout, the
+per-instruction counts ncu measured there (refill LDS at 2.00/1.00 on 8 threads and the lc
+writer STS.U16 at 1.00/1.00 on 8 threads), so the model is anchored before it is used.
 
 THE MODEL is the suite's one shared-memory bank model, `tests/_smem_banks.py`: the servicing
-rule that a lane-pattern microbenchmark measured on B200 and H100 on 2026-09-29, whose measured
+rule that a lane-pattern microbenchmark measured on B200 and H100, whose measured
 patterns `test_smem_bank_model_cpu.py` pins. A 16-byte load is served one 8-lane quarter warp at a time, merged into one
 wavefront per 16-lane half warp when that half touches at most 128 bytes on distinct banks, and
 a 4-byte access is served as the whole warp. Each group costs the largest number of distinct
 4-byte words in one bank. The microbenchmark measured no 2-byte access, so the lc writer's
-STS.U16 is costed by the 4-byte rule, and ncu's 1.00/1.00 for it at 6d4a06e is the measurement
+STS.U16 is costed by the 4-byte rule, and ncu's 1.00/1.00 for it is the measurement
 that anchors that choice here.
 
 A buffer's base only rotates the banks every lane sees, so each check runs at every 16-byte
@@ -102,7 +100,7 @@ def _c_fragment(warp, lane, j):
 def _refill_a_word(lane, kt, e):
     """(plane, token pair) that A word e of refill lane `lane` (below 8) holds at step kt:
     the m64n8k16 A fragment with the planes on rows 0, 1, 8, 9 (rcp hi, zr hi, rcp lo, zr lo).
-    This is what `rLcA[4kt + e]` was loaded with at 6d4a06e, and what the lc wgmma reads."""
+    This is what `rLcA[4kt + e]` was loaded with in the scalar layout, and what the lc wgmma reads."""
     return lane // 4 + 2 * (e % 2), 8 * kt + lane % 4 + 4 * (e // 2)
 
 
@@ -117,7 +115,7 @@ def _cost(instructions):
 # ---------------------------------------------------------------------------------------------
 
 def _lc_elem_today(plane, token, wg):
-    """6d4a06e's allocation, make_ordered_layout((4, 64, 2), order=(1, 0, 2)): token fastest."""
+    """The earlier token-fastest allocation, make_ordered_layout((4, 64, 2), order=(1, 0, 2))."""
     return token + PAGE * plane + PLANES * PAGE * wg
 
 
@@ -163,7 +161,7 @@ def test_each_refill_load_delivers_the_words_the_wgmma_reads(kernel):
 
 
 def _refill_today(base):
-    """16 LDS.32 per warpgroup per tile at 6d4a06e: one per (kt, e), lanes 0-7."""
+    """16 LDS.32 per warpgroup per tile in the scalar layout: one per (kt, e), lanes 0-7."""
     out = []
     for wg in range(WARPGROUPS):
         for kt in range(PAGE // 16):
@@ -212,15 +210,15 @@ def _lc_writer(elem, base):
 @pytest.mark.parametrize("base", BASES)
 def test_the_refill_is_one_conflict_free_16_byte_load_per_step(kernel, base):
     today = _cost(_refill_today(base))
-    assert today == [(2, 1)] * (16 * WARPGROUPS)          # ncu at 6d4a06e: 2.00 / 1.00
+    assert today == [(2, 1)] * (16 * WARPGROUPS)          # ncu: 2.00 / 1.00
     whole = _cost(_refill(kernel, base))
     assert whole == [(1, 1)] * (4 * WARPGROUPS)
     # the grouped body, every lane: each half warp reads the step's one 128-byte row, so each
     # load is two wavefronts, its ideal
     grouped = _cost(_tile_copy(kernel, base))
     assert grouped == [(2, 2)] * (4 * 4 * WARPGROUPS)
-    # per warpgroup per tile: 32 wavefronts in 16 loads at 6d4a06e, 4 in 4 on the whole-D body
-    # now, and 32 in 16 on the grouped body
+    # per warpgroup per tile: 32 wavefronts in 16 loads in the scalar layout, 4 in 4 on the
+    # whole-D body now, and 32 in 16 on the grouped body
     assert sum(a for a, _ in today) // WARPGROUPS == 32
     assert sum(a for a, _ in whole) // WARPGROUPS == 4
     assert sum(a for a, _ in grouped) // WARPGROUPS == 32
@@ -229,7 +227,7 @@ def test_the_refill_is_one_conflict_free_16_byte_load_per_step(kernel, base):
 @pytest.mark.parametrize("base", BASES)
 def test_the_lc_writer_stays_at_its_ideal(kernel, base):
     """No excess moves to the only other access of the buffer: each of the writer's 2-byte
-    stores touches four distinct words on four banks in both layouts (ncu at 6d4a06e:
+    stores touches four distinct words on four banks in both layouts (ncu:
     1.00 / 1.00 on 8 threads)."""
     for elem in (_lc_elem_today, _lc_elem(kernel)):
         assert _cost(_lc_writer(elem, base)) == [(1, 1)] * (8 * 4 * WARPGROUPS)
@@ -237,7 +235,7 @@ def test_the_lc_writer_stays_at_its_ideal(kernel, base):
 
 def test_the_lc_writer_address_is_one_lane_base_plus_an_immediate(kernel):
     """The new writer needs no instruction in the tile loop: its address is a lane part that
-    does not depend on the tile plus a per-store constant, as it was at 6d4a06e. The lane part
+    does not depend on the tile plus a per-store constant, as it was before. The lane part
     is 2(i%2) + 16(i//2) + 128w bytes (i = lane // 4), and the constants are 64(p%2) + 4(p//2)
     + 8(j//2)."""
     elem = _lc_elem(kernel)

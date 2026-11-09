@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """Source rules of the graph builds (CUDA-graph mode) that no numeric gate can see.
 
 1. The Blackwell split reduction reads no partial slot at or past the request's split count
@@ -17,8 +19,7 @@
    helper is refused, with a message that says so: the rule looks for the wait in the body. The
    decode triggers the dependent launch once its maxima and sums are stored, and stores its
    outputs on their own path, so a read placed before the wait, or reached by a thread that
-   skipped a wait nested under a condition, races the decode, and T7 sees it only when the race
-   fires (kernel review K1, PR B round 2; codex C1, round 3).
+   skipped a wait nested under a condition, races the decode.
 3. Each graph decode build exits an idle CTA first (THE EXIT): on Hopper
    (`IntPingPongDecodeSm90.kernel`) and on Blackwell (`IntDecodeSm100._graph_work_entry`), the
    statement after the 16-byte entry load reads the item and the next one exits on the idle
@@ -26,9 +27,9 @@
    descriptor prefetch or dependent-launch wait comes before it, in the kernel or, on
    Blackwell, in the entry helper's own statements before its exit (the helper itself; its
    callees are not searched). An idle CTA that exits after `alloc_tmem` holds tensor memory; one
-   that waits first costs the whole grid a wait (K2; codex C2, round 3).
+   that waits first costs the whole grid a wait.
 
-SCOPE (orchestrator decision, round 4). These rules are regression guards against plausible
+SCOPE. These rules are regression guards against plausible
 edits to this source by a cooperating developer, not a proof: an AST rule cannot be complete, so
 each closes the escapes reviews have found with the simple scope rule its text states.
 
@@ -37,9 +38,8 @@ the most pieces one request can get, S, and each request merges only its own k_b
 (`GroupedQueryAttentionDecode.reduction_merge`, handed `nsplit = k_b`); slots k_b..S-1 hold
 whatever an earlier step left there. A bound that reads S instead of k_b can load those slots
 without changing any output: the register prefetch of the first 16 partial outputs, for one,
-keeps its accumulation behind `j < nsplit`, so T7 (`scripts/test_fold_quant_flex_sm100.py
---graph`), which judges outputs and LSEs, passes with the prefetch clamp at `splits - 1`
-(codex, graph gate round 1). Such a load is out of bounds of the request's data, and a load
+keeps its accumulation behind `j < nsplit`, so numeric checks on outputs and LSEs pass even
+with the prefetch clamp at `splits - 1`. Such a load is out of bounds of the request's data, and a load
 leaves nothing a numeric check sees. So the bounds are pinned where the kernel is traced from,
 the source of `reduction_merge` and `reduction_kernel`, which the DSL traces into the kernel
 statement for statement; this reads the source, not PTX, in which k_b and S are both run-time
@@ -54,8 +54,7 @@ THE RULE.
   the graph build, after its `k_b == 1` path, which reads slot 0 alone (`FAST_PATH_READS`).
 
 The mutation tests apply each mutation to the source in memory and require its rule to reject
-it, the clamp regression codex built and the kernel reviewer's mutants (R2, R3, R4, D1b, D2,
-H1b; tmp/agent_review/prb_kernels/mutants.json) among them, so no rule passes vacuously.
+it, so no rule passes vacuously.
 
 Run: pytest tests/test_graph_build_source_cpu.py
 """
@@ -165,7 +164,7 @@ def test_the_reduction_reads_only_its_own_slots():
 
 
 MUTATIONS = {
-    "the prefetch clamp at the capacity (codex's regression)": (
+    "the prefetch clamp at the capacity": (
         "cutlass.min(Int32(j), nsplit - 1)", "cutlass.min(Int32(j), splits - 1)"),
     "the prefetch unclamped": ("cutlass.min(Int32(j), nsplit - 1)", "Int32(j)"),
     "the tail staging to the capacity": (
@@ -391,14 +390,13 @@ def test_each_graph_decode_build_exits_an_idle_cta_first():
 #: the source spells them (anchors of the mutants and controls below).
 MERGE_WAIT = ("        cute.arch.fence_acq_rel_cta()  # Don't reorder partitioning after PDL wait\n"
               "        cute.arch.griddepcontrol_wait()\n\n        if tidx < nsplit:\n")
-#: A view of the partial outputs rebuilt from their iterator and layout (codex, round 5).
+#: A view of the partial outputs rebuilt from their iterator and layout.
 REBUILT_VIEW = ("        outputs = cute.make_tensor(tCgO_partial.iterator.align(16), "
                 "tCgO_partial.layout)\n")
 PREFETCH = ("        o_pf = reduction_prefetch_splits if cutlass.const_expr(d % d_per_blk == 0) "
             "else 0\n        rO_pf = [\n            tCgO_partial[None, cutlass.min(Int32(j), "
             "nsplit - 1)].load()\n            for j in range(o_pf)\n        ]\n")
-#: The kernel reviewer's mutants (tmp/agent_review/prb_kernels/mutants.json), each a list of
-#: (file, old, new) edits that its rule must reject.
+#: Ordering mutants, each a list of (file, old, new) edits that its rule must reject.
 ORDER_MUTANTS = {
     "R2: the merge reads the partials with no dependent-launch wait": [(SOURCE,
         "        cute.arch.griddepcontrol_wait()\n\n        if tidx < nsplit:",
@@ -412,7 +410,7 @@ ORDER_MUTANTS = {
         "wait\n                cute.arch.griddepcontrol_wait()\n")],
     "R4: k_b read after the wait": [(SOURCE, "            k_b = split_counts[coord_b]\n",
         "            cute.arch.griddepcontrol_wait()\n            k_b = split_counts[coord_b]\n")],
-    "R9 (codex C1): the merge's wait only under its first copy's condition": [(SOURCE,
+    "R9: the merge's wait only under its first copy's condition": [(SOURCE,
         "        cute.arch.griddepcontrol_wait()\n\n        if tidx < nsplit:\n",
         "\n        if tidx < nsplit:\n            cute.arch.griddepcontrol_wait()\n")],
     "R10: the one-piece path waits on thread 0 only": [(SOURCE,
@@ -444,11 +442,11 @@ ORDER_MUTANTS = {
         "                cute.arch.fence_acq_rel_cta()  # Don't reorder partitioning after PDL "
         "wait\n                cute.arch.griddepcontrol_wait()\n                max_final = "
         "gM_partial[0, 0]\n")],
-    "codex round 4: the merge's prefetch through an alias, moved before the wait": [
+    "the merge's prefetch through an alias, moved before the wait": [
         (SOURCE, PREFETCH, ""),
         (SOURCE, MERGE_WAIT, "        outputs = tCgO_partial\n"
          + PREFETCH.replace("tCgO_partial", "outputs") + MERGE_WAIT)],
-    "codex round 5: the merge's prefetch through a rebuilt view, moved before the wait": [
+    "the merge's prefetch through a rebuilt view, moved before the wait": [
         (SOURCE, PREFETCH, ""),
         (SOURCE, MERGE_WAIT, REBUILT_VIEW + PREFETCH.replace("tCgO_partial", "outputs")
          + MERGE_WAIT)],
@@ -462,7 +460,7 @@ ORDER_MUTANTS = {
         "                if not_oob_d:\n                    cute.arch.griddepcontrol_wait()\n"
         "                max_final = gM_partial[0, 0]\n")],
 }
-#: Correct code the order rule must accept (kernel review KB2): a view of a partial built before
+#: Correct code the order rule must accept: a view of a partial built before
 #: the merge's wait reads no memory.
 ORDER_ACCEPTS = {
     "the merge's prefetch through a rebuilt view, after the wait": [
@@ -470,10 +468,10 @@ ORDER_ACCEPTS = {
         (SOURCE, MERGE_WAIT, REBUILT_VIEW + MERGE_WAIT)],
     "an extent of a partial's shape taken before the merge's wait": [(SOURCE, MERGE_WAIT,
         "        n_slots = tCgO_partial.shape[1]\n" + MERGE_WAIT)],
-    "codex round 6: an extent through a name bound to the shape, before the wait": [
+    "an extent through a name bound to the shape, before the wait": [
         (SOURCE, MERGE_WAIT, "        partial_shape = tCgO_partial.shape\n"
          "        n_slots = partial_shape[1]\n" + MERGE_WAIT)],
-    "codex round 6: a stride through a name bound to the stride, before the wait": [
+    "a stride through a name bound to the stride, before the wait": [
         (SOURCE, MERGE_WAIT, "        partial_stride = tCgO_partial.stride\n"
          "        slot_step = partial_stride[1]\n" + MERGE_WAIT)],
     "a nested CuTe extent of a partial's shape, before the wait": [(SOURCE, MERGE_WAIT,

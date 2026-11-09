@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """Graph mode's host side (`PagedDecodeWrapper(..., use_cuda_graph=True)`), on the CPU.
 
 The compiles, launches and the CUDA calls `plan()` and `update()` make are replaced by stand-ins
@@ -14,6 +14,8 @@ import sys
 import numpy as np
 import pytest
 import torch
+
+pytest.importorskip("cutlass", reason="requires nvidia-cutlass-dsl")
 
 from foscar import _utils, graph_plan, kv_cache
 from foscar import wrapper as W

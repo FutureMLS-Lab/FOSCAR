@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -35,11 +35,12 @@ dependencies = [
 [project.optional-dependencies]
 cu12 = ["nvidia-cutlass-dsl==4.8.0", "cuda-python>=12.4,<13"]
 cu13 = ["nvidia-cutlass-dsl[cu13]==4.8.0", "cuda-python>=13,<14"]
-test = ["pytest>=7", "nvidia-cutlass-dsl==4.8.0", "cuda-python>=12.4,<13"]
+test = ["pytest>=7"]
+dev = ["pytest>=7", "ruff>=0.4"]
 # The benchmark harness compares against FlashInfer's kernels. Nothing in the
 # package imports it. The version is pinned because the baseline columns in the
 # README were measured with it; a later release moves its decode kernels.
-bench = ["flashinfer-python==0.7.3", "pyyaml>=6"]
+bench = ["flashinfer-python==0.7.3", "pyyaml>=6", "matplotlib>=3.5"]
 
 [project.urls]
 Homepage = "https://github.com/FutureMLS-Lab/FOSCAR"
@@ -57,6 +58,7 @@ conflicts = [[{ extra = "cu12" }, { extra = "cu13" }]]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 markers = ["gpu: needs an SM90 or SM100 device"]
 addopts = "--strict-markers"
 

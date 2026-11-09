@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The shared-memory geometry of the Hopper dequantize (`_sm90/quant_dequant.py`), on a CPU.
 
 The kernel copies each (page, KV head) code block into shared memory, each warpgroup thread its

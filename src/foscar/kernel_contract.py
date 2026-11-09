@@ -30,26 +30,17 @@ configuration may use, and the two kernels genuinely disagree there:
 
     SM100   at D=128, bf16 REQUIRED when K is token-(D/2), because token-64 doubles its
             ring section and the halved scale element is what funds it; elsewhere bf16
-            is permitted alongside the f32 default, matching SM90. At D=256 SM100
+            is permitted alongside the f32 default, matching SM90. At D=64 and D=256 SM100
             builds only token-wise K and V over all D channels with an f32 pool.
     SM90    at D=128, bf16 REQUIRED when K is token-(D/2), because token-64 doubles its
             ring section and the halved scale element is what funds it; elsewhere bf16
-            is merely PERMITTED, there being no assert against it. At any other head
-            dimension SM90 builds only token-wise K and V over all D channels with an
-            f32 pool, so it refuses a half-width K group and a bf16 pool alike
+            is permitted alongside the f32 default. At any other head dimension (64 or 256)
+            SM90 builds only token-wise K and V over all D channels with an f32 pool, so it
+            refuses a half-width K group and a bf16 pool alike
             (`quant_layout.sm90_wide_refusal`).
 
-    So the asymmetry is about what each kernel FORBIDS, not about V token-64: that
-    granularity is deferred on both arches, `validate_quant_flex` refusing it in one
-    place for both.
-
-That is not drift, and the difference is narrower than it looks. BOTH rules key on K
-alone -- V token-64 is deferred on both arches, refused in one place by
-`validate_quant_flex` -- so neither kernel needs a V term. What they differ about is
-what happens OUTSIDE K token-(D/2): SM100 asserts f32 there and SM90 at D=128 asserts
-nothing, so bf16 is legal on SM90 at D=128 and refused on SM100. That is a difference in
-what each kernel FORBIDS, not in what either supports, and it is why each keeps its own
-rule next to the envelope that explains it.
+    So the rules match at D=128 and at D in (64, 256), while each kernel keeps its own
+    constructor validation next to the ring-budget envelope that explains it.
 """
 from __future__ import annotations
 
@@ -142,9 +133,8 @@ class GQAPagedDecode:
     SM100 packs the grouped heads on the tiled mode and launches
     `ceil_div(q_heads // kv_heads, q_head_tile)` head tiles per KV head, so a ratio
     larger than the tile is SPREAD over several threadblocks. SM90's inline RS wgmma
-    produces exactly `q_head_tile` head columns and refuses a larger ratio, because
-    there is nowhere else for the rest to go. SM90's bound is its own and must not be
-    restated here as if it applied to both.
+    produces `q_head_tile` head columns per CTA and launches `head_tiles` CTAs along
+    its grid's head-tile dimension when `heads_per_kv > q_head_tile`.
 
     SM90 also takes `heads_per_kv` at construction, it being trace-time there, while
     SM100 does not take it at all and derives it at launch from the head counts. That

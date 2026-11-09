@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The graph-on planner (`graph_plan.py`): bucket classes, per-step chunk counts, the work list.
 
 `graph_plan.py` and the Hopper eager planner import nothing but numpy and math, so they are

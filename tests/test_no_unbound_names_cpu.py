@@ -1,31 +1,22 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """No function uses a name that nothing in scope binds.
 
-WHY THIS EXISTS. `baselines/adapters/ours.py` called `k_pool_perm` in a method
-whose only import of it lived in a DIFFERENT method, so `reference()` raised
-`NameError` on every call and took `validate.py`'s ours column and the split
-parity gate with it. That shipped in 820fb5f and survived a review. The same
-mistake was then made twice more while repairing it, once for `LEGACY` and once
-for `k_pool_perm` again in `accuracy_gate.py`, where it cost a GPU run to find.
-
-The shape is specific to this repository and that is why a general linter has not
-been enough: `scripts/` and `baselines/` deliberately import the heavy modules
-(`_fold_harness`, `repack_sm100`, anything reaching cutlass) INSIDE the functions
-that need them, so that a CPU box can still import the file. Function-local
-imports are therefore normal here, and a name imported in one function is exactly
-the kind of thing that looks bound when it is not.
+WHY THIS EXISTS. Function-local imports of heavy modules (such as those reaching
+`cutlass`) are normal in this repository so that a CPU box can still import the
+host modules. A name imported in one function is therefore easy to reference by
+mistake in another function of the same file.
 
 `python -m py_compile` cannot see this: an unbound load is legal Python until it
 runs. Nothing else in the suite covers it, because the failing paths need a GPU.
 
-THE SCOPE MODEL IS LEXICAL, AND IT HAS TO BE. An earlier revision collected
-bindings with `ast.walk`, which descends through every nested scope, and codex
-demonstrated the two holes that opens: a load satisfied only by a CLASS ATTRIBUTE
-was treated as bound, though a function body cannot see a class namespace, and so
-was a load satisfied only by a SIBLING nested function's import. Both are
-`NameError` at runtime and both passed. Bindings are therefore collected per
-scope, stopping at each nested function, lambda and class, and a scope's visible
-set is builtins, the module scope, its enclosing FUNCTION scopes, and its own.
+THE SCOPE MODEL IS LEXICAL, AND IT HAS TO BE. Collecting bindings with `ast.walk`
+descends through every nested scope, which opens two holes: a load satisfied only
+by a CLASS ATTRIBUTE would be treated as bound (though a function body cannot see
+a class namespace), and so would a load satisfied only by a SIBLING nested
+function's import. Both are `NameError` at runtime. Bindings are therefore
+collected per scope, stopping at each nested function, lambda and class, and a
+scope's visible set is builtins, the module scope, its enclosing FUNCTION scopes,
+and its own.
 
 WHAT IT DOES NOT CATCH, so nobody reads more into a pass. It resolves names, not
 values, and it is conservative on purpose: any name bound anywhere in the same
@@ -51,7 +42,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 #: a reader to ignore this gate. `_vendor/flash_attn/cute/utils.py` legitimately
 #: trips it: `ex2_emulation_2` reads `quack` under an import upstream makes
 #: conditional.
-VENDORED = ("src/foscar/_vendor/", "baselines/vendor/")
+VENDORED = ("src/foscar/_vendor/",)
 
 #: Anything that opens a new namespace. Bindings do not cross these.
 SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
@@ -93,12 +84,10 @@ def _own_nodes(scope: ast.AST):
     is written: a `def` binds its name, and decorators, argument defaults and base
     classes all run in the enclosing scope. A header part that is ITSELF a scope,
     such as a lambda used as an argument default, is yielded and not entered:
-    entering it charged the enclosing function for the lambda's own parameters,
-    which reported four false positives in the `gqa_decode_sm90_quant*.py` snapshots
-    under `183286a:solution/`, where
-    `index_transform=lambda index_q, index_k: (index_q, index_k)` is a default. The
-    visitor below picks that lambda up as a scope of its own, and the "lambda as an
-    argument default" case below holds it there.
+    entering it would charge the enclosing function for the lambda's own
+    parameters (for example `index_transform=lambda index_q, index_k: (index_q, index_k)`).
+    The visitor below picks that lambda up as a scope of its own, and the "lambda
+    as an argument default" case below holds it there.
     """
     for child in ast.iter_child_nodes(scope):
         yield child

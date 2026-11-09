@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 Donglin Zhuang (standalone foscar adaptation).
 # SPDX-License-Identifier: BSD-3-Clause
+# Adapted from FlashInfer's CuTe DSL attention modules (see NOTICE).
 """SM100 quantized-KV decode with the affine dequant folded through the MMA
 (`IntDecodeSm100`).
 
@@ -365,10 +367,10 @@ _T32 = lambda b: b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)
 LUT2C8 = _T32(_E4M3_CODES[8:12])  # int2 K table: e4m3(8+q), q in 0..3 = 0x50..0x53
 
 # Every stage count this kernel exposes is timed against its default at a
-# configuration the planner selects, and none reaches one percent: `p_stages=5`
-# reads 0.3 percent faster than the shipped 4 and the default stays at 4
-# deliberately. Time a stage-count change as two arms of one benchmark YAML,
-# compared pairwise, before changing a default.
+# configuration the planner selects. Default `p_stages` is 3 at `head_dim == 64`
+# and 2 otherwise; `o_stages` resolves through `resolve_tiling`. Time a
+# stage-count change as two arms of one benchmark YAML, compared pairwise,
+# before changing a default.
 #
 # ``sp_stages`` is not a knob at all: the block it sizes is allocated only when
 # ``threshold_scale_factor is not None``, which no shipped configuration passes.
@@ -594,9 +596,10 @@ class IntDecodeSm100(GQAPagedDecode):
             return page_size, head_dim * bits // 8
         return head_dim, page_size * bits // 8
 
-    #: (sequence_tile, o_stages) for the quant configs where the shipped (256, 3)
-    #: is measurably wrong. Everything absent from this table keeps (256, 3), the
-    #: value every measured flex configuration uses.
+    #: (sequence_tile, o_stages) for the quant configs where the default (256, 3)
+    #: is overridden (e.g. token-wise K/V at D=64 and D=128 use o_stages=2, and D=64
+    #: at bits=2 uses sequence_tile=512 in `resolve_tiling`). Everything absent from
+    #: this table keeps (256, 3).
     #:
     #: Keyed on the FULL (k_quant, v_quant) pair, not on v_axis, and that is
     #: load-bearing in two ways:
@@ -726,7 +729,8 @@ class IntDecodeSm100(GQAPagedDecode):
             ``max(16, q_head_tile)`` because an N-major 8-bit B operand in shared
             memory needs N to be a multiple of 16.
             ``IntPingPongDecodeSm90`` uses the same name for the same quantity;
-            that kernel packs a fixed 8 and requires the ratio not to exceed it.
+            that kernel packs 8 query rows per CTA and launches ``head_tiles``
+            CTAs per KV head when ``heads_per_kv > 8``.
         sequence_tile
             KV tokens per threadblock per loop iteration.
         reduction_mode
@@ -771,17 +775,14 @@ class IntDecodeSm100(GQAPagedDecode):
             that margin. Depths up to 8 are nearly
             free in smem; only at 16 does the ring cost a KV stage.
         p_stages
-            smem P (BMM2 B) ring depth. Default 4. Also caps the S depth through
-            ``s_stages = min(max_s_stages, p_stages)``, and it is the binding
-            side of that min at the shipped tiling, so raising it deepens two
-            rings at once at the cost of smem the KV ring would otherwise get.
-            5 measures slightly faster than 4 and the default stays at 4
-            deliberately.
+            smem P (BMM2 B) ring depth. Default 3 at ``head_dim == 64`` and 2 otherwise.
+            Also caps the S depth through ``s_stages = min(max_s_stages, p_stages)``,
+            and it is the binding side of that min at the shipped tiling, so raising it
+            deepens two rings at once at the cost of smem the KV ring would otherwise get.
         o_stages
             tmem O (BMM2 C) ring depth (2 or 3). ``None`` resolves through
-            ``resolve_tiling``, which is 3 at every quant config except
-            (K token-128, V channel-128), where the measured pair is
-            (sequence_tile 256, o_stages 2). Depth 3 moves the
+            ``resolve_tiling``, which is 2 for token-wise (64, 64), (128, 128) and
+            (K token-128, V channel-128), and 3 otherwise. Depth 3 moves the
             VP/correction coupling distance from tile s-2 to s-3, buying one
             extra tile of slack on the loop-carried
             softmax -> sM -> correction -> O-release -> MMA chain for one more
@@ -1054,11 +1055,7 @@ class IntDecodeSm100(GQAPagedDecode):
         # The four shape arguments both kernels take are checked in ONE place, so the
         # two constructors cannot drift apart on them. This guard runs FIRST, BEFORE
         # THE SHARED SHAPE CHECK, because `_validate_shape` asserts and `python -O`
-        # drops asserts. THE SM100 CONSTRAINT IS 128-TILING, NOT D==128:
-        # `tiles_dm` and `tiles_dk` are ceil(D/128) and every tile is partitioned and
-        # stored whole, so a D that is not a multiple of 128 runs past the last full tile.
-        # The legacy token-D path is tiled for D=256, but whether D=256 works is
-        # untested; the wrapper refuses it, on the ground that nothing measures it.
+        # drops asserts.
         if head_dim <= 0 or head_dim % 64 != 0:
             # NOT an assert: python -O would drop this guard.
             raise ValueError(
@@ -1075,19 +1072,13 @@ class IntDecodeSm100(GQAPagedDecode):
         # an ICE naming a line in the softmax warpgroup rather than the
         # configuration that caused it.
         #
-        # `blk_tile_n_of` maps BOTH GQA ratio 1 and ratio 2 to `q_head_tile=2`, so
-        # neither compiles today. The refusal is unconditional, and it is a
-        # retained restriction rather than a requirement of every surviving
-        # path: the fold-off arm runs with `fold_p == False` and takes the
-        # single-row P store, so the hi/lo justification below scopes to the
-        # fold-enabled configurations. The bound stays unconditional because
-        # nothing needs `q_head_tile < 4` and no arm is tested at it.
+        # `blk_tile_n_of` maps GQA ratios 1 and 2 to `q_head_tile=4` (zero-padded in
+        # the query packer), so this assert catches only direct caller overrides of
+        # `q_head_tile < 4`.
         assert q_head_tile >= 4, (
             f"q_head_tile >= 4 is required: the P hi/lo quantize truncates "
             f"{q_head_tile} e4m3 values as one vector and nvgpu.cvt_fptrunc "
-            f"requires a 32-bit-aligned result, which takes 4. GQA ratios 1 and "
-            f"2 both resolve to q_head_tile=2 through blk_tile_n_of and are not "
-            f"supported by this path.")
+            f"requires a 32-bit-aligned result, which takes 4.")
         assert sequence_tile > 0 and sequence_tile % 128 == 0
         assert self.do_kernel_red ^ self.do_atomic_red ^ self.do_none_red
         # Quant-granularity flex, at parity with the SM90 IntPingPongDecodeSm90:
@@ -1096,9 +1087,9 @@ class IntDecodeSm100(GQAPagedDecode):
         # deferred, same as SM90). The per-(page, hk) scale block is the sectioned
         # layout of quant_layout.quant_block_offsets ([K ring | V ring | K ch |
         # V ch]); the legacy ("token", D) x 2 config keeps the interleaved [64, 4]
-        # f32 mScale contract and compiles byte-identical. `sdtype` ("f32"/"bf16")
-        # is the scale-pool element type: bf16 is REQUIRED by K token-64 (it funds
-        # the doubled K ring section) and disallowed elsewhere (SM90 rule).
+        # mScale contract and compiles byte-identical. `sdtype` ("f32"/"bf16")
+        # is the scale-pool element type: bf16 is REQUIRED by K token-(D/2) (it funds
+        # the doubled K ring section) and permitted alongside f32 at D=128.
         self.k_quant, self.v_quant = validate_quant_flex(
             k_quant, v_quant, page_size, head_dim)
         self.k_axis, self.k_group = self.k_quant
@@ -3690,7 +3681,7 @@ class IntDecodeSm100(GQAPagedDecode):
             # PRMT gather with table e4m3(8+q) (0x50..0x53): pack_lut
             # puts codes 4a..4a+3 one per selector nibble at shift
             # 16*(a//2)+2*(a%2). (Straight OR-magic is impossible on
-            # K: the G1-locked mKq bit layout is nibble-spaced.)
+            # K: the mKq bit layout is nibble-spaced.)
             for wl in cutlass.range_constexpr(words):
                 for aa in cutlass.range_constexpr(4):
                     sh = 16 * (aa // 2) + 2 * (aa % 2)

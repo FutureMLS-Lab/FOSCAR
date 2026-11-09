@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """Render the decode-speedup figures from `decode_latency.csv`.
 
 One figure per GPU, each with two panels, one per batch size. Context lengths are
@@ -41,23 +43,41 @@ REF = "#8a8984"
 rows = list(csv.DictReader((HERE / "decode_latency.csv").open()))
 
 
+def _kv_of(row) -> int:
+    return int(row.get("kv") or row["context"])
+
+
+def _gpu_matches(row, gpu: str) -> bool:
+    raw = row.get("gpu", "").lower()
+    if raw == gpu:
+        return True
+    arch = row.get("arch", "").lower()
+    return (gpu == "b200" and ("b200" in raw or arch == "sm100")) or (
+        gpu == "h100" and ("h100" in raw or arch == "sm90")
+    )
+
+
 def us(here, kernel, batch, kv):
     """One cell of one figure. `here` is already narrowed to a GPU and a shape."""
     hit = [r for r in here if r["kernel"] == kernel
-           and int(r["batch"]) == batch and int(r["kv"]) == kv]
+           and int(r["batch"]) == batch and _kv_of(r) == kv]
     return float(hit[0]["us"]) if hit else None
 
 
-def render(gpu, shape, out):
-    here = [r for r in rows if r["gpu"] == gpu and r["shape"] == shape]
+def render(gpu, shape, out, csv_rows=None):
+    data = rows if csv_rows is None else csv_rows
+    here = [r for r in data if _gpu_matches(r, gpu) and r["shape"] == shape]
+    if not here:
+        return
     batches = sorted({int(r["batch"]) for r in here})
-    kv_lens = sorted({int(r["kv"]) for r in here})
+    kv_lens = sorted({_kv_of(r) for r in here})
     present = [s for s in SERIES
                if any(r["kernel"] == s[0] for r in here)]
 
     fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.6), sharey=True)
     fig.patch.set_facecolor("#ffffff")
     top = 1.0
+    low = 1.0
 
     for ax, batch in zip(axes, batches):
         ax.set_facecolor("#ffffff")
@@ -74,6 +94,7 @@ def render(gpu, shape, out):
                     zorder=3)
             if ys:
                 top = max(top, max(ys))
+                low = min(low, min(ys))
 
         ax.axhline(1.0, color=REF, linewidth=1.2, linestyle=(0, (4, 3)), zorder=2)
         ax.annotate("FlashInfer bf16", xy=(0, 1.0), xytext=(0, 6),
@@ -92,9 +113,10 @@ def render(gpu, shape, out):
             ax.spines[side].set_color(GRID)
         ax.tick_params(colors=INK_2, labelsize=8, length=3, width=0.8)
 
-    # Fit the axis to the data: the bf16 reference at 1.00 always stays in view, and
-    # the top is the highest point plus a little headroom rather than a fixed 5.0.
-    axes[0].set_ylim(0.95, top * 1.08)
+    # Fit the axis to the data: the bf16 reference at 1.00 and any sub-1.00 points
+    # stay in view, and the top is the highest point plus a little headroom.
+    bottom = min(0.95, low * 0.95)
+    axes[0].set_ylim(bottom, top * 1.08)
     axes[0].yaxis.set_major_locator(MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10]))
     axes[0].yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
     axes[0].set_ylabel("speedup over FlashInfer bf16", color=INK_2, fontsize=9)
@@ -106,11 +128,17 @@ def render(gpu, shape, out):
 
     fig.tight_layout(rect=(0, 0.08, 1, 1))
     fig.savefig(out, dpi=200, facecolor="#ffffff")
+    plt.close(fig)
     print(f"wrote {out}")
 
 
-render("b200", "qwen3-8b", DOCS / "decode-latency-b200.png")
-render("h100", "qwen3-8b", DOCS / "decode-latency-h100.png")
-render("b200", "inkling", DOCS / "decode-latency-b200-inkling.png")
-render("b200", "muse-spark", DOCS / "decode-latency-b200-muse-spark.png")
-render("h100", "muse-spark", DOCS / "decode-latency-h100-muse-spark.png")
+def main() -> None:
+    render("b200", "qwen3-8b", DOCS / "decode-latency-b200.png")
+    render("h100", "qwen3-8b", DOCS / "decode-latency-h100.png")
+    render("b200", "inkling", DOCS / "decode-latency-b200-inkling.png")
+    render("b200", "muse-spark", DOCS / "decode-latency-b200-muse-spark.png")
+    render("h100", "muse-spark", DOCS / "decode-latency-h100-muse-spark.png")
+
+
+if __name__ == "__main__":
+    main()

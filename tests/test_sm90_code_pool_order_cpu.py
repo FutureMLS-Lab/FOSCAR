@@ -1,16 +1,14 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The SM90 code-pool orders (`_sm90/serving_cache.py`, CODE POOL ORDERS), on a CPU.
 
 IntPingPongDecodeSm90 reads the chunk16 order, and the row order is the packers'
 thread-row layout. Both hold the same bytes per (page, kv-head) block, so a pool in the
 wrong order decodes to finite, plausible values and raises nothing unless its SHAPE is
 checked. These tests pin the definition of the order, the refusal that names it, and that
-the pool builders copy whichever order they are given. The kernel-side read and the refusal inside `__call__`
-need an H100, and `scripts/test_pingpong_quant_flex.py` and
-`scripts/test_wrapper_quant_sm90_compile.py` gate those.
+the pool builders copy whichever order they are given.
 
-`serving_cache.py` is loaded from its file with stub parent packages, the way
-`test_ours_flex_adapter_cpu.py` loads it, because importing the package imports the DSL.
+`serving_cache.py` is loaded from its file with stub parent packages, because importing
+the package imports the DSL.
 """
 import ast
 import importlib.util

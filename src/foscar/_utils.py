@@ -153,8 +153,7 @@ def get_capabilities(device: Optional[torch.device] = None) -> dict:
         # (page, kv-head) of 64 tokens.
         "dtypes": (["float8_e4m3fn"] if sm100 else ["bfloat16"]) if supported else [],
         # The running architecture's accepted set from `_ACCEPTED_HEAD_DIMS`, comma-joined
-        # ("128,256" on SM90, "128" on SM100): `PagedDecodeWrapper` refuses everything
-        # else, and the kernels raise below 128.
+        # ("64,128,256" on SM90 and SM100): `PagedDecodeWrapper` refuses everything else.
         "head_dims": (",".join(str(d) for d in _ACCEPTED_HEAD_DIMS[arch])
                       if supported else ""),
         "page_sizes": [64] if supported else [],

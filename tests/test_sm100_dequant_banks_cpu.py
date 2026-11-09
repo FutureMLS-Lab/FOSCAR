@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """Lane maps of the Blackwell kernel's dequant streams, costed in the shared bank model.
 
 The dequant warpgroup of `IntDecodeSm100` runs a K stream on warps 0-1 and a V stream on
@@ -9,8 +9,7 @@ stream warp, for INT2 and INT4, K and V, at head tiles 4 and 8, at all eight ope
 rows (address bits 7-9, the bits a K-major swizzle reads) and all eight code-ring placements
 modulo 1,024, and costs each one in `tests/_smem_banks.py`, the suite's measured bank model.
 
-THE RULE IT ENFORCES (`docs/kernel/int_fold_decode.md`, "Shared-memory bank conflicts in the
-dequant streams"). Every code load and every deposit is at ncu's ideal, with one documented
+THE RULE IT ENFORCES. Every code load and every deposit is at ncu's ideal, with one documented
 floor: the INT2 deposits write the padded e2m1 operand the `kind::f8f6f4` MMA reads from shared
 memory, 8 payload bytes in every 16, so their payload reaches only 16 of the 32 banks, a
 wavefront carries at most 64 payload bytes, and a warp's 256 payload bytes take 4 wavefronts
@@ -882,11 +881,11 @@ def test_the_retired_full_row_v_load_is_8_over_4():
 
 
 def test_the_pre_95_token_row_v_load_is_16_over_4():
-    """Before #95 the MN-major INT4 V stream gave each thread one whole 64-byte token row,
+    """The earlier MN-major INT4 V stream gave each thread one whole 64-byte token row,
     loaded as four 16-byte loads, so each quarter warp read 16 bytes at a 64-byte lane stride,
-    on 2 of the 8 16-byte bank groups: 16/4 at every code placement. ncu measured exactly
-    that, 16 wavefronts per execution against 4 at each of the 16 V-stream LDS.128 sites of
-    the pre-#95 kernel (`fecfff3`), on 2026-09-25. The aligned layout reads the same token
+    on 2 of the 8 16-byte bank groups: 16/4 at every code placement. ncu measured
+    16 wavefronts per execution against 4 at each of the 16 V-stream LDS.128 sites of
+    that layout. The aligned layout reads the same token
     rows with the K stream's chunk ownership, which `test_every_int4_load_and_deposit_is_at_
     its_ideal` holds at 4/4."""
     for code in CODE_RING_STARTS:

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """GPU kernel time for one decode call, from CUPTI activity records.
 
 A call's latency is the device time of every kernel it launches, summed over one

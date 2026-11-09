@@ -31,6 +31,9 @@ Redistributed: QuACK
 `src/foscar/_vendor/quack/` redistributes a minimal subset of QuACK
 (https://github.com/Dao-AILab/quack), BSD 3-Clause License.
 Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+Copyright (c) 2025-2026, Vijay Thakkar, Tri Dao.
+Copyright (c) 2025-2026, QuACK team.
+Copyright (c) 2025, Tri Dao.
 
 Changes from the upstream work: internal imports were rewritten to the
 `foscar._vendor` package path, and the package `__init__.py` files were
@@ -43,7 +46,9 @@ Redistributed: flash-attention (cute submodule)
 
 `src/foscar/_vendor/flash_attn/cute/` redistributes a minimal subset of
 flash-attention (https://github.com/Dao-AILab/flash-attention), BSD 3-Clause
-License. Copyright (c) 2025, Tri Dao.
+License.
+Copyright (c) 2025, Tri Dao.
+Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 Changes from the upstream work: internal imports were rewritten to the
 `foscar._vendor` package path, and the package `__init__.py` files were

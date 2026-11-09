@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """Every benchmarked implementation as a zero-argument callable.
 
 Each builder receives one problem, converts it to the cache format its kernel
@@ -251,10 +253,19 @@ REGISTRY = {
 
 def supported(name: str, problem) -> bool:
     """Whether this kernel builds for this shape on this device."""
+    q_heads, kv_heads = problem["q_heads"], problem["kv_heads"]
+    if kv_heads < 1 or q_heads < kv_heads or q_heads % kv_heads != 0:
+        return False
+    ratio = q_heads // kv_heads
     if name.startswith("ours_"):
         accepted = [int(d) for d in foscar.get_capabilities()["head_dims"].split(",")
                     if d]
         if problem["head_dim"] not in accepted:
+            return False
+        # QuantKVCache.append is used by build_ours, which supports head_dim in (64, 128) on SM100.
+        if problem["arch"] == "sm100" and problem["head_dim"] not in (64, 128):
+            return False
+        if problem["arch"] == "sm90" and ratio > 8 and ratio % 8 != 0:
             return False
     if name.startswith("trtllm_"):
         return problem["arch"] == "sm100" and problem["page_size"] == 64

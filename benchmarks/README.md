@@ -1,7 +1,7 @@
 # Benchmarks
 
-Decode latency for this package and for the two kernels it is compared against,
-measured by one harness on one GPU in one process.
+Decode latency for this package and for the three baseline columns it is compared
+against, measured by one harness on one GPU in one process.
 
 ```sh
 pip install -e ".[bench]"                       # adds FlashInfer 0.7.3
@@ -38,17 +38,17 @@ NVRTC rather than issued as a `torch` fill.
 Every column of a cell decodes the same K, V and page table. Each converts them
 to the cache format its own kernel reads, before timing starts.
 
-The three FlashInfer columns are Blackwell-only for the TensorRT-LLM kernels; on
-Hopper the harness reports them as skipped. The extra pins FlashInfer 0.7.3,
+The two TensorRT-LLM columns (`trtllm_fp8`, `trtllm_nvfp4`) are Blackwell-only;
+on Hopper the harness reports them as skipped. The extra pins FlashInfer 0.7.3,
 the release the published columns were measured with: a later one moves its
 decode kernels, and its numbers would not be the same comparison.
 
 ## Output
 
 One CSV row per cell: GPU, architecture, shape, batch, context, the shape's head
-counts and head dimension, kernel, microseconds, and the kernels the call
-launched. `decode_latency.csv` is the published table; `plot_decode.py` renders
-the figures in `docs/` from it.
+counts, head dimension and tensor-parallel width, kernel, microseconds, and the
+kernels the call launched. `decode_latency.csv` is the published table;
+`plot_decode.py` renders the figures in `docs/` from it.
 
 ## Adding a shape
 

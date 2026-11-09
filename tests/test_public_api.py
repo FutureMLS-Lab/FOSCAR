@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 # tests/test_public_api.py
 """The public surface: exports, and the cache layout and cache objects.
 
@@ -33,6 +35,7 @@ def test_public_surface():
 
 
 def _layout(arch, bits=4, **kw):
+    pytest.importorskip("cutlass", reason="requires nvidia-cutlass-dsl")
     kw.setdefault("head_dim", D)
     kw.setdefault("num_kv_heads", 8)
     return QuantKVLayout._create(arch, bits=bits, **kw)
@@ -42,6 +45,7 @@ def _layout(arch, bits=4, **kw):
 def fake_cuda(monkeypatch):
     """Stand in for `torch.cuda`: `caps[i]` is device i's capability, `current[0]` the current
     device. The capability cache is cleared before and after."""
+    pytest.importorskip("cutlass", reason="requires nvidia-cutlass-dsl")
     caps, current = {}, [0]
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda i: caps[i])
     monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
@@ -54,6 +58,7 @@ def fake_cuda(monkeypatch):
 
 @pytest.mark.parametrize("bits", [2, 4])
 def test_production_orders_are_the_readers_answers(bits):
+    pytest.importorskip("cutlass", reason="requires nvidia-cutlass-dsl")
     from foscar._sm100.int_fold_decode import IntDecodeSm100
     from foscar._sm90.int_decode_pingpong import IntPingPongDecodeSm90
 
@@ -137,6 +142,7 @@ def test_both_arches_take_either_scale_dtype_at_128():
 
 @pytest.mark.parametrize("bits", [2, 4])
 def test_blackwell_d256_has_only_the_whole_head_eager_layout(bits):
+    pytest.importorskip("cutlass", reason="requires nvidia-cutlass-dsl")
     from foscar._append_core import envelope_refusal
     layout = _layout("sm100", bits, head_dim=256)
     assert layout.k_quant == layout.v_quant == ("token", 256)
@@ -262,6 +268,7 @@ def stub_dsl(monkeypatch):
     """Stand in for the CuTe DSL's compile target: returns the stub, whose `envar.arch` a
     test sets, with the per-process cache of the target cleared before, after every change
     (`retarget`) and after the test, so no stub value outlives it."""
+    pytest.importorskip("cutlass", reason="requires nvidia-cutlass-dsl")
     from cutlass.cutlass_dsl import CuTeDSL
 
     class Dsl:
@@ -641,6 +648,7 @@ def test_the_prequantized_saturation_range_is_the_quantizing_writers(bits):
     """`scale_range(qmax)` is the f32 scale `append` stores for a constant row, div.rn(1e-8,
     qmax), and for a row spanning the whole input envelope, div.rn(2^65, qmax), each as torch's
     correctly rounded f32 division gives it: the bounds the prequantized write saturates to."""
+    pytest.importorskip("cutlass", reason="requires nvidia-cutlass-dsl")
     from foscar._append_core import INPUT_ENVELOPE, scale_range
     qmax = (1 << bits) - 1
     lo, hi = scale_range(qmax)

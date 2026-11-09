@@ -16,3 +16,6 @@ venv/
 # local scratch
 tmp/
 *.local
+.DS_Store
+results.csv
+benchmarks/results.csv

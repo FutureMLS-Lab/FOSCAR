@@ -40,7 +40,7 @@ WHEN IT STANDS ASIDE. Whenever the DSL is asked to dump PTX, cubin or IR
 tiling report (``FOLD_TRACE_TILING``): those gates' evidence is the trace itself,
 and the variable's presence is what counts, not its value. Whenever
 ``cutedsl_profiling`` has been imported, because an instrumented kernel bakes
-session state into the object. Whenever ``CUTEDSL_DECODE_KERNEL_CACHE=0``, which a
+session state into the object. Whenever ``FOSCAR_KERNEL_CACHE=0``, which a
 caller sets when its claim is that a configuration traces or that processes compile
 independently. And whenever the cache root cannot be created or locked, because a
 benchmark must not fail on a full or read-only disk. In every one of those cases
@@ -56,13 +56,12 @@ is returned and the failure is recorded. ``record_of``, ``provenance``, ``record
 and ``inventory`` expose, per kernel, whether it was traced, loaded or left
 uncached, with the object's sha256, so a benchmark artifact can say which.
 
-WHAT THIS DOES NOT COVER. Callers that invoke ``cute.compile`` directly, such as the
-static-shape anchor and numerics scripts, are not
-cached; they compile concrete tensor shapes per cell and would need to compile through
-``compile_constructed`` to benefit. A benchmark sweep takes every kernel it
-times from this cache, an SM90 arm's through ``compile_constructed`` included. The SM90
-SASS census sets ``CUTE_DSL_KEEP``, which stands the cache aside, so that every kernel it
-compiles is traced and its PTX is written.
+WHAT THIS DOES NOT COVER. Callers that invoke ``cute.compile`` directly with
+concrete tensor shapes rather than compiling through ``compile_constructed``,
+``compile_fold`` or ``compile_splitk_combine`` are not cached. A benchmark sweep
+takes every kernel it times from this cache, an SM90 arm's through
+``compile_constructed`` included. Setting ``CUTE_DSL_KEEP`` stands the cache
+aside so that every kernel compiled is traced and its PTX is written.
 """
 from __future__ import annotations
 
@@ -81,11 +80,11 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 #: ``0`` (or ``false`` / ``off`` / ``no``) turns the on-disk layer off for the process.
-ENABLE_ENV = "CUTEDSL_DECODE_KERNEL_CACHE"
+ENABLE_ENV = "FOSCAR_KERNEL_CACHE"
 #: Overrides the cache root. The default is ``$XDG_CACHE_HOME/foscar/kernel-cache``
 #: or ``~/.cache/foscar/kernel-cache``. Put it on local disk on a box whose home
 #: is NFS.
-DIR_ENV = "CUTEDSL_DECODE_KERNEL_CACHE_DIR"
+DIR_ENV = "FOSCAR_KERNEL_CACHE_DIR"
 #: Environment variables whose PRESENCE means the caller needs a real trace: the DSL
 #: dump and dry-run knobs (the fingerprint gates fail closed on "no PTX written"), and
 #: the SM100 tiling report, which is printed from inside the trace.
@@ -195,7 +194,7 @@ def status() -> dict:
     """Whether this process may use the disk cache, and why not if not.
 
     Read at every call rather than once at import, so a gate that sets
-    ``CUTEDSL_DECODE_KERNEL_CACHE=0`` after importing the package is still honoured.
+    ``FOSCAR_KERNEL_CACHE=0`` after importing the package is still honoured.
     A bypass variable counts as set when it is present, whatever its value: an empty
     ``CUTE_DSL_KEEP`` still tells the DSL to keep something.
     """

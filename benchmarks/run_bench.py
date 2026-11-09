@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """Measure the decode grid in `bench.yaml` and write one CSV row per cell.
 
     python benchmarks/run_bench.py                       # every shape and kernel

@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 Donglin Zhuang (standalone foscar adaptation).
 # SPDX-License-Identifier: BSD-3-Clause
+# Adapted from FlashInfer's CuTe DSL attention modules (see NOTICE).
 
 import math
 from typing import Tuple

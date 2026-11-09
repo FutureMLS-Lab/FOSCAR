@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """CPU-only regression tests for the SM100 quant-flex scale-pool dtype contract."""
 
 import importlib.util
@@ -158,7 +160,7 @@ def _f32_of_bits(bits):
 def test_pscale_lp_integer_formula_equals_the_float_formula(fold_runtime):
     """The writer, the Blackwell decode and `v_max_hist_of` bin a page maximum with
     `vmax_bucket`, and the decode turns the highest bin into `pscale_lp_of_bucket`; for
-    every x >= 1e-30 that must equal floor(log2(448 / x)), main's host formula.
+    every x >= 1e-30 that must equal floor(log2(448 / x)), the exact host formula.
 
     Every binade that holds values >= 1e-30, at the mantissa fields where the floor
     can change (0x600000 is 1.75, where 448 / x crosses a power of two) and at
@@ -323,7 +325,7 @@ def test_writer_protocol_keeps_the_table_the_histogram_of_the_cells(fold_runtime
     (`RAW_WORDS`, sign-set and non-finite ones included, with the table recounted over them).
     Random cells, values, duplicates and interleavings: once every update has settled, the table
     equals `v_max_hist_of` of the cells, word for word. On the states the writer and `_adopt`
-    produce, the decode's exponent is then main's.
+    produce, the decode's exponent equals the exact host formula.
     """
     runtime = fold_runtime
     rng = random.Random(3)
@@ -370,8 +372,8 @@ def test_writer_protocol_keeps_the_table_the_histogram_of_the_cells(fold_runtime
                 hist[b] = (hist[b] + delta) % (1 << 32)
         want = _hist_by_hand(runtime, cells)
         assert [h % (1 << 32) for h in hist] == want, (trial, cells, ops)
-        # and on writer and adopted states the decode's exponent is main's: 135 - max(top bin,
-        # floor bin) against floor(log2(448 / max(max s_v, 1e-30)))
+        # and on writer and adopted states the decode's exponent equals the exact host formula:
+        # 135 - max(top bin, floor bin) against floor(log2(448 / max(max s_v, 1e-30)))
         if trial % 3 != 2:
             top = max([b for b, h in enumerate(want) if h] + [runtime.PSCALE_FLOOR_BUCKET])
             live = [_f32_of_bits(c) for c in cells if c & 0x7FFFFFFF]

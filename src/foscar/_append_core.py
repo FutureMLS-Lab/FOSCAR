@@ -38,12 +38,12 @@ ONE RUN, in three steps.
      The writer's input envelope (`INPUT_ENVELOPE`) saturates every value to [-2^64, 2^64];
      saturation is monotone, so it is applied to the minimum and maximum, and to the values
      themselves only when one lies outside. In f32, z = mn, s = div.rn(max(mx - z, 1e-8), qmax) and
-     q = clamp(cvt.rni(div.rn(x - z, s)), 0, qmax), which is `quant_ref.quantize_grouped` on
-     the CPU: no step is a product, so nothing can be contracted into an fma
-     (`_store_quantized` says why a dividend floor changes no q). Each quantized value goes to
-     shared memory as one byte, at [in-page position][channel] of `sQk` / `sQv` (rows padded by
-     16 bytes, so the reads of step 3 spread across banks). The group's first lane stores the
-     token's scale records, rounded to the pool's dtype; the codes always use the f32 scale.
+     q = clamp(cvt.rni(div.rn(x - z, s)), 0, qmax): no step is a product, so nothing can be
+     contracted into an fma (`_store_quantized` says why a dividend floor changes no q). Each
+     quantized value goes to shared memory as one byte, at [in-page position][channel] of
+     `sQk` / `sQv` (rows padded by 16 bytes, so the reads of step 3 spread across banks). The
+     group's first lane stores the token's scale records, rounded to the pool's dtype; the
+     codes always use the f32 scale.
   2. A CTA barrier, then on Blackwell the tail clear (below) when the run starts its page at
      position 0 and ends before the page does, and thread 0 issues the run's atomic on
      `v_page_max` unless the update would change nothing (below). Hopper clears those tails in
@@ -195,7 +195,7 @@ GROUP_CHANNELS = 16
 #: two for a warp per token (D / 32 values a lane), one for a group (16 values a lane), which
 #: keeps the registers within eight CTAs per SM.
 PASSES_IN_FLIGHT = {4: 1, 8: 1, 16: 1, 32: 2}
-#: The clamp of a token's range before it is divided, as `quant_ref.quantize_grouped` has it.
+#: The clamp of a token's range before it is divided by qmax.
 S_CLAMP = 1.0e-8
 #: The writer's input envelope: every K and V element is saturated to
 #: [-2^64, 2^64] before it is quantized, so mx - mn, z / s and the INT4 x512 of the Blackwell
@@ -404,8 +404,7 @@ def envelope_refusal(layout, arch):
         return f"num_kv_heads must be at least 1; got {layout.num_kv_heads}"
     k_quant, v_quant = tuple(layout.k_quant), tuple(layout.v_quant)
     if k_quant[0] == "channel" or v_quant[0] == "channel":
-        return ("a channel-wise K or V is written in whole quantization groups by "
-                "append_groups (PR 3), not by the per-token append")
+        return "a channel-wise K or V is not supported by the per-token append writer"
     heads = (64, 128, 256) if arch == "sm90" else (64, 128)
     if D not in heads:
         return f"the {arch} writer serves head_dim in {heads}; got {D}"
@@ -423,7 +422,7 @@ def envelope_refusal(layout, arch):
     else:
         allowed = ("f32",)
     if name not in allowed:
-        return (f"the scale pool of this pair is {' or '.join(allowed)} (plan section 3.2); "
+        return (f"the scale pool of this pair is {' or '.join(allowed)}; "
                 f"got {layout.scale_dtype}")
     return None
 

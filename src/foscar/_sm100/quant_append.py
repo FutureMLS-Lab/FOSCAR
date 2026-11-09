@@ -2,14 +2,13 @@
 """QuantAppendSm100: the serving cache write for `IntDecodeSm100`, on Blackwell.
 
 One launch per layer quantizes new K and V tokens and writes them into the global-memory pools
-the Blackwell decode reads, and keeps `v_page_max` with its count table `v_max_hist`
-(docs/SERVING_READINESS.md, sections 3, 4 and 6.2). The page runs, the quantization, the scale
-records, the tail clear and the page maximum are `_append_core.QuantAppendBase`'s; this module
-adds the Blackwell code pools.
+the Blackwell decode reads, and keeps `v_page_max` with its count table `v_max_hist`. The page
+runs, the quantization, the scale records, the tail clear and the page maximum are
+`_append_core.QuantAppendBase`'s; this module adds the Blackwell code pools.
 
 THE CODE POOLS, in the production layout the reader's predicates name
 (`IntDecodeSm100.k_pool_is_permuted` and `v_pool_token_rows`; `_sm100/code_layout.py`). V is
-stored exactly like K (docs/SM100_ALIGNED_KV.md), so the two pools have one shape and one
+stored exactly like K (docs/K_STORE_PERM.md), so the two pools have one shape and one
 within-word order:
     K  uint8 [NP, HKV, 64, D * bits / 8]   one row per token, packing its D channels
     V  uint8 [NP, HKV, 64, D * bits / 8]   the same

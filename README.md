@@ -20,7 +20,7 @@ From a source checkout:
 
 ```sh
 git clone https://github.com/FutureMLS-Lab/FOSCAR.git
-cd foscar
+cd FOSCAR
 pip install -e ".[cu13]"    # CUDA 13: Blackwell, and Hopper
 pip install -e ".[cu12]"    # CUDA 12: Hopper only
 ```
@@ -107,8 +107,11 @@ Accepted pairs, at `head_dim` 128:
 | K | group `D` (default) or `D/2` | token group 64, 128 or 256 |
 | V | group `D` only | token group 64, 128 or 256 |
 
-`QuantKVCache.append` writes token-wise layouts. A channel-wise layout is written
-one complete quantization group at a time, through `append_quantized`.
+At `head_dim` 64 and 256, both architectures build whole-head token-wise K and V
+(`("token", D)` with `float32` scales). `QuantKVCache.append` and
+`append_quantized` write token-wise layouts (at `head_dim` 64, 128 and 256 on
+Hopper, and at `head_dim` 64 and 128 on Blackwell); channel-wise layouts are
+supported in the decode kernels via `QuantKVCache.bind` / `from_buffer`.
 
 ## Support matrix
 
@@ -118,11 +121,11 @@ one complete quantization group at a time, through `append_quantized`.
 | `bits` | 2, 4 | 2, 4 |
 | Q dtype | bf16 | fp8 e4m3 |
 | K/V | packed uint8 pools + scale pool | packed uint8 pools + scale pool |
-| head_dim | 64, 128, 256 | 64, 128, 256 |
+| head_dim | 64, 128, 256 | 64, 128, 256 (256 eager only) |
 | page_size | 64 | 64 |
 | reductions | none, kernel (split-K with LSE merge) | none, kernel (split-K with LSE merge) |
 | KV heads | 1 to 128 at 128 query heads | 1 to 128 at 128 query heads |
-| quantized granularity | token 128/64, channel 64/128/256 | token 128/64, channel 64/128/256 |
+| quantized granularity | token `D` (at 64/128/256); token 64, channel 64/128/256 (at 128) | token `D` (at 64/128/256); token 64, channel 64/128/256 (at 128) |
 
 `get_capabilities()` reports the same set for the running device. Requesting a
 configuration outside it raises `ValueError` or `NotImplementedError` naming what
@@ -189,8 +192,8 @@ bf16 at the same shape, so the dashed line at 1.00 is bf16.
 
 ### H100 (SM90), Qwen3-8B TP1 (HQ=32 HKV=8 D=128)
 
-TensorRT-LLM's `trtllm-gen` decode is Blackwell only, so this table has no
-TensorRT-LLM column.
+TensorRT-LLM's `trtllm-gen` decode is Blackwell only, so the H100 tables have no
+TensorRT-LLM columns.
 
 ![Decode speedup over FlashInfer bf16 on H100, at batch 1 and 8](docs/decode-latency-h100.png)
 
@@ -225,7 +228,7 @@ TensorRT-LLM column.
 One query token per request. K and V are quantized token-wise, one scale and one
 offset per token over the whole head dimension, both in FP32.
 Page size 64, paged cache. Q is fp8 e4m3 on the B200 tables and bf16 on the H100
-one; FlashInfer is bf16 everywhere. Every column of a row was timed by the same
+tables; FlashInfer is bf16 everywhere. Every column of a row was timed by the same
 harness on the same GPU model. The number is the CUDA kernel span from CUPTI
 over a cold L2, the median of the fully observed iterations, so it excludes host
 dispatch and the paged-attention wrapper.

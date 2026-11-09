@@ -88,27 +88,27 @@ lane that wrote it, so it needs none.
 
 HEAD DIMENSION
 
-The kernel builds head_dim 128 and 256 (`quant_layout.SM90_HEAD_DIMS`), and the constructor
+The kernel builds head_dim 64, 128 and 256 (`quant_layout.SM90_HEAD_DIMS`), and the constructor
 chooses the body at trace time through `group_channels`, which every site that differs reads:
 
   whole-D body (D=128, `group_channels` None): the D=128 form. One
       QK wgmma group reads a 32-word register A operand unpacked from the thread's whole K row,
       two 64-channel accumulators hold the output, and one PV group covers both halves.
-  grouped body (D=256, `group_channels` 128): both contractions run as D/128 groups of 128
-      channels, each doing the whole-D body's work on its channels. A thread copies one
+  grouped body (D=64 or D=256, `group_channels` min(D, 128)): both contractions run as D/group_channels
+      groups, each doing the whole-D body's work on its channels. A thread copies one
       group's packed words of its K or V row from the shared-memory stage at a time
-      (`_code_group_words`, `_load_code_group`), unpacks them into the same register A
+      (`_code_group_words`, `_load_code_group`), unpacks them into the register A
       operand, issues the group's wgmmas and waits for them to retire before the next group
       rewrites the operand, so the A operand and the live packed words stay at one group's
       worth. The QK groups chain into one score accumulator; each PV group's sums join its
       own output halves of a (4, D/64) f32 register tensor, the only register state that
       grows with D. The lc wgmma runs after the PV groups, from an A operand loaded per tile
       (`pv_tile_restart`). The epilogue stashes, merges and stores every output half, and the
-      fused combine runs its second pass once per 128 channels.
+      fused combine runs its second pass once per `group_channels` channels.
 
-At D=256 the constructor admits one layout: token-wise K and V over all 256 channels, the
-fold, an f32 scale pool and 2 or 4 ring stages, and resolves the default depth to 2 at both
-widths. `quant_layout.sm90_wide_refusal` names every
+At D=64 and D=256 the constructor admits one layout: token-wise K and V over all D channels, the
+fold, an f32 scale pool and 2 or 4 ring stages, and resolves the default depth to 4 at D=64 and
+2 at D=256. `quant_layout.sm90_wide_refusal` names every
 other quantization pair, scale dtype, fold setting and ring depth, and the constructor raises
 ValueError with it before `validate_quant_flex` and every assert. The arguments that layout
 leaves free (the bit width, `fused_combine`, `phase_lock`, `int2_fast_mantissa_injection`,
@@ -580,9 +580,9 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
     """Ping-pong int2/int4 paged-decode (SM90): two symmetric full-attention consumer WGs
     per CTA over interleaved tiles + CTA-tail log2-max merge.  See the module docstring for
     the design.
-    Constraints: head_dim in {128, 256} (256 in one layout, the module docstring's HEAD DIMENSION),
-    q_head_tile=8, page_size=64, num_stages EVEN, min_blocks_per_sm=2 (32/104 setmaxnregs split
-    built in).
+    Constraints: head_dim in {64, 128, 256} (64 and 256 in the whole-head token-wise layout, the
+    module docstring's HEAD DIMENSION), q_head_tile=8, page_size=64, num_stages EVEN,
+    min_blocks_per_sm=2 (32/104 setmaxnregs split built in).
 
     ``q_head_tile`` is the number of query rows one CTA packs, fixed at eight
     by the inline m64n8k16 WGMMA. ``heads_per_kv`` is the logical GQA ratio.
@@ -648,10 +648,11 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
                                     validate_quant_flex)
         # TMA ring depth (correctness-neutral prefetch), resolved here, before the head-dimension
         # envelope below, which admits a depth.
+        #   D=64: 4 at both widths (compact code rows fit a 4-stage ring within SMEM).
         #   D=128: bit-aware. int2 takes 4 (its small codes leave SMEM headroom, and deeper
         #     prefetch hides the memory latency) and int4 takes 2 (2x-larger codes, closer to
         #     bandwidth-bound).
-        #   Any other admitted head dimension (256): 2 at both widths. At the planner's split, B in
+        #   D=256: 2 at both widths. At the planner's split, B in
         #     {1, 8, 128} and KV in {8192, 16384}, 4 stages is slower than 2 at five shapes at int4
         #     (0.9-4.7%) and three at int2 (0.4-3.5%), and faster at one at each width (1.1%, 1.3%),
         #     so the rule, 4 only where it is faster somewhere and slower nowhere, keeps 2.
@@ -683,8 +684,8 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # GROUPED body, which cuts the QK contraction and the PV contraction into groups of
         # this many channels, each group doing the whole-D body's work on its channels, so
         # the register A operands and the packed words a thread holds at one time stay at one
-        # group's worth and only the D/16 f32 output accumulators grow with D. 128 at both
-        # widths: the SASS census of the launched D=256 binaries passes at 128.
+        # group's worth and only the D/16 f32 output accumulators grow with D (64 at D=64,
+        # 128 at D=256).
         self.group_channels = None if head_dim == 128 else min(head_dim, 128)
         self.k_axis, self.k_group = k_quant
         self.v_axis, self.v_group = v_quant
@@ -2652,7 +2653,6 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # at HQ = 4096, i.e. HKV = 512 at 8 query heads per kv head, and D = 128). Codes and
         # token-wise scales are TMA copies that take the page as a coordinate. The head, channel
         # and token-in-page terms are bounded by the tile and stay 32-bit.
-        # tests/test_decode_wide_offsets_cpu.py holds every indexing site to this.
         cnt_index = Int64(batch_idx) * q_group_count + q_group_idx   # fused-combine split counter cell
         thread_idx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -2926,9 +2926,9 @@ class IntPingPongDecodeSm90(GQAPagedDecode):
         # mSL: int32 [B] per-request kv lengths (ragged batching; final tile masked in-kernel).
         # bmm1 = softmax scale (folded at use with the K fold), bmm2 = output scale.
         # The GQA ratio is NOT a launch argument: it is `heads_per_kv`, fixed at
-        #      construction, and the constructor refuses a ratio above PG because the
-        #      m64n8 wgmma only produces PG head-columns. An operand could not be
-        #      checked, and a larger ratio would silently drop the heads at and above PG.
+        #      construction; each CTA packs `heads_per_tile = min(heads_per_kv, PG)`
+        #      query rows and the grid launches `head_tiles = heads_per_kv // PG` CTAs
+        #      along the head-tile dimension when `heads_per_kv > PG`.
         D, Nkv, PG = self.head_dim, self.page_size, self.q_head_tile
         sQ_layout = sm90_utils.make_smem_layout(BF16, LayoutEnum.ROW_MAJOR, (PG, D))       # gemm0 B operand (descriptor-compatible)
         sP_layout = sm90_utils.make_smem_layout(BF16, LayoutEnum.ROW_MAJOR, (PG, Nkv), 2)  # gemm1 B operand (bf16)

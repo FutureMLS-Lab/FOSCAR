@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 # tests/test_utils.py
 import pytest
 import torch
@@ -5,12 +7,13 @@ from foscar import _utils
 
 
 def test_torch_to_cutlass_known_dtypes():
-    import cutlass
+    cutlass = pytest.importorskip("cutlass", reason="requires nvidia-cutlass-dsl")
     assert _utils.torch_to_cutlass(torch.bfloat16) is cutlass.BFloat16
     assert _utils.torch_to_cutlass(torch.float16) is cutlass.Float16
 
 
 def test_torch_to_cutlass_rejects_unsupported():
+    pytest.importorskip("cutlass", reason="requires nvidia-cutlass-dsl")
     with pytest.raises(TypeError):
         _utils.torch_to_cutlass(torch.float64)
 

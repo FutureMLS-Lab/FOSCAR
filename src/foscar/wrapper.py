@@ -67,24 +67,21 @@ _QUANT_BITS = (2, 4)
 #: package, and `tests/test_public_api.py` holds the two equal.
 _QUANT_PAGE_SIZE = 64
 
-# The decode kernels are specialized to the head dimensions they tile, and this is NOT a
-# "multiple of 64" envelope. The two architectures reach that from different mechanisms,
-# so do not state one of them as if it covered both:
-#   SM90 builds 128 in every layout, and 256 in one: token-wise K and V over all 256
-#   channels, the fold, an f32 scale pool and 2 or 4 stages (`quant_layout.sm90_wide_refusal`).
+# The decode kernels are specialized to the head dimensions they tile (64, 128, 256).
+# The two architectures reach that from different mechanisms, so do not state one of
+# them as if it covered both:
+#   SM90 builds 128 in every layout, and 64 / 256 with whole-head token-wise K and V,
+#   the fold, an f32 scale pool and 2 or 4 stages (`quant_layout.sm90_wide_refusal`).
 #   At 256 it cuts both contractions into 128-channel groups and tiles its output
 #   accumulators and its fused split-K epilogue by D.
-#   SM100 tiles D in complete groups of 128. The public D256 layout is narrower:
-#   whole-head token-wise K/V, f32 scales and default settings, in eager mode.
+#   SM100 builds 128 in every layout, and 64 / 256 with whole-head token-wise K/V,
+#   f32 scales and default settings (64 in both eager and graph modes; 256 in eager mode).
 # Both constructors RAISE rather than assert, so `python -O` cannot drop the guard.
 # The accepted set is therefore per architecture, keyed by the names `_utils.get_capabilities`
-# reports. A value is listed once a kernel implements AND a run covers it, or a layout admits a
-# configuration that writes out of range (below 128) or that nothing has measured:
-#   "sm90" lists 256 because the SM90 kernel implements it, its ring depth and phase lock
-#   are measured at that head dim, and its planner has a kernel-side D=256 entry fitted on
-#   its own split ladder (``_sm90/scheduler.py``, PINGPONG_MODEL).
-#   "sm100" lists 128 and 256; D256 is covered by correctness and SASS gates.
-#   Graph, append and dequantize keep their D128 envelope.
+# reports:
+#   "sm90" lists 64, 128 and 256; its planner has head_dim-specific entries in
+#   `_sm90/scheduler.py` (`PINGPONG_MODEL`).
+#   "sm100" lists 64, 128 and 256; CUDA graphs support 64 and 128.
 # `kv_cache.QuantKVLayout.create` refuses anything else, so a plan never sees it.
 # It stays one literal, because tooling reads it from this file's syntax tree with
 # `ast.literal_eval` rather than importing the package.
@@ -363,13 +360,15 @@ _GRAPH_MAX_KV_LEN = 2**31 - 1 - 63
 
 def _graph_tile(arch, layout):
     """The sequence tile of the graph builds of `layout`, in tokens: Hopper's 64-token page, and
-    Blackwell's `resolve_fold_tiling` (256, or 128 for K token-128 with V channel-64), which is
-    also what eager's planner is told (`_plan_quantized_sm100`)."""
+    Blackwell's `resolve_fold_tiling` (256, 512 at D=64 int2, or 128 for K token-128 with V
+    channel-64), which is also what eager's planner is told (`_plan_quantized_sm100`)."""
     if arch == "sm90":
         return _QUANT_PAGE_SIZE
     from ._sm100.fold_runtime import resolve_fold_tiling
 
-    return resolve_fold_tiling(layout.k_quant, layout.v_quant, bits=layout.bits)[0]
+    return resolve_fold_tiling(
+        layout.k_quant, layout.v_quant, head_dim=layout.head_dim, bits=layout.bits
+    )[0]
 
 
 def _graph_bucket(arch, layout, batch, max_kv_len, sm_count):
@@ -406,7 +405,7 @@ def graph_workspace_bytes(max_batch: int, num_qo_heads: int, layout: QuantKVLayo
     if layout.arch != arch:
         raise ValueError(f"the layout was resolved for {layout.arch} and {device} is {arch}")
     if arch == "sm100" and layout.head_dim == 256:
-        raise NotImplementedError("SM100 head_dim=256 is eager-only; CUDA graphs retain D=128")
+        raise NotImplementedError("SM100 head_dim=256 is eager-only; CUDA graphs support head_dim 64 and 128")
     sm_count = get_num_sm(device)
     wave = graph_plan.SPLIT_CTAS_PER_SM[arch] * sm_count
     words = 0
@@ -892,10 +891,10 @@ class PagedDecodeWrapper:
         # The layout's kernel keyword arguments (empty in production), plus the
         # granularity. At D128 whole-head token-wise K/V is left OUT on purpose:
         # the compile key, and therefore the traced kernel, is then byte-for-byte the
-        # default build's. The scale dtype is never passed: the layout
-        # admits only the dtype `quant_cfg_of` resolves without one, asserted below.
-        # compile_fold's constructor defaults are explicitly token-128, so D256 must
-        # forward its whole-head pair even though quant_cfg_of derives it when omitted.
+        # default build's. When the layout's scale_dtype is bfloat16 on a layout that
+        # defaults to f32 scales, sdtype="bf16" is forwarded explicitly.
+        # compile_fold's constructor defaults are explicitly token-128, so D64 and D256
+        # must forward their whole-head pair even though quant_cfg_of derives it when omitted.
         kkw = dict(self._quant_kernel_kwargs)
         if self._head_dim != 128 or k_quant != ("token", self._head_dim) or v_quant != ("token", self._head_dim):
             kkw["k_quant"] = k_quant
@@ -1004,7 +1003,8 @@ class PagedDecodeWrapper:
         production layouts carry nothing.
 
         The scale-pool precision is the layout's ``scale_dtype``, which ``create()`` checked
-        against the granularity (token-wise K over D/2 needs bfloat16, D=256 needs float32).
+        against the granularity (token-wise K over D/2 needs bfloat16, D in (64, 256) needs
+        float32).
         """
         from .quant_layout import quant_block_offsets
         from ._sm90.pingpong_runtime import (
@@ -1157,7 +1157,7 @@ class PagedDecodeWrapper:
             With channel-wise K the kernel first multiplies the query by each channel's K scale
             and rounds the product to its MMA operand (e4m3 on SM100; bf16 on SM90, with the
             softmax scale in it), so its scores, and the LSE, differ from that formula by that
-            rounding (docs/integration.md gives its size). ``o_scale`` is in neither. Every
+            rounding. ``o_scale`` is in neither. Every
             request must have ``seq_len >= 1``:
             a row of length 0 gets an unspecified LSE (and, in SM100's unsplit builds, an
             unspecified output row). The first call with ``lse`` compiles the variant that
@@ -1539,6 +1539,8 @@ class _GraphDecodeWrapper(PagedDecodeWrapper):
         kkw = dict(self._quant_kernel_kwargs)
         if self._head_dim != 128 or (self._k_quant, self._v_quant) != (("token", self._head_dim),) * 2:
             kkw["k_quant"], kkw["v_quant"] = self._k_quant, self._v_quant
+        if self._layout.scale_dtype == torch.bfloat16 and self._k_quant != ("token", self._head_dim // 2):
+            kkw["sdtype"] = "bf16"
         self._reads_v_max_hist = reads_v_max_hist(self._page_size, self._head_dim, kkw)
         graph.decode, applied = _get_compiled_fold_graph_kernel(
             self._page_size, self._num_qo_heads, self._num_kv_heads, self._head_dim, self._bits,

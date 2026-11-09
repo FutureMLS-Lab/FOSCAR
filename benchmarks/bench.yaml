@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 # Decode shapes and the grid to measure them over.
 #
 # A shape is the attention geometry ONE GPU decodes: a model's query-head and
@@ -6,7 +8,7 @@
 #
 # Every column is measured at the same shape, page size and grid, on one GPU,
 # in one process. K and V are quantized token-wise with one FP32 scale and one
-# FP32 offset per group of 128 values, which is the whole head dimension.
+# FP32 offset per token over the whole head dimension.
 
 page_size: 64
 

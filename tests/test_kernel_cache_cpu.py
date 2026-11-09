@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Donglin Zhuang. SPDX-License-Identifier: MIT
 """The persistent kernel cache: its key, its bypasses and its store, without a GPU.
 
 WHAT A CACHE CAN GET WRONG, and which test pins each. A hit that hands back the wrong

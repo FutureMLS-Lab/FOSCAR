@@ -55,11 +55,10 @@ top level. `_utils`, `quant_layout` and `kernel_contract` import nothing from th
 DSL, so `import foscar` works on a machine with no CUDA toolkit installed; the
 DSL is imported at the point a kernel is compiled.
 
-`_sm100/gqa_decode.py` is a split-K reduction library rather than a kernel. `int_fold_decode.py` imports the `GroupedQueryAttentionDecode` class from it and
-uses it as the namespace for the reduction entry points. Two of those dependencies are
-invisible to a search of the import list: `launch_reduction` reaches the kernel through a
-class-qualified call, and `reduction_epilogue` reads `gmem_fmax` as a module global.
-Breaking either dependency fails at trace time, as a broken reduction launch.
+`_sm100/gqa_decode.py` is a split-K reduction library rather than a standalone decode
+kernel. `int_fold_decode.py` imports the `GroupedQueryAttentionDecode` class from it and
+uses it as the namespace for the reduction entry points (`launch_reduction` reaches the
+reduction kernel through a class-qualified call).
 
 ## Architecture dispatch
 
@@ -77,13 +76,13 @@ print(get_capabilities()["arch"])     # "sm90", "sm100" or "unsupported"
 ```
 
 `plan()` refuses anything else before it compiles. It raises `RuntimeError` when torch
-reports no CUDA device, and `ValueError` naming the compute capability when the device is
-neither Hopper nor Blackwell. The decision is stored on the wrapper and selects the
+reports no CUDA device or when the device is neither Hopper nor Blackwell (naming the
+compute capability). The decision is stored on the wrapper and selects the
 planner, the compile entry point and the launch site:
 
 | Device | Kernel | Compile | Launch |
 |---|---|---|---|
-| SM90 (major 9) | `IntPingPongDecodeSm90` | `_sm90/pingpong_runtime.compile_pingpong` | `launch_pingpong` |
+| SM90 (major 9) | `IntPingPongDecodeSm90` | `_sm90/pingpong_runtime.compile_constructed` | `launch_pingpong` |
 | SM100 (10, 0) | `IntDecodeSm100` | `_sm100/fold_runtime.compile_fold` | `launch_fold` |
 
 Feature gating happens in the wrapper, so a refused request
@@ -93,28 +92,34 @@ raises an actionable message before any trace is attempted:
 |---|---|---|
 | `plan()` | `q_len_per_req` other than 1 | `NotImplementedError` |
 | `plan()` | `reduction="atomic"` | `NotImplementedError` |
-| `run()` | `lse=` | `NotImplementedError` |
 | `run()` | `skip_softmax_threshold_scale_factor=` | `NotImplementedError` |
 
 On a supported device, `get_capabilities()` reports the same set: `speculative`,
-`skip_softmax` and `atomic_reduction` are false, and `kv_layouts` is `["NHD"]`.
+`skip_softmax` and `atomic_reduction` are false, and `kv_layouts` is `["QuantKVLayout"]`.
+`run(lse=)` is supported on both architectures and writes the natural-log LSE per
+`(batch, q_head)`.
 
 Each architecture narrows the shared envelope further, and `plan()` raises for the rest.
-SM100 takes fp8 e4m3 Q, accepts head dimension 128, and packs at most 8 Q head rows per
-threadblock. SM90 takes bf16 Q and accepts head dimension 128 or 256, where 256 builds a
-single layout. The [support matrix](../README.md#support-matrix) lists the full set.
+SM100 takes fp8 e4m3 Q and accepts head dimensions 64, 128 and 256 (with 256 eager-only).
+SM90 takes bf16 Q and accepts head dimensions 64, 128 and 256. At head dimensions 64 and
+256 both architectures build whole-head token-wise K and V with float32 scales. The
+[support matrix](../README.md#support-matrix) lists the full set.
 
 ## Wrapper lifecycle
 
 `PagedDecodeWrapper` holds the plan-time state and the compiled kernels. The constructor
-records the workspace tensor and the device taken from it and does nothing else.
+records the workspace tensor, the device taken from it, and `use_cuda_graph`, and does
+nothing else.
 
-`plan()` establishes everything `run()` reads. It validates the problem, converts
-`indptr`, `indices` and `seq_lens` to int32 on the wrapper's device, runs the
+`plan()` establishes everything `run()` reads. In eager mode it validates the problem,
+converts `indptr`, `indices` and `seq_lens` to int32 on the wrapper's device, runs the
 architecture's split-K planner, slices the workspace, and compiles the kernel. The page
 table and sequence lengths are stored on the wrapper, which is why `run()` takes only the
-query and the pools; calling `plan()` again replaces them, and SM90 also builds its own
-2-D block table from the same inputs.
+query and the cache; calling `plan()` again replaces them, and SM90 also builds its own
+2-D block table from the same inputs. In CUDA-graph mode (`use_cuda_graph=True`), `plan()`
+binds a fixed-shape `page_table` and `seq_lens` buffer for one batch bucket and compiles
+the bucket's graph kernel, and `update(lengths)` refreshes the device work list before each
+graph replay (see [SGLang integration](integration.md#cuda-graphs)).
 
 Compilation is keyed on the static configuration: bits, head counts, head dimension, page
 size, quantization granularity, scale-pool precision, reduction mode, output dtype and any
@@ -137,8 +142,8 @@ cache's layout against the planned one, the scale pool's shape against the plann
 dtype against the planned precision, and, on SM100, the declared K pool order. Each of
 those mismatches would otherwise decode to finite but wrong values.
 
-Four read-only properties report what the plan decided: `kv_splits`, `reduction`, `bits`
-and `scale_pool_dtype`.
+Three read-only properties report what the plan decided: `kv_splits`, `reduction` and
+`bits` (and the layout's scale-pool precision is `layout.scale_dtype`).
 
 The reduction mode is resolved differently on the two architectures, and `plan()` enforces
 the difference. On SM100 the mode selects a compile-time epilogue, so the planner chooses
@@ -149,23 +154,22 @@ raises.
 ## Workspace
 
 On SM100 with `reduction="kernel"`, `plan()` carves the caller's `float_workspace_buffer`
-into four float32 views, in this order:
+into three float32 views, in this order:
 
 | View | Shape |
 |---|---|
 | `o_partial` | `[kv_splits, batch, 1, num_qo_heads, head_dim]` |
 | `l_partial` | `[kv_splits, batch, 1, num_qo_heads]` |
 | `m_partial` | `[kv_splits, batch, 1, num_qo_heads]` |
-| `m` | `[batch, 1, num_qo_heads]` |
 
 `plan()` raises `RuntimeError` naming the required byte count when the buffer is too
-small. `run()` fills `m` with `-inf` before every launch, because the kernel reduces into
-it with an atomic max and needs the identity value there. With `reduction="none"` the
-kernel writes straight to the output and no workspace is used.
+small. With `reduction="none"` the kernel writes straight to the output and no workspace
+is used.
 
-SM90 does not use the caller's buffer. `plan()` allocates the kernel's own `o_partial`,
-`lse` and `counters` through `alloc_pingpong_workspace`. `counters` is allocated zeroed
-and must stay zeroed across launches, because the kernel rearms its own cell.
+SM90 uses the caller's `float_workspace_buffer` in CUDA-graph mode and allocates the
+kernel's own `o_partial`, `lse` and `counters` through `alloc_pingpong_workspace` in eager
+mode. `counters` is allocated zeroed and must stay zeroed across launches, because the
+kernel rearms its own cell.
 
 ## Stream binding
 

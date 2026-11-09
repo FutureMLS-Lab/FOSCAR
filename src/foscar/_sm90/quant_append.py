@@ -2,7 +2,7 @@
 """QuantAppendSm90: the serving cache write for `IntPingPongDecodeSm90`, on Hopper.
 
 One launch per layer quantizes new K and V tokens and writes them into the global-memory pools
-the Hopper decode reads (docs/SERVING_READINESS.md, sections 3 and 4). The page runs, the
+the Hopper decode reads. The page runs, the
 quantization, the scale records and the tail clear are `_append_core.QuantAppendBase`'s; this
 module adds the Hopper code pools.
 

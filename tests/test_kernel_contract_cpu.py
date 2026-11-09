@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
 """CPU gates for the constructor contract the two decode kernels share.
 
 `kernel_contract.py` exists because the same argument name would otherwise mean different

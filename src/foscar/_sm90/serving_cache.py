@@ -38,11 +38,12 @@ a block, `code_word_offset` where row word w sits in a whole pool, with the page
 holds.  The pingpong kernel, the serving writer (`quant_append.QuantAppendSm90`) and this
 module's own checks call these, so a head dimension or width has one formula.  They are
 generic in the head dimension D: the layout is defined for any D whose rows are whole chunks
-(D = 128 and 256 at both widths), and the pingpong kernel reads both: at D=256 its grouped body
-copies one 128-channel group of a row at a time (`IntPingPongDecodeSm90._code_group_words`).
+(D = 64, 128 and 256 at both widths), and the pingpong kernel reads all three: at D=64 and D=256
+its grouped body copies one `min(D, 128)`-channel group of a row at a time
+(`IntPingPongDecodeSm90._code_group_words`).
 
 CODE POOL ORDERS.  Thread t's plane-word A-fragment row holds `per` bytes (`code_row_bytes`:
-32 int4 / 16 int2 at D=128, 64 / 32 at D=256).
+16 int4 / 16 int2 at D=64, 32 int4 / 16 int2 at D=128, 64 / 32 at D=256).
 A (page, kv-head) block stores the 128 rows in one of two orders, and the READER decides which:
   "row"      [128, per]           row t contiguous.  No kernel reads this order; it is the
                                   thread-row layout the packers produce and the pool shape
@@ -119,9 +120,9 @@ def code_row_bytes(head_dim, page_size, bits):
     """(K, V) bytes of one warpgroup thread's plane-word row: the `per` of the two code pools.
 
     K: head_dim/16 k-steps x 8 fragment values x bits.  V^T: head_dim/64 output halves of
-    `code_v_half_bytes` each.  At a 64-token page that is 32 / 32 bytes at D=128 int4, 16 / 16 at
-    D=128 int2, 64 / 64 at D=256 int4 and 32 / 32 at D=256 int2.  A head dimension whose rows are
-    not whole 16-byte chunks has no code pool in either order and is refused."""
+    `code_v_half_bytes` each.  At a 64-token page that is 16 / 32 bytes at D=64 int4, 8 / 16 at
+    D=64 int2 (with K padded to one 16-byte chunk in `code_block_shape`), 32 / 32 bytes at D=128
+    int4, 16 / 16 at D=128 int2, 64 / 64 at D=256 int4 and 32 / 32 at D=256 int2."""
     half = code_v_half_bytes(page_size, bits)
     if head_dim <= 0 or head_dim % CODE_V_HALF_CHANNELS:
         raise ValueError(f"head_dim must be a positive multiple of {CODE_V_HALF_CHANNELS} "
