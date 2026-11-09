@@ -10,11 +10,12 @@
 </p>
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2611.09722">Paper</a> ·
-  <a href="#quickstart">Quickstart</a> ·
-  <a href="#benchmarks">Benchmarks</a> ·
-  <a href="docs/integration.md">Integration</a> ·
-  <a href="#citation">Citation</a>
+  <a href="https://arxiv.org/abs/2611.09722"><img src="https://img.shields.io/badge/Paper-arXiv-B31B1B.svg?logo=arxiv&amp;logoColor=white" alt="Paper on arXiv"></a>
+  <a href="#quickstart"><img src="https://img.shields.io/badge/Quickstart-2563A6.svg?logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyLjI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik04IDVsMTEgNy0xMSA3eiIgZmlsbD0id2hpdGUiIHN0cm9rZT0ibm9uZSIvPjwvc3ZnPg%3D%3D&amp;logoColor=white" alt="Quickstart"></a>
+  <a href="#benchmarks"><img src="https://img.shields.io/badge/Benchmarks-16756D.svg?logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyLjI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik00IDE5aDE2TTcgMTV2LTRtNSA0VjZtNSA5VjMiLz48L3N2Zz4%3D&amp;logoColor=white" alt="Benchmarks"></a>
+  <a href="docs/integration.md"><img src="https://img.shields.io/badge/Integration-6554A3.svg?logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyLjI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik0xMiA3bDItMmE0IDQgMCAwIDEgNiA2bC0zIDNtLTUgMy0yIDJhNCA0IDAgMCAxLTYtNmwzLTNtMiA1IDYtNiIvPjwvc3ZnPg%3D%3D&amp;logoColor=white" alt="Integration guide"></a>
+  <a href="#citation"><img src="https://img.shields.io/badge/Cite-BibTeX-555555.svg?logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyLjI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik00IDdoNnY1YzAgMy0yIDUtNSA1di0zYzEuNSAwIDItMSAyLTJINHptMTAgMGg2djVjMCAzLTIgNS01IDV2LTNjMS41IDAgMi0xIDItMmgtM3oiIGZpbGw9IndoaXRlIiBzdHJva2U9Im5vbmUiLz48L3N2Zz4%3D&amp;logoColor=white" alt="Citation in BibTeX"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-32723F.svg?logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyLjI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik0xMiAzbDcgM3Y1YzAgNC0zIDctNyAxMC00LTMtNy02LTctMTBWNnpNOSAxMmwyIDIgNC00Ii8%2BPC9zdmc%2B&amp;logoColor=white" alt="MIT license"></a>
 </p>
 
 FOSCAR provides paged grouped-query attention (GQA) decode kernels for packed INT2 and INT4 KV caches.
