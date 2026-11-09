@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# JIT and profiling artifacts
+*.ncu-rep
+*.nsys-rep
+.cutedsl_cache/
+
+# local scratch
+tmp/
+*.local
+.DS_Store
+results.csv
+benchmarks/results.csv

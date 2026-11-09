@@ -1,0 +1,49 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
+# Decode shapes and the grid to measure them over.
+#
+# A shape is the attention geometry ONE GPU decodes: a model's query-head and
+# KV-head counts divided by the tensor-parallel width it is served at. Batch is
+# requests, not heads, so it is not divided.
+#
+# Every column is measured at the same shape, page size and grid, on one GPU,
+# in one process. K and V are quantized token-wise with one FP32 scale and one
+# FP32 offset per token over the whole head dimension.
+
+page_size: 64
+
+grid:
+  batch: [1, 8]
+  context: [32768, 131072, 262144, 524288]
+
+shapes:
+  qwen3-8b:
+    # Qwen3-8B, served on one GPU.
+    num_qo_heads: 32
+    num_kv_heads: 8
+    head_dim: 128
+    tensor_parallel: 1
+
+  inkling:
+    # Inkling's full-attention layers at TP8: 64 query heads and 8 KV heads
+    # divided by eight. Its sliding-window layers are 64 over 16 at the same
+    # head dimension over a 512-token window, which is a prefill-sized problem.
+    num_qo_heads: 8
+    num_kv_heads: 1
+    head_dim: 128
+    tensor_parallel: 8
+
+  muse-spark:
+    # Muse-Spark-Open-816B-A42B's global attention layers at TP8: 128 query
+    # heads and 16 KV heads divided by eight, at head dimension 64.
+    num_qo_heads: 16
+    num_kv_heads: 2
+    head_dim: 64
+    tensor_parallel: 8
+
+kernels:
+  - ours_int2
+  - ours_int4
+  - flashinfer_bf16
+  - trtllm_fp8
+  - trtllm_nvfp4

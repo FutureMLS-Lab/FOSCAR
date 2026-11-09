@@ -1,0 +1,144 @@
+# Copyright (c) 2026 Donglin Zhuang
+# SPDX-License-Identifier: MIT
+"""Render the decode-speedup figures from `decode_latency.csv`.
+
+One figure per GPU, each with two panels, one per batch size. Context lengths are
+placed at even spacing rather than by value, so the four points read at the same
+interval. The y axis is the speedup over FlashInfer bf16 at the same shape,
+which is bf16's latency divided by the kernel's, so the dashed line at 1.00 is
+bf16 and higher is better. The latencies themselves are in the README tables.
+
+Run from the repository root:
+
+    python benchmarks/plot_decode.py
+"""
+import csv
+import pathlib
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter, MaxNLocator
+
+HERE = pathlib.Path(__file__).resolve().parent
+DOCS = HERE.parent / "docs"
+BASE = "flashinfer_bf16"
+
+
+# Fixed categorical order; identity is carried by position in the legend and by
+# the marker, not by colour alone. bf16 is the reference line rather than a
+# series, so it takes no hue.
+SERIES = [
+    ("ours_int2", "FOSCAR int2", "#2a78d6", "o"),
+    ("ours_int4", "FOSCAR int4", "#eb6834", "s"),
+    ("trtllm_nvfp4", "TRT-LLM NVFP4", "#1baf7a", "D"),
+    ("trtllm_fp8", "TRT-LLM FP8", "#eda100", "^"),
+]
+INK = "#0b0b0b"
+INK_2 = "#52514e"
+GRID = "#e4e3df"
+REF = "#8a8984"
+
+rows = list(csv.DictReader((HERE / "decode_latency.csv").open()))
+
+
+def _kv_of(row) -> int:
+    return int(row.get("kv") or row["context"])
+
+
+def _gpu_matches(row, gpu: str) -> bool:
+    raw = row.get("gpu", "").lower()
+    if raw == gpu:
+        return True
+    arch = row.get("arch", "").lower()
+    return (gpu == "b200" and ("b200" in raw or arch == "sm100")) or (
+        gpu == "h100" and ("h100" in raw or arch == "sm90")
+    )
+
+
+def us(here, kernel, batch, kv):
+    """One cell of one figure. `here` is already narrowed to a GPU and a shape."""
+    hit = [r for r in here if r["kernel"] == kernel
+           and int(r["batch"]) == batch and _kv_of(r) == kv]
+    return float(hit[0]["us"]) if hit else None
+
+
+def render(gpu, shape, out, csv_rows=None):
+    data = rows if csv_rows is None else csv_rows
+    here = [r for r in data if _gpu_matches(r, gpu) and r["shape"] == shape]
+    if not here:
+        return
+    batches = sorted({int(r["batch"]) for r in here})
+    kv_lens = sorted({_kv_of(r) for r in here})
+    present = [s for s in SERIES
+               if any(r["kernel"] == s[0] for r in here)]
+
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.6), sharey=True)
+    fig.patch.set_facecolor("#ffffff")
+    top = 1.0
+    low = 1.0
+
+    for ax, batch in zip(axes, batches):
+        ax.set_facecolor("#ffffff")
+        for key, label, color, marker in present:
+            xs, ys = [], []
+            for i, kv in enumerate(kv_lens):
+                base = us(here, BASE, batch, kv)
+                val = us(here, key, batch, kv)
+                if base and val:
+                    xs.append(i)
+                    ys.append(base / val)
+            ax.plot(xs, ys, color=color, linewidth=2, marker=marker, markersize=5,
+                    markeredgecolor="#ffffff", markeredgewidth=1.2, label=label,
+                    zorder=3)
+            if ys:
+                top = max(top, max(ys))
+                low = min(low, min(ys))
+
+        ax.axhline(1.0, color=REF, linewidth=1.2, linestyle=(0, (4, 3)), zorder=2)
+        ax.annotate("FlashInfer bf16", xy=(0, 1.0), xytext=(0, 6),
+                    textcoords="offset points", color=REF, fontsize=8, zorder=4)
+
+        ax.set_xticks(range(len(kv_lens)))
+        ax.set_xticklabels([f"{kv // 1024}K" for kv in kv_lens])
+        ax.set_xlim(-0.25, len(kv_lens) - 0.75)
+        ax.minorticks_off()
+        ax.set_xlabel("context length", color=INK_2, fontsize=9)
+        ax.set_title(f"batch {batch}", color=INK, fontsize=10, pad=8)
+        ax.grid(True, which="major", color=GRID, linewidth=0.8, zorder=0)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(GRID)
+        ax.tick_params(colors=INK_2, labelsize=8, length=3, width=0.8)
+
+    # Fit the axis to the data: the bf16 reference at 1.00 and any sub-1.00 points
+    # stay in view, and the top is the highest point plus a little headroom.
+    bottom = min(0.95, low * 0.95)
+    axes[0].set_ylim(bottom, top * 1.08)
+    axes[0].yaxis.set_major_locator(MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10]))
+    axes[0].yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
+    axes[0].set_ylabel("speedup over FlashInfer bf16", color=INK_2, fontsize=9)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(present), frameon=False,
+               fontsize=8, labelcolor=INK_2, bbox_to_anchor=(0.5, -0.02),
+               handlelength=1.8, columnspacing=1.8)
+
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    fig.savefig(out, dpi=200, facecolor="#ffffff")
+    plt.close(fig)
+    print(f"wrote {out}")
+
+
+def main() -> None:
+    render("b200", "qwen3-8b", DOCS / "decode-latency-b200.png")
+    render("h100", "qwen3-8b", DOCS / "decode-latency-h100.png")
+    render("b200", "inkling", DOCS / "decode-latency-b200-inkling.png")
+    render("b200", "muse-spark", DOCS / "decode-latency-b200-muse-spark.png")
+    render("h100", "muse-spark", DOCS / "decode-latency-h100-muse-spark.png")
+
+
+if __name__ == "__main__":
+    main()

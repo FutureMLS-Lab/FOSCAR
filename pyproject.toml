@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "foscar"
+version = "0.2.0"
+description = "Quantized-KV paged decode kernels for Hopper (SM90) and Blackwell (SM100), written in CuTe DSL."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Donglin Zhuang", email = "donglinzhuang@outlook.com" }]
+keywords = ["attention", "decode", "kv-cache", "quantization", "cuda", "cute-dsl"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.21",
+    # The DSL compiles with `enable_tvm_ffi=True` and every launch binds torch's
+    # stream through `tvm_ffi.use_torch_stream`, so a kernel cannot be built or
+    # launched without it.
+    "apache-tvm-ffi>=0.1.8",
+]
+
+[project.optional-dependencies]
+cu12 = ["nvidia-cutlass-dsl==4.8.0", "cuda-python>=12.4,<13"]
+cu13 = ["nvidia-cutlass-dsl[cu13]==4.8.0", "cuda-python>=13,<14"]
+test = ["pytest>=7"]
+dev = ["pytest>=7", "ruff>=0.4"]
+# The benchmark harness compares against FlashInfer's kernels. Nothing in the
+# package imports it. The version is pinned because the baseline columns in the
+# README were measured with it; a later release moves its decode kernels.
+bench = ["flashinfer-python==0.7.3", "pyyaml>=6", "matplotlib>=3.5"]
+
+[project.urls]
+Homepage = "https://github.com/FutureMLS-Lab/FOSCAR"
+Repository = "https://github.com/FutureMLS-Lab/FOSCAR"
+Issues = "https://github.com/FutureMLS-Lab/FOSCAR/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+foscar = ["py.typed", "_vendor/README.md"]
+
+[tool.uv]
+conflicts = [[{ extra = "cu12" }, { extra = "cu13" }]]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["gpu: needs an SM90 or SM100 device"]
+addopts = "--strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# The vendored subset keeps its upstream style.
+extend-exclude = ["src/foscar/_vendor"]
+
+[tool.ruff.lint]
+# Ruff's classic default set. The ignores are idioms the kernels use on purpose:
+# semicolon-separated statements inside unrolled bodies, `l` as a loop variable,
+# lambda assignment for the small per-config partials, and locals pre-declared before a
+# dynamic region because the DSL requires a prior value for a name it rebinds there.
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E701", "E702", "E731", "E741", "F841"]
