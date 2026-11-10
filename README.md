@@ -21,19 +21,18 @@ Both GPU backends use the same Python API.
 
 ## How FOSCAR works
 
-![B200 schematic showing the INT2 key path from HBM through Tensor Cores to affine folding](docs/foscar-overview.png)
+![B200 INT2 key comparison. Reconstruction applies scale and offset before the dot product. FOSCAR folds them into the result. The chart compares kernel latency with FP8 on both sides.](docs/foscar-overview.png)
 
-[Watch the B200 walkthrough (44 s, MP4)](docs/foscar-explainer.mp4) · [Read the folding derivation](https://arxiv.org/html/2611.09722v1#S4.SS1)
+[Download the B200 walkthrough (47 s, MP4)](docs/foscar-explainer.mp4?raw=true) · [Read the folding derivation](https://arxiv.org/html/2611.09722v1#S4.SS1)
 
 <details>
 <summary>Play the INT2 dataflow animation</summary>
 
-![FOSCAR animation: BF16 K values become INT2 codes, are unpacked as FP4 on B200, and give a corrected QK logit](docs/foscar-folding-preview.gif)
+![Side-by-side animation of per-value INT2 reconstruction and FOSCAR affine folding on B200](docs/foscar-folding-preview.gif)
 
 </details>
 
-The final chapter reports geometric-mean INT2 **kernel** speedups over FlashInfer BF16 from [paper §6.1](https://arxiv.org/html/2611.09722v1#S6.SS1).
-The [repository benchmarks](#benchmarks) below use a different set of workloads.
+The latency bars isolate folding on B200 with FP8 KV operands and equal split-KV counts. The hardware walkthrough shows the production FP4 path. [Paper §6.3, Fig. 10b–c](https://arxiv.org/html/2611.09722v1#S6.SS3)
 
 ## Install
 
