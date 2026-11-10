@@ -2,12 +2,9 @@
   <img src="docs/foscar-logo.png" alt="FOSCAR logo" width="150">
 </p>
 
-<h1 align="center">FOSCAR</h1>
+<h1 align="center">FOSCAR: Accelerating Decode Attention over 2- and 4-Bit KV Caches through Affine Folding</h1>
 
-<p align="center">
-  <strong>Decode attention for 2- and 4-bit KV caches</strong><br>
-  NVIDIA Hopper and Blackwell · CuTe DSL
-</p>
+<p align="center">NVIDIA Hopper and Blackwell · CuTe DSL</p>
 
 <p align="center">
   <a href="https://arxiv.org/abs/2611.09722"><img src="https://img.shields.io/badge/Paper-arXiv-B31B1B.svg?logo=arxiv&amp;logoColor=white" alt="Paper on arXiv"></a>
