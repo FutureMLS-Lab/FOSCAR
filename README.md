@@ -21,9 +21,9 @@ Both GPU backends use the same Python API.
 
 ## How FOSCAR works
 
-![Four INT2 cells illustrate per-value reconstruction versus affine folding. Below, a common-axis chart shows peak B200 serving throughput of 333 output tokens/s with OSCAR INT2 and 868 with the FOSCAR kernel.](docs/foscar-overview.png)
+![Four INT2 cells show where FOSCAR folds scale and offset, and highlight the B200 FP4 Tensor Core path. The throughput chart shows 333 output tokens/s with OSCAR INT2 and 868 with the FOSCAR kernel.](docs/foscar-overview.png)
 
-[Download the B200 walkthrough (43 s, MP4)](docs/foscar-explainer.mp4?raw=true) · [Read the folding derivation](https://arxiv.org/html/2611.09722v1#S4.SS1)
+[Download the 16-second silent walkthrough (MP4)](docs/foscar-explainer.mp4?raw=true) · [Read the folding derivation](https://arxiv.org/html/2611.09722v1#S4.SS1)
 
 <details>
 <summary>Animate the INT2 cells</summary>
@@ -34,7 +34,7 @@ Both GPU backends use the same Python API.
 
 Swapping the OSCAR INT2 decode kernel for FOSCAR raised peak aggregate serving throughput from **333 to 868 output tokens/s (2.61×)**. Both runs use the OSCAR cache policy and rotations on one B200 with Qwen3-8B, 100K input tokens, 1K output tokens, and a 99% prefix-cache hit rate. Each bar is the peak across the tested concurrency levels. [Paper §6.4, Fig. 12c](https://arxiv.org/html/2611.09722v1#S6.SS4)
 
-The kernel ablation separately compares reconstruction and folding with FP8 KV operands and equal split-KV counts. [Paper §6.3, Fig. 10b–c](https://arxiv.org/html/2611.09722v1#S6.SS3)
+In the kernel ablation, switching from folded FP8 to FP4 KV operands and matching packing gives a **1.17–1.21×** speedup on B200 at equal split-KV counts. [Paper §6.3, Fig. 10c](https://arxiv.org/html/2611.09722v1#S6.SS3)
 
 ## Install
 
