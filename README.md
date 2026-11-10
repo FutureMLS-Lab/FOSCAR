@@ -11,7 +11,6 @@
   <a href="#quickstart"><img src="https://img.shields.io/badge/Quickstart-2563A6.svg?logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyLjI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik04IDVsMTEgNy0xMSA3eiIgZmlsbD0id2hpdGUiIHN0cm9rZT0ibm9uZSIvPjwvc3ZnPg%3D%3D&amp;logoColor=white" alt="Quickstart"></a>
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Benchmarks-16756D.svg?logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyLjI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik00IDE5aDE2TTcgMTV2LTRtNSA0VjZtNSA5VjMiLz48L3N2Zz4%3D&amp;logoColor=white" alt="Benchmarks"></a>
   <a href="docs/integration.md"><img src="https://img.shields.io/badge/Integration-6554A3.svg?logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyLjI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik0xMiA3bDItMmE0IDQgMCAwIDEgNiA2bC0zIDNtLTUgMy0yIDJhNCA0IDAgMCAxLTYtNmwzLTNtMiA1IDYtNiIvPjwvc3ZnPg%3D%3D&amp;logoColor=white" alt="Integration guide"></a>
-  <a href="#citation"><img src="https://img.shields.io/badge/Cite-BibTeX-555555.svg?logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyLjI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik00IDdoNnY1YzAgMy0yIDUtNSA1di0zYzEuNSAwIDItMSAyLTJINHptMTAgMGg2djVjMCAzLTIgNS01IDV2LTNjMS41IDAgMi0xIDItMmgtM3oiIGZpbGw9IndoaXRlIiBzdHJva2U9Im5vbmUiLz48L3N2Zz4%3D&amp;logoColor=white" alt="Citation in BibTeX"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-32723F.svg?logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyLjI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik0xMiAzbDcgM3Y1YzAgNC0zIDctNyAxMC00LTMtNy02LTctMTBWNnpNOSAxMmwyIDIgNC00Ii8%2BPC9zdmc%2B&amp;logoColor=white" alt="MIT license"></a>
 </p>
 
@@ -21,20 +20,9 @@ Both GPU backends use the same Python API.
 
 ## How FOSCAR works
 
-![Both decode paths produce the same QK logit of −1.5. The chart below shows 333 output tokens/s with OSCAR INT2 and 868 with the FOSCAR kernel.](docs/foscar-overview.png)
+![FOSCAR decode walkthrough](docs/foscar-folding-preview.gif)
 
-[Download the 16-second silent walkthrough (MP4)](docs/foscar-explainer.mp4?raw=true) · [Read the folding derivation](https://arxiv.org/html/2611.09722v1#S4.SS1)
-
-<details>
-<summary>Play the 16-second decode walkthrough</summary>
-
-![The FP4 path reaches TMEM first in the illustration. The final frame keeps the equal QK logits and measured serving throughput on screen together.](docs/foscar-folding-preview.gif)
-
-</details>
-
-Swapping the OSCAR INT2 decode kernel for FOSCAR raised peak aggregate serving throughput from **333 to 868 output tokens/s (2.61×)**. Both runs use the OSCAR cache policy and rotations on one B200 with Qwen3-8B, 100K input tokens, 1K output tokens, and a 99% prefix-cache hit rate. Each bar is the peak across the tested concurrency levels. [Paper §6.4, Fig. 12c](https://arxiv.org/html/2611.09722v1#S6.SS4)
-
-In the kernel ablation, switching from folded FP8 to FP4 KV operands and matching packing gives a **1.17–1.21×** speedup on B200 at equal split-KV counts. [Paper §6.3, Fig. 10c](https://arxiv.org/html/2611.09722v1#S6.SS3)
+Swapping the OSCAR INT2 decode kernel for FOSCAR raised peak aggregate serving throughput from **333 to 868 output tokens/s (2.61×)**. Both runs use the OSCAR cache policy and rotations on one B200 with Qwen3-8B, 100K input tokens, 1K output tokens, and a 99% prefix-cache hit rate. Each bar is the peak across the tested concurrency levels.
 
 ## Install
 
@@ -148,18 +136,6 @@ It measures GPU kernel time with a cold L2 cache and excludes host dispatch.
 
 After installing the CUDA extra, install the test dependencies with `pip install -e '.[test]'` and run `pytest -q`.
 Device tests skip without a supported GPU.
-
-## Citation
-
-```bibtex
-@article{zhuang2026foscar,
-  title   = {{FOSCAR}: Accelerating Decode Attention over 2- and 4-Bit {KV} Caches through Affine Folding},
-  author  = {Donglin Zhuang and Pragaash Ponnusamy and Xiaoxia Wu and Shuaiwen Leon Song and Zhongzhu Zhou},
-  journal = {arXiv preprint arXiv:2611.09722},
-  year    = {2026},
-  url     = {https://arxiv.org/abs/2611.09722}
-}
-```
 
 ## License
 
