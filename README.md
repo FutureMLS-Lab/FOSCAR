@@ -21,14 +21,14 @@ Both GPU backends use the same Python API.
 
 ## How FOSCAR works
 
-![B200 INT2 key comparison. Reconstruction applies scale and offset before the dot product. FOSCAR folds them into the result. The chart compares kernel latency with FP8 on both sides.](docs/foscar-overview.png)
+![Four INT2 cells flow through B200. On the left, four scale and offset operations precede the dot product. On the right, one group correction turns the TMEM sum of 3.5 into the same logit of −1.5.](docs/foscar-overview.png)
 
-[Download the B200 walkthrough (47 s, MP4)](docs/foscar-explainer.mp4?raw=true) · [Read the folding derivation](https://arxiv.org/html/2611.09722v1#S4.SS1)
+[Download the B200 walkthrough (42 s, MP4)](docs/foscar-explainer.mp4?raw=true) · [Read the folding derivation](https://arxiv.org/html/2611.09722v1#S4.SS1)
 
 <details>
-<summary>Play the INT2 dataflow animation</summary>
+<summary>Animate the INT2 cells</summary>
 
-![Side-by-side animation of per-value INT2 reconstruction and FOSCAR affine folding on B200](docs/foscar-folding-preview.gif)
+![Animated INT2 cells change into K operands, pair with Q, and converge to a scalar in TMEM](docs/foscar-folding-preview.gif)
 
 </details>
 
