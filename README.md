@@ -21,14 +21,14 @@ Both GPU backends use the same Python API.
 
 ## How FOSCAR works
 
-![INT2 values pass through two per-value arithmetic gates on the left and become compact FP4 operands on the right. The throughput chart shows 333 output tokens/s with OSCAR INT2 and 868 with the FOSCAR kernel.](docs/foscar-overview.png)
+![Both decode paths produce the same QK logit of −1.5. The chart below shows 333 output tokens/s with OSCAR INT2 and 868 with the FOSCAR kernel.](docs/foscar-overview.png)
 
 [Download the 16-second silent walkthrough (MP4)](docs/foscar-explainer.mp4?raw=true) · [Read the folding derivation](https://arxiv.org/html/2611.09722v1#S4.SS1)
 
 <details>
-<summary>Watch the two paths to TMEM</summary>
+<summary>Play the 16-second decode walkthrough</summary>
 
-![The gold FP4 packets take the direct route and reach TMEM while the gray lane is still multiplying. The animation uses illustrative timing.](docs/foscar-folding-preview.gif)
+![The FP4 path reaches TMEM first in the illustration. The final frame keeps the equal QK logits and measured serving throughput on screen together.](docs/foscar-folding-preview.gif)
 
 </details>
 
