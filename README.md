@@ -19,6 +19,22 @@ FOSCAR provides paged grouped-query attention (GQA) decode kernels for packed IN
 Affine folding moves scale and offset arithmetic from individual KV values into the attention computation.
 Both GPU backends use the same Python API.
 
+## How FOSCAR works
+
+![B200 schematic showing the INT2 key path from HBM through Tensor Cores to affine folding](docs/foscar-overview.png)
+
+[Watch the B200 walkthrough (44 s, MP4)](docs/foscar-explainer.mp4) · [Read the folding derivation](https://arxiv.org/html/2611.09722v1#S4.SS1)
+
+<details>
+<summary>Play the INT2 dataflow animation</summary>
+
+![FOSCAR animation: BF16 K values become INT2 codes, are unpacked as FP4 on B200, and give a corrected QK logit](docs/foscar-folding-preview.gif)
+
+</details>
+
+The final chapter reports geometric-mean INT2 **kernel** speedups over FlashInfer BF16 from [paper §6.1](https://arxiv.org/html/2611.09722v1#S6.SS1).
+The [repository benchmarks](#benchmarks) below use a different set of workloads.
+
 ## Install
 
 Requires Linux, Python 3.10+, and a CUDA-enabled PyTorch build for your GPU (`torch>=2.4`).
