@@ -130,7 +130,103 @@ It measures GPU kernel time with a cold L2 cache and excludes host dispatch.
 | H100 | **3.41×** | **3.00×** |
 | B200 | **2.73×** | **2.33×** |
 
-[H100 plots](docs/decode-latency-h100.png) · [B200 plots](docs/decode-latency-b200.png) · [Full results (CSV)](benchmarks/decode_latency.csv) · [Reproduction guide](benchmarks/README.md)
+[Full results (CSV)](benchmarks/decode_latency.csv) · [Reproduction guide](benchmarks/README.md)
+
+Expand a model below for plots and latency tables by GPU.
+Head counts are per GPU after tensor parallelism (TP): HQ is the number of query heads,
+HKV is the number of KV heads, and D is the head dimension.
+Tables report decode latency in microseconds; plots show speedup over FlashInfer BF16
+at the same shape, with a dashed baseline at 1.00×.
+
+<details>
+<summary>Qwen3-8B TP1 (HQ=32, HKV=8, D=128) · H100 / B200</summary>
+
+### H100 (SM90)
+
+![Decode speedup over FlashInfer bf16 on H100, at batch 1 and 8](docs/decode-latency-h100.png)
+
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 |
+|---:|---:|---:|---:|---:|
+| 1 | 32K | **25.8** | 33.0 | 63.4 |
+| 1 | 128K | **73.7** | 79.7 | 200.6 |
+| 1 | 256K | **129.7** | 135.9 | 378.5 |
+| 1 | 512K | **243.3** | 249.4 | 734.1 |
+| 8 | 32K | **94.9** | 116.5 | 387.1 |
+| 8 | 128K | **345.9** | 402.5 | 1463.4 |
+| 8 | 256K | **681.2** | 782.0 | 2906.5 |
+| 8 | 512K | **1352.2** | 1546.0 | 5726.9 |
+
+### B200 (SM100)
+
+![Decode speedup over FlashInfer bf16 on B200, at batch 1 and 8](docs/decode-latency-b200.png)
+
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 32K | **15.3** | 17.6 | 35.3 | 23.0 | 18.1 |
+| 1 | 128K | **36.7** | 44.2 | 99.0 | 60.1 | 41.2 |
+| 1 | 256K | **62.4** | 74.8 | 170.7 | 100.1 | 69.8 |
+| 1 | 512K | **114.3** | 135.6 | 314.1 | 175.3 | 123.7 |
+| 8 | 32K | **62.5** | 75.1 | 167.6 | 95.8 | 69.2 |
+| 8 | 128K | **218.3** | 251.9 | 596.0 | 310.5 | 242.9 |
+| 8 | 256K | **399.1** | 456.2 | 1172.5 | 594.3 | 474.7 |
+| 8 | 512K | **758.1** | 865.7 | 2319.8 | 1166.6 | 932.7 |
+
+</details>
+
+<details>
+<summary>Inkling TP8 (HQ=8, HKV=1, D=128) · B200</summary>
+
+### B200 (SM100)
+
+![Decode speedup over FlashInfer bf16 on B200 at the Inkling shape, at batch 1 and 8](docs/decode-latency-b200-inkling.png)
+
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 32K | 12.9 | 12.2 | 16.7 | **11.5** | 13.8 |
+| 1 | 128K | **18.2** | 18.4 | 36.4 | 29.9 | 28.4 |
+| 1 | 256K | **22.4** | 22.6 | 49.2 | 37.1 | 32.2 |
+| 1 | 512K | **29.4** | 31.6 | 73.9 | 49.5 | 40.4 |
+| 8 | 32K | **17.3** | 18.8 | 34.8 | 22.2 | 17.7 |
+| 8 | 128K | **37.5** | 44.2 | 98.5 | 59.2 | 41.6 |
+| 8 | 256K | **63.2** | 72.9 | 170.6 | 100.9 | 71.3 |
+| 8 | 512K | **114.8** | 126.3 | 317.4 | 179.0 | 123.9 |
+
+</details>
+
+<details>
+<summary>Muse-Spark-Open-816B-A42B TP8 (HQ=16, HKV=2, D=64) · H100 / B200</summary>
+
+### H100 (SM90)
+
+![Decode speedup over FlashInfer bf16 on H100 at the Muse-Spark shape, at batch 1 and 8](docs/decode-latency-h100-muse-spark.png)
+
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 |
+|---:|---:|---:|---:|---:|
+| 1 | 32K | **15.8** | 16.3 | 19.4 |
+| 1 | 128K | **26.7** | 27.7 | 41.6 |
+| 1 | 256K | **35.2** | 37.2 | 66.2 |
+| 1 | 512K | **52.1** | 55.4 | 110.9 |
+| 8 | 32K | **27.2** | 29.3 | 65.1 |
+| 8 | 128K | **78.8** | 84.3 | 196.9 |
+| 8 | 256K | **147.6** | 156.2 | 374.7 |
+| 8 | 512K | **285.6** | 298.9 | 724.8 |
+
+### B200 (SM100)
+
+![Decode speedup over FlashInfer bf16 on B200 at the Muse-Spark shape, at batch 1 and 8](docs/decode-latency-b200-muse-spark.png)
+
+| Batch | Context | FOSCAR int2 | FOSCAR int4 | FlashInfer bf16 | TRT-LLM FP8 | TRT-LLM NVFP4 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 32K | 12.0 | 11.8 | 12.1 | **10.6** | 13.7 |
+| 1 | 128K | **17.0** | 17.6 | 28.6 | 23.2 | 22.8 |
+| 1 | 256K | **22.1** | 23.4 | 41.0 | 30.8 | 29.6 |
+| 1 | 512K | **32.1** | 36.6 | 66.5 | 44.5 | 42.3 |
+| 8 | 32K | **20.0** | 22.0 | 33.5 | 23.0 | 22.2 |
+| 8 | 128K | **51.0** | 59.6 | 100.9 | 61.6 | 62.3 |
+| 8 | 256K | **89.5** | 107.9 | 176.0 | 108.3 | 116.6 |
+| 8 | 512K | **168.4** | 206.1 | 327.2 | 187.6 | 224.2 |
+
+</details>
 
 ## Testing
 
