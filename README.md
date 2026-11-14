@@ -228,23 +228,6 @@ at the same shape, with a dashed baseline at 1.00×.
 
 </details>
 
-### Measurement conditions
-
-One query token per request. K and V are quantized token-wise, one scale and one
-offset per token over the whole head dimension, both in FP32.
-Page size 64, paged cache. Q is fp8 e4m3 on the B200 tables and bf16 on the H100
-tables; FlashInfer is bf16 everywhere. Every column of a row was timed by the same
-harness on the same GPU model. The number is the CUDA kernel span from CUPTI
-over a cold L2, the median of the fully observed iterations, so it excludes host
-dispatch and the paged-attention wrapper.
-
-`benchmarks/decode_latency.csv` holds the values in these tables and
-`benchmarks/plot_decode.py` renders the figures. The FOSCAR columns come from
-`PagedDecodeWrapper`; the competitor columns from FlashInfer.
-
-TensorRT-LLM's `trtllm-gen` decode is Blackwell-only, so the H100 tables have no
-TensorRT-LLM columns.
-
 ## Testing
 
 After installing the CUDA extra, install the test dependencies with `pip install -e '.[test]'` and run `pytest -q`.
